@@ -44,8 +44,20 @@ _USER_AGENT = (
 # redundant ATCs (e.g. sticky + inline).
 _ATC_SCAN_JS = r"""
 () => {
-  const ATC_TEXT = /^(ADD TO CART|ADD TO BAG|BUY NOW|SOLD OUT|NOTIFY ME|COMING SOON|PRE[- ]?ORDER)$/i;
-  const OOS_TEXT = /^(SOLD OUT|NOTIFY ME|COMING SOON|UNAVAILABLE)$/i;
+  // Action phrase + optional $-prefixed price suffix(es). Based's primary
+  // PDP CTAs render as `<p>ADD TO CART $28.00</p>` via Instant.so (price
+  // baked into the leaf). Some show sale + strikethrough as
+  // `<p>ADD TO CART $28.00 $40.00</p>`. Bare `<p>ADD TO CART</p>` is also
+  // common.
+  //
+  // The suffix MUST be empty or look like `[$price]` (optionally repeated)
+  // so we don't over-match marketing copy like "BUY NOW AND SAVE 30%" or
+  // accidentally match "ADD TO CARTRIDGE INSTRUCTIONS". The earlier `\b`
+  // version was too permissive (would match BUY NOW + arbitrary trailing
+  // text); this version requires either end-of-string or whitespace +
+  // dollar-prefixed token(s).
+  const ATC_TEXT = /^(ADD TO CART|ADD TO BAG|BUY NOW|SOLD OUT|NOTIFY ME|COMING SOON|PRE[- ]?ORDER)(\s+\$[\d.,]+(\s+\$[\d.,]+)?)?$/i;
+  const OOS_TEXT = /^(SOLD OUT|NOTIFY ME|COMING SOON|UNAVAILABLE)(\s+\$[\d.,]+(\s+\$[\d.,]+)?)?$/i;
 
   function productHandleFromCard(leafEl) {
     let cur = leafEl.parentElement;
@@ -240,7 +252,11 @@ class AtcCrawler:
             with contextlib.suppress(Exception):
                 page.wait_for_function(
                     """(pageHandle) => {
-                        const re = /^(ADD TO CART|ADD TO BAG|BUY NOW|SOLD OUT|NOTIFY ME|COMING SOON|PRE[- ]?ORDER)$/i;
+                        // Mirrors _ATC_SCAN_JS regex: action phrase plus
+                        // optional `\\s+\\$price` suffix(es); rejects
+                        // marketing banners and 'ADD TO CARTRIDGE'-style
+                        // word continuations.
+                        const re = /^(ADD TO CART|ADD TO BAG|BUY NOW|SOLD OUT|NOTIFY ME|COMING SOON|PRE[- ]?ORDER)(\s+\$[\d.,]+(\s+\$[\d.,]+)?)?$/i;
                         function cardHandle(leaf) {
                           let cur = leaf.parentElement;
                           for (let i = 0; i < 20 && cur; i++) {

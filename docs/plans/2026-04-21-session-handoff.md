@@ -9,7 +9,7 @@ state, posting alerts to Slack `#alerts-inventory`. Three cron jobs on Render,
 one Key Value (Redis) state store.
 
 - Repo: https://github.com/basedbodyworks-apps/based-inventory
-- Local clone: `/Users/avijhingan/Desktop/based-inventory` (main branch, up to date)
+- Local clone: `/Users/avijhingan/tools/based-inventory` (main branch, up to date)
 - Render Blueprint: https://dashboard.render.com/blueprint/exs-d7ikrepkh4rs73b2l5o0
 
 ## Services (all Render Blueprint-managed)

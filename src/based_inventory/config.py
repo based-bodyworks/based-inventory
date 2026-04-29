@@ -8,10 +8,16 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Config:
+    # Shopify (used by atc_audit job for storefront crawl + auth-token reads)
     shopify_store: str
     shopify_client_id: str
     shopify_client_secret: str
     shopify_api_version: str
+    # ShipHero (canonical inventory source; used by quantity_alerts + weekly_snapshot)
+    shiphero_access_token: str | None
+    shiphero_refresh_token: str | None
+    shiphero_api_url: str
+    # Slack + Telegram + state
     slack_bot_token: str
     slack_channel: str
     telegram_bot_token: str | None
@@ -38,6 +44,12 @@ class Config:
             shopify_client_id=required("SHOPIFY_CLIENT_ID"),
             shopify_client_secret=required("SHOPIFY_CLIENT_SECRET"),
             shopify_api_version=optional("SHOPIFY_API_VERSION", "2026-01") or "2026-01",
+            shiphero_access_token=optional("SHIPHERO_ACCESS_TOKEN"),
+            shiphero_refresh_token=optional("SHIPHERO_REFRESH_TOKEN"),
+            shiphero_api_url=optional(
+                "SHIPHERO_API_URL", "https://public-api.shiphero.com/graphql"
+            )
+            or "https://public-api.shiphero.com/graphql",
             slack_bot_token=required("SLACK_BOT_TOKEN"),
             slack_channel=required("SLACK_CHANNEL"),
             telegram_bot_token=optional("TELEGRAM_BOT_TOKEN"),

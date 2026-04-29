@@ -1,0 +1,5 @@
+{
+  "_note": "SKUs intentionally being run down or no longer restocked. The bot skips these entirely (no alerts, no oversold warnings). Review and update when product lifecycle status changes.",
+  "_format": "Each entry: sku (string, exact match against ShipHero WarehouseStock.sku), name (human-readable), reason (free text), added (YYYY-MM-DD).",
+  "skus": []
+}

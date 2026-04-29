@@ -78,34 +78,68 @@ def _write_file(p: Path, payload: dict[str, Any]) -> None:
     p.write_text(json.dumps(payload, indent=2))
 
 
-def _coerce(data: dict[str, Any]) -> tuple[dict[str, int], dict[str, dict[str, str]]]:
+def _coerce(
+    data: dict[str, Any],
+) -> tuple[dict[str, int], dict[str, dict[str, str]], str | None]:
     qt = data.get("quantity_tiers", {})
     af = data.get("atc_flags", {})
+    sv = data.get("schema_version")
     if not isinstance(qt, dict):
         logger.warning("state 'quantity_tiers' is not an object; ignoring")
         qt = {}
     if not isinstance(af, dict):
         logger.warning("state 'atc_flags' is not an object; ignoring")
         af = {}
-    return qt, af
+    if sv is not None and not isinstance(sv, str):
+        sv = None
+    return qt, af, sv
+
+
+# Bump this when a code change makes the OLD state no longer correct.
+# Examples: SKU/title key migration, ATC regex change that retires
+# previously-recorded false-positive flags, dedup logic refactor.
+# On load, if state.schema_version != CURRENT_SCHEMA_VERSION, all
+# dedup state is wiped (loud log) so prior false positives don't
+# silently keep matching new code.
+#
+# History:
+#   None  -> v1 (legacy: title-keyed quantity_tiers, broken ATC regex)
+#   v1    -> v2 (2026-04-28: SKU-keyed quantity_tiers via ShipHero
+#                rewire; tightened ATC regex with $-price suffix support;
+#                clears stale title-keyed entries and 5 false-positive
+#                ATC flags from the prior DRY_RUN cycles).
+CURRENT_SCHEMA_VERSION = "v2"
 
 
 @dataclass
 class AlertState:
     quantity_tiers: dict[str, int] = field(default_factory=dict)
     atc_flags: dict[str, dict[str, str]] = field(default_factory=dict)
+    schema_version: str = CURRENT_SCHEMA_VERSION
 
     @classmethod
     def load(cls, location: Path | str) -> AlertState:
         loc = str(location)
         data = _read_redis(loc) if _is_redis_url(loc) else _read_file(Path(loc))
-        qt, af = _coerce(data)
-        return cls(quantity_tiers=qt, atc_flags=af)
+        qt, af, sv = _coerce(data)
+        if sv != CURRENT_SCHEMA_VERSION:
+            logger.warning(
+                "AlertState schema version %r != current %r; clearing "
+                "quantity_tiers (%d) and atc_flags (%d) so stale entries "
+                "from the prior code revision don't suppress new alerts.",
+                sv,
+                CURRENT_SCHEMA_VERSION,
+                len(qt),
+                len(af),
+            )
+            qt, af = {}, {}
+        return cls(quantity_tiers=qt, atc_flags=af, schema_version=CURRENT_SCHEMA_VERSION)
 
     def save(self, location: Path | str) -> None:
         payload = {
             "quantity_tiers": self.quantity_tiers,
             "atc_flags": self.atc_flags,
+            "schema_version": self.schema_version,
         }
         loc = str(location)
         if _is_redis_url(loc):

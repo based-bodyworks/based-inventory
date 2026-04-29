@@ -18,8 +18,9 @@ htmlcov/
 *.pem
 *.rtf
 
-# State (persisted on Render Disk, never committed)
+# State (persisted on Render Key Value service, never committed)
 data/alert-state.json
+data/alert-state-shiphero.json
 
 # IDE
 .vscode/

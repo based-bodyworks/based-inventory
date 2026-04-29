@@ -5,20 +5,30 @@ services:
     ipAllowList: []
     maxmemoryPolicy: noeviction
 
+  # Quantity alerts: ShipHero-sourced. Daily 14:00 UTC (7am Pacific).
+  # Was every 6h on Shopify; cadence dropped per 2026-04-28 rewire decision.
   - type: cron
     name: based-inventory-quantity
     runtime: docker
     dockerfilePath: ./Dockerfile
-    schedule: "0 */6 * * *"
+    schedule: "0 14 * * 1-5"
     dockerCommand: python -m based_inventory.jobs.quantity_alerts
     plan: starter
     envVars:
+      - key: SHIPHERO_ACCESS_TOKEN
+        sync: false
+      - key: SHIPHERO_REFRESH_TOKEN
+        sync: false
+      - key: SHIPHERO_API_URL
+        value: https://public-api.shiphero.com/graphql
+      # Shopify env vars not used by this job, but Config requires them.
+      # Set to placeholders; real values live on the atc_audit service.
       - key: SHOPIFY_STORE
-        sync: false
+        value: basedbodyworks.myshopify.com
       - key: SHOPIFY_CLIENT_ID
-        sync: false
+        value: not-used-by-quantity-alerts
       - key: SHOPIFY_CLIENT_SECRET
-        sync: false
+        value: not-used-by-quantity-alerts
       - key: SHOPIFY_API_VERSION
         value: "2026-01"
       - key: SLACK_BOT_TOKEN
@@ -41,6 +51,7 @@ services:
       - key: LOG_LEVEL
         value: INFO
 
+  # ATC audit: Shopify-sourced (storefront crawl). Unchanged.
   - type: cron
     name: based-inventory-atc
     runtime: docker
@@ -49,23 +60,27 @@ services:
     dockerCommand: python -m based_inventory.jobs.atc_audit
     plan: starter
     envVars:
-      - fromService:
-          name: based-inventory-quantity
-          type: cron
-          envVarKey: SHOPIFY_STORE
-        key: SHOPIFY_STORE
-      - fromService:
-          name: based-inventory-quantity
-          type: cron
-          envVarKey: SHOPIFY_CLIENT_ID
-        key: SHOPIFY_CLIENT_ID
-      - fromService:
-          name: based-inventory-quantity
-          type: cron
-          envVarKey: SHOPIFY_CLIENT_SECRET
-        key: SHOPIFY_CLIENT_SECRET
+      - key: SHOPIFY_STORE
+        sync: false
+      - key: SHOPIFY_CLIENT_ID
+        sync: false
+      - key: SHOPIFY_CLIENT_SECRET
+        sync: false
       - key: SHOPIFY_API_VERSION
         value: "2026-01"
+      # ShipHero not used here, but Config is shared. Pull from quantity service.
+      - fromService:
+          name: based-inventory-quantity
+          type: cron
+          envVarKey: SHIPHERO_ACCESS_TOKEN
+        key: SHIPHERO_ACCESS_TOKEN
+      - fromService:
+          name: based-inventory-quantity
+          type: cron
+          envVarKey: SHIPHERO_REFRESH_TOKEN
+        key: SHIPHERO_REFRESH_TOKEN
+      - key: SHIPHERO_API_URL
+        value: https://public-api.shiphero.com/graphql
       - fromService:
           name: based-inventory-quantity
           type: cron
@@ -89,6 +104,7 @@ services:
       - key: LOG_LEVEL
         value: INFO
 
+  # Weekly snapshot: ShipHero-sourced. Friday 16:00 UTC (9am Pacific).
   - type: cron
     name: based-inventory-weekly
     runtime: docker
@@ -100,18 +116,21 @@ services:
       - fromService:
           name: based-inventory-quantity
           type: cron
-          envVarKey: SHOPIFY_STORE
-        key: SHOPIFY_STORE
+          envVarKey: SHIPHERO_ACCESS_TOKEN
+        key: SHIPHERO_ACCESS_TOKEN
       - fromService:
           name: based-inventory-quantity
           type: cron
-          envVarKey: SHOPIFY_CLIENT_ID
-        key: SHOPIFY_CLIENT_ID
-      - fromService:
-          name: based-inventory-quantity
-          type: cron
-          envVarKey: SHOPIFY_CLIENT_SECRET
-        key: SHOPIFY_CLIENT_SECRET
+          envVarKey: SHIPHERO_REFRESH_TOKEN
+        key: SHIPHERO_REFRESH_TOKEN
+      - key: SHIPHERO_API_URL
+        value: https://public-api.shiphero.com/graphql
+      - key: SHOPIFY_STORE
+        value: basedbodyworks.myshopify.com
+      - key: SHOPIFY_CLIENT_ID
+        value: not-used-by-weekly
+      - key: SHOPIFY_CLIENT_SECRET
+        value: not-used-by-weekly
       - key: SHOPIFY_API_VERSION
         value: "2026-01"
       - fromService:

@@ -292,7 +292,7 @@ def fake_product():
 - [ ] **Step 1.11: Set up local venv and verify**
 
 ```bash
-cd ~/Desktop/based-inventory
+cd ~/tools/based-inventory
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
@@ -2593,7 +2593,7 @@ ATC_TEXT_PATTERN = r"(?i)(add to cart|sold out|notify me|coming soon)"
 Add `beautifulsoup4` to `requirements.txt`:
 
 ```bash
-cd ~/Desktop/based-inventory
+cd ~/tools/based-inventory
 echo "beautifulsoup4==4.12.3" >> requirements.txt
 pip install beautifulsoup4==4.12.3
 ```

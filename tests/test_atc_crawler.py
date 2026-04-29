@@ -34,6 +34,65 @@ def test_pdp_visible_add_to_cart_is_observed():
     assert obs.text.upper() == "ADD TO CART"
 
 
+def test_pdp_atc_with_baked_price_is_observed():
+    """Regression: Based's primary CTA renders <p>ADD TO CART $28.00</p>
+    via Instant.so. The pre-fix scanner had `$` (end-of-string) anchor
+    on its regex which rejected every PDP. The fix uses `\\b` (word
+    boundary) so the trailing price is allowed."""
+    html = """
+    <html><body>
+      <main>
+        <a href="/products/daily-skincare-duo">Daily Skincare Duo</a>
+        <a href="/cart/123:1">
+          <div class="instant-rich-text"><p>ADD TO CART $28.00</p></div>
+          <div><p>$40.00</p></div>
+        </a>
+      </main>
+    </body></html>
+    """
+    observations = _with_crawler(html, url="https://x.invalid/products/daily-skincare-duo")
+    assert len(observations) == 1
+    obs = observations[0]
+    assert obs.product_handle == "daily-skincare-duo"
+    assert obs.present is True
+    assert obs.enabled is True
+    assert "ADD TO CART" in obs.text.upper()
+    # Price must be retained in the captured text (used for downstream debugging).
+    assert "$28" in obs.text
+
+
+def test_atc_regex_rejects_marketing_banner_text():
+    """The regex must NOT match text like 'ADD TO CARTRIDGES INCLUDED' or
+    'BUY NOW AND SAVE 30%' — those are marketing copy, not buy buttons.
+    The strict shape is action-phrase + optional $-prefixed price suffix."""
+    html = """
+    <html><body>
+      <a href="/products/x">X</a>
+      <p>ADD TO CARTRIDGES INCLUDED</p>
+      <p>BUY NOW AND SAVE 30%</p>
+      <p>ADD TO CART NOW</p>
+    </body></html>
+    """
+    observations = _with_crawler(html, url="https://x.invalid/products/x")
+    # None of those leaves match the strict regex; only true CTA leaves do.
+    assert observations == []
+
+
+def test_atc_regex_accepts_baked_sale_and_strikethrough_prices():
+    """A leaf like 'ADD TO CART $28.00 $40.00' (sale + strikethrough)
+    should match. The regex allows up to two $-prefixed price tokens."""
+    html = """
+    <html><body>
+      <a href="/products/y">Y</a>
+      <a><p>ADD TO CART $28.00 $40.00</p></a>
+    </body></html>
+    """
+    observations = _with_crawler(html, url="https://x.invalid/products/y")
+    assert len(observations) == 1
+    assert observations[0].present and observations[0].enabled
+    assert "$28" in observations[0].text
+
+
 def test_pdp_sold_out_visible_is_observed_as_oos():
     html = """
     <html><body>
