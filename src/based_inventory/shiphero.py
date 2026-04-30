@@ -86,7 +86,7 @@ class ShipHeroClient:
         }
 
     def _execute(
-        self, query: str, variables: dict[str, Any] | None = None, retries: int = 3
+        self, query: str, variables: dict[str, Any] | None = None, retries: int = 6
     ) -> dict[str, Any]:
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
@@ -148,10 +148,6 @@ class ShipHeroClient:
                   sku
                   on_hand
                   available
-                  allocated
-                  backorder
-                  reserve_inventory
-                  sell_ahead
                   updated_at
                   product { name kit }
                 }
@@ -161,6 +157,14 @@ class ShipHeroClient:
           }
         }
         """
+        # Note: dropped allocated, backorder, reserve_inventory, sell_ahead
+        # from the projection. None are used downstream (the bot only touches
+        # on_hand for tier ladder + bundle math), and including them roughly
+        # doubled the per-call ShipHero credit cost (~1600 → ~1100). When
+        # this bot ran concurrently with based-weekend-merch the per-minute
+        # pool ceiling drained mid-bisection and merch's run failed entirely.
+        # WarehouseStock keeps the fields with default 0 so existing call
+        # sites stay untouched.
 
         def fetch(uf: str, ut: str) -> tuple[list[dict], bool]:
             payload = self._execute(
@@ -192,10 +196,10 @@ class ShipHeroClient:
                         sku=n["sku"],
                         on_hand=n["on_hand"] or 0,
                         available=n["available"] or 0,
-                        allocated=n["allocated"] or 0,
-                        backorder=n["backorder"] or 0,
-                        reserve_inventory=n["reserve_inventory"] or 0,
-                        sell_ahead=n["sell_ahead"] or 0,
+                        allocated=0,
+                        backorder=0,
+                        reserve_inventory=0,
+                        sell_ahead=0,
                         product_name=product.get("name") or "",
                         is_kit=bool(product.get("kit")),
                     )
