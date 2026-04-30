@@ -186,11 +186,12 @@ def build_atc_blocks(flags: list[Flag]) -> list[dict[str, Any]]:
         icon = FLAG_ICONS[f.flag_type]
         label = FLAG_LABELS[f.flag_type]
         variant_part = f" / {f.variant_label}" if f.variant_label else ""
-        body = (
-            f"{icon} {label} - *{f.product_title}*{variant_part}\n"
-            f"🔗 <{f.url}|{f.url}>\n"
-            f'💬 Observed: "{f.observed_text}"'
-        )
+        # Compact one-line format: link wraps the product title; Observed text
+        # only appears when non-empty (NO BUY BUTTON has nothing meaningful to
+        # quote, so omit). OVERSELL_RISK keeps the v0 limitation footer below.
+        body = f"{icon} {label} — <{f.url}|*{f.product_title}*>{variant_part}"
+        if f.observed_text:
+            body += f' · "{f.observed_text}"'
         if f.flag_type == FlagType.OVERSELL_RISK:
             body += f"\n{V0_LIMITATION_FOOTER}"
         blocks.append(section(body))
