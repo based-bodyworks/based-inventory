@@ -11,6 +11,7 @@ weekend-merch report).
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,7 @@ from typing import Any
 from based_inventory.config import Config
 from based_inventory.discontinued import DiscontinuedFilter
 from based_inventory.jobs._common import run_job
-from based_inventory.registry import _name_match, build_registry
+from based_inventory.registry import _name_matches, build_registry
 from based_inventory.shiphero import MERCHDROP_WAREHOUSE_ID, ShipHeroClient, WarehouseStock
 from based_inventory.shiphero_auth import resolve_access_token
 from based_inventory.slack import SlackClient, context, divider, header, section
@@ -56,6 +57,7 @@ AUDIT_LAYOUT: list[tuple[str, list[str]]] = [
 DATA_DIR = Path(__file__).resolve().parents[3] / "data"
 COMPONENTS_PATH = DATA_DIR / "set-components.json"
 DISCONTINUED_PATH = DATA_DIR / "discontinued-skus.json"
+ALIASES_PATH = DATA_DIR / "audit-aliases.json"
 
 
 @dataclass
@@ -64,6 +66,34 @@ class ProductLine:
     qty: int
     sku: str | None
     affected_bundles: list[str]
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """Result of resolving an AUDIT_LAYOUT name to ShipHero stock.
+
+    `skus` lists every contributing physical SKU (single-element for
+    direct matches; multi-element for aliased aggregates like
+    "Tallow Moisturizer" = 50ml + 100ml). `qty` is the sum across
+    those SKUs. `primary_sku` is the representative SKU shown in any
+    UI that needs a single label (defaults to the first / largest).
+    """
+
+    primary_sku: str
+    qty: int
+    skus: tuple[str, ...]
+
+
+def _load_aliases(path: Path) -> dict[str, dict[str, Any]]:
+    """Read audit-aliases.json. Missing/invalid file = empty mapping (silent no-op)."""
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    aliases = raw.get("aliases") or {}
+    return {k: v for k, v in aliases.items() if isinstance(v, dict)}
 
 
 def _emoji(qty: int) -> str:
@@ -123,29 +153,66 @@ def build_snapshot_blocks(
 def _resolve_to_stock(
     name: str,
     by_name: dict[str, list[WarehouseStock]],
+    by_sku: dict[str, WarehouseStock],
     bundle_skus: frozenset[str],
     discontinued: DiscontinuedFilter,
-) -> WarehouseStock | None:
-    """Find the trusted-single WarehouseStock for an audit-layout name.
+    aliases: dict[str, dict[str, Any]],
+) -> Resolved | None:
+    """Resolve an AUDIT_LAYOUT name to a Resolved stock summary.
 
-    Reuses BundleRegistry's _name_match which does exact / case-insensitive /
-    substring fallback. Filters out kits, registry-known bundle SKUs, and
-    discontinued / heuristic-match cruft.
+    Resolution order:
+    1. Explicit alias from `audit-aliases.json` — pin to a single SKU
+       or aggregate across multiple SKUs. Aliases bypass kit / bundle /
+       discontinued filters because Avi has explicitly chosen the SKU.
+    2. Fuzzy `_name_matches` walk: iterate ranked candidates and return
+       the first that passes is_kit / bundle / discontinued filters.
+       Earlier behavior bailed to None as soon as the top match failed
+       a filter (e.g. legacy V1 Scalp Scrubber mis-flagged is_kit=True
+       killed the lookup even though V2 single was right behind it).
+
+    Returns None only when the name has no alias AND every fuzzy
+    candidate is filtered out.
     """
-    match = _name_match(name, by_name)
-    if match is None:
-        return None
-    if match.is_kit or match.sku in bundle_skus:
-        return None
-    if discontinued.should_skip(match.sku, match.product_name):
-        return None
-    return match
+    alias = aliases.get(name)
+    if alias:
+        if "sku" in alias:
+            stock = by_sku.get(alias["sku"])
+            if stock is not None:
+                return Resolved(primary_sku=stock.sku, qty=stock.on_hand, skus=(stock.sku,))
+        if "skus" in alias:
+            members = [by_sku[s] for s in alias["skus"] if s in by_sku]
+            if members:
+                # Pick highest-on_hand SKU as the primary label; sum the rest.
+                primary = max(members, key=lambda s: s.on_hand)
+                return Resolved(
+                    primary_sku=primary.sku,
+                    qty=sum(s.on_hand for s in members),
+                    skus=tuple(s.sku for s in members),
+                )
+        # Alias present but its SKUs aren't in this warehouse: fall through
+        # to fuzzy match rather than silently lying with qty=0.
+
+    for candidate in _name_matches(name, by_name):
+        if candidate.is_kit:
+            continue
+        if candidate.sku in bundle_skus:
+            continue
+        if discontinued.should_skip(candidate.sku, candidate.product_name):
+            continue
+        return Resolved(
+            primary_sku=candidate.sku,
+            qty=candidate.on_hand,
+            skus=(candidate.sku,),
+        )
+    return None
 
 
-def _affected_bundle_names(sku: str, registry) -> list[str]:
+def _affected_bundle_names(skus: tuple[str, ...], registry) -> list[str]:
+    """Bundles whose components include any of `skus` (union across aggregates)."""
+    skus_set = set(skus)
     out: list[str] = []
     for entry in registry.bundles:
-        if any(c[0] == sku for c in entry.components_resolved):
+        if any(c[0] in skus_set for c in entry.components_resolved):
             out.append(entry.bundle_name or entry.bundle_sku)
     return sorted(set(out))
 
@@ -157,6 +224,7 @@ def _run(cfg: Config) -> None:
     )
     client = ShipHeroClient(token=access_token, api_url=cfg.shiphero_api_url)
     discontinued = DiscontinuedFilter(DISCONTINUED_PATH)
+    aliases = _load_aliases(ALIASES_PATH)
     slack = SlackClient(cfg.slack_bot_token, cfg.slack_channel, dry_run=cfg.dry_run)
 
     stock = client.fetch_warehouse_stock(warehouse_id=MERCHDROP_WAREHOUSE_ID)
@@ -173,28 +241,48 @@ def _run(cfg: Config) -> None:
         except RuntimeError:
             continue
 
+    # Pull aliased SKUs that aren't returned by warehouse_products (zero on_hand
+    # rows can be excluded from the bulk paginated query). Without this, an
+    # alias pinning to a 0-stock SKU would fall through to fuzzy match instead
+    # of correctly reporting 0.
+    aliased_skus: set[str] = set()
+    for entry in aliases.values():
+        if "sku" in entry:
+            aliased_skus.add(entry["sku"])
+        if "skus" in entry:
+            aliased_skus.update(entry["skus"])
+    for sku in sorted(aliased_skus - known):
+        try:
+            row = client.fetch_warehouse_product_for_sku(sku, MERCHDROP_WAREHOUSE_ID)
+            if row is not None:
+                stock.append(row)
+        except RuntimeError:
+            continue
+
     registry = build_registry(kits, stock, COMPONENTS_PATH)
 
-    # Index by product name for the resolver. When multiple SKUs share a
-    # name (legacy + active), _name_match picks the highest on_hand.
     by_name: dict[str, list[WarehouseStock]] = {}
+    by_sku: dict[str, WarehouseStock] = {}
     for s in stock:
         by_name.setdefault((s.product_name or "").strip(), []).append(s)
+        by_sku.setdefault(s.sku, s)
 
     sections: list[tuple[str, list[ProductLine]]] = []
     for category, names in AUDIT_LAYOUT:
         lines: list[ProductLine] = []
         for name in names:
-            match = _resolve_to_stock(name, by_name, registry.bundle_skus, discontinued)
-            if match is None:
+            resolved = _resolve_to_stock(
+                name, by_name, by_sku, registry.bundle_skus, discontinued, aliases
+            )
+            if resolved is None:
                 lines.append(ProductLine(name=name, qty=0, sku=None, affected_bundles=[]))
                 continue
             lines.append(
                 ProductLine(
                     name=name,
-                    qty=match.on_hand,
-                    sku=match.sku,
-                    affected_bundles=_affected_bundle_names(match.sku, registry),
+                    qty=resolved.qty,
+                    sku=resolved.primary_sku,
+                    affected_bundles=_affected_bundle_names(resolved.skus, registry),
                 )
             )
         sections.append((category, lines))

@@ -1,0 +1,11 @@
+{
+  "_note": "Pin weekly_snapshot AUDIT_LAYOUT names to ShipHero SKUs when fuzzy name matching can't bridge the gap (audit-layout 'Hair Clay' vs ShipHero 'Clay'; legacy V1 SKU mis-flagged is_kit=True hiding the real V2 single; etc.). Keys are AUDIT_LAYOUT names (case-sensitive). Each entry pins to either a single 'sku' (one trusted physical SKU) or a list of 'skus' (sum on_hand across multiple physical SKUs that the audit layout treats as one product, e.g. 50ml + 100ml size variants).",
+  "_format": "Each entry: <AUDIT_LAYOUT name> -> {sku: <ShipHero SKU>} | {skus: [<ShipHero SKU>, ...]}. Edit when ShipHero canonical names drift or new size variants ship.",
+  "aliases": {
+    "Hair Clay": {"sku": "CLAY1"},
+    "Leave-In Conditioner": {"sku": "BB-LEAVEIN-ONE"},
+    "Wooden Hair Comb": {"sku": "BB-GWP-COMB-DARK"},
+    "Scalp Scrubber": {"sku": "BB-ACCS-SCLPSCRBR-V2"},
+    "Tallow Moisturizer": {"skus": ["BB-ONE-BTAL-50ML", "BB-ONE-BTAL-100ML"]}
+  }
+}

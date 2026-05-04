@@ -78,50 +78,67 @@ def _index_stock_by_name(stock: list[WarehouseStock]) -> dict[str, list[Warehous
     return out
 
 
-def _name_match(name: str, by_name: dict[str, list[WarehouseStock]]) -> WarehouseStock | None:
-    """Look up a single SKU for a component or bundle name.
+def _name_matches(name: str, by_name: dict[str, list[WarehouseStock]]) -> list[WarehouseStock]:
+    """Return all candidate SKUs for `name`, ordered by match strength then on_hand.
 
-    Strategy:
+    Strategy (each tier exhausted before falling to the next):
     1. Exact match.
     2. Case-insensitive exact.
     3. Substring match (the search name appears within a longer ShipHero
        name like "BASED Curly Duo | Leave-In Conditioner & Curl Cream"
        — empirically observed for 9/24 set-components.json bundles).
 
-    When multiple SKUs match, prefer the one with the highest on_hand
-    (assumed to be the canonical physical SKU rather than a zeroed-out
-    legacy variant or duplicate channel listing).
+    Within each tier, candidates are sorted by on_hand desc so the
+    caller can iterate from highest-confidence to lowest. Callers that
+    apply additional filters (kit, bundle, discontinued) can fall
+    through to the next candidate when their preferred one is rejected,
+    instead of bailing to None on the first filter hit.
     """
     target = name.strip()
     target_l = target.lower()
+    out: list[WarehouseStock] = []
+    seen: set[str] = set()
 
-    candidates = by_name.get(target)
-    if candidates:
-        return max(candidates, key=lambda s: s.on_hand)
+    def _add(stocks: list[WarehouseStock]) -> None:
+        for s in sorted(stocks, key=lambda x: x.on_hand, reverse=True):
+            if s.sku not in seen:
+                seen.add(s.sku)
+                out.append(s)
 
+    # Tier 1: exact match.
+    exact = by_name.get(target)
+    if exact:
+        _add(exact)
+
+    # Tier 2: case-insensitive exact (skip rows already added by tier 1).
     for k, v in by_name.items():
-        if k.lower() == target_l:
-            return max(v, key=lambda s: s.on_hand)
+        if k != target and k.lower() == target_l:
+            _add(v)
 
-    # Substring fallback: search name appears within a ShipHero product name.
-    # Guard against trivial matches by requiring the target to be at least
-    # 4 chars and to appear as a whole-word boundary.
-    if len(target_l) < 4:
-        return None
-    substring_candidates: list[WarehouseStock] = []
-    for k, v in by_name.items():
-        kl = k.lower()
-        if target_l in kl:
-            # Whole-word boundary check: the match must be flanked by a
-            # non-letter character or end-of-string.
-            idx = kl.find(target_l)
-            before_ok = idx == 0 or not kl[idx - 1].isalnum()
-            after_ok = (idx + len(target_l) == len(kl)) or not kl[idx + len(target_l)].isalnum()
-            if before_ok and after_ok:
-                substring_candidates.extend(v)
-    if substring_candidates:
-        return max(substring_candidates, key=lambda s: s.on_hand)
-    return None
+    # Tier 3: substring fallback. Guard against trivial matches by
+    # requiring the target to be at least 4 chars and to appear at
+    # whole-word boundaries.
+    if len(target_l) >= 4:
+        substring_candidates: list[WarehouseStock] = []
+        for k, v in by_name.items():
+            kl = k.lower()
+            if target_l in kl:
+                idx = kl.find(target_l)
+                before_ok = idx == 0 or not kl[idx - 1].isalnum()
+                end = idx + len(target_l)
+                after_ok = end == len(kl) or not kl[end].isalnum()
+                if before_ok and after_ok:
+                    substring_candidates.extend(v)
+        if substring_candidates:
+            _add(substring_candidates)
+
+    return out
+
+
+def _name_match(name: str, by_name: dict[str, list[WarehouseStock]]) -> WarehouseStock | None:
+    """First/best candidate for `name`. See `_name_matches` for tier semantics."""
+    matches = _name_matches(name, by_name)
+    return matches[0] if matches else None
 
 
 def build_registry(
