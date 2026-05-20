@@ -148,6 +148,7 @@ class ShipHeroClient:
                   sku
                   on_hand
                   available
+                  backorder
                   updated_at
                   product { name kit }
                 }
@@ -157,14 +158,20 @@ class ShipHeroClient:
           }
         }
         """
-        # Note: dropped allocated, backorder, reserve_inventory, sell_ahead
-        # from the projection. None are used downstream (the bot only touches
-        # on_hand for tier ladder + bundle math), and including them roughly
-        # doubled the per-call ShipHero credit cost (~1600 → ~1100). When
-        # this bot ran concurrently with based-weekend-merch the per-minute
-        # pool ceiling drained mid-bisection and merch's run failed entirely.
-        # WarehouseStock keeps the fields with default 0 so existing call
-        # sites stay untouched.
+        # Projection notes:
+        #   - on_hand + available are needed for the availability ladder
+        #     (OVERSOLD uses on_hand<0; the rest uses available).
+        #   - backorder was re-added 2026-05-20 to feed the new backorder
+        #     ladder. The CLAY1 case (14,796-unit backorder against
+        #     available=0) was invisible without it.
+        #   - allocated, reserve_inventory, sell_ahead remain dropped:
+        #     unused downstream, and sell_ahead in particular is expensive
+        #     (~15 credits/SKU on the per-SKU query — see fetch_warehouse_
+        #     product_for_sku). The pool-drain incident that triggered the
+        #     original drop was driven by `sell_ahead`, not by `backorder`,
+        #     so re-adding `backorder` alone is the conservative move.
+        #   - WarehouseStock keeps the other fields with default 0 so
+        #     existing call sites stay untouched.
 
         def fetch(uf: str, ut: str) -> tuple[list[dict], bool]:
             payload = self._execute(
@@ -197,7 +204,7 @@ class ShipHeroClient:
                         on_hand=n["on_hand"] or 0,
                         available=n["available"] or 0,
                         allocated=0,
-                        backorder=0,
+                        backorder=n.get("backorder") or 0,
                         reserve_inventory=0,
                         sell_ahead=0,
                         product_name=product.get("name") or "",
@@ -240,6 +247,7 @@ class ShipHeroClient:
                   sku
                   on_hand
                   available
+                  backorder
                   product { name kit }
                 }
               }
@@ -258,7 +266,7 @@ class ShipHeroClient:
             on_hand=n["on_hand"] or 0,
             available=n["available"] or 0,
             allocated=0,
-            backorder=0,
+            backorder=n.get("backorder") or 0,
             reserve_inventory=0,
             sell_ahead=0,
             product_name=product.get("name") or "",

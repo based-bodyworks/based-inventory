@@ -10,11 +10,18 @@ Backend dispatch:
 
 Payload shape (both backends):
 {
-  "quantity_tiers": {"Shampoo": 500, "Conditioner": 1000},
+  "quantity_tiers": {"BB-SHMP": 500, "BB-COND": 1000},
+  "backorder_tiers": {"CLAY1": 10000},
   "atc_flags": {
     "<variant_gid>::<url>::<flag_type>": {"first_seen_at": "...", "last_seen_at": "..."}
   }
 }
+
+Dedup direction differs between ladders:
+- quantity_tiers values are the availability-threshold ceiling (100, 500, 750,
+  1000, or -1 for OVERSOLD). Lower = worse. Alert fires when new < prev.
+- backorder_tiers values are the backorder-threshold floor (100, 1000, 5000,
+  10000). Higher = worse. Alert fires when new > prev.
 """
 
 from __future__ import annotations
@@ -80,19 +87,23 @@ def _write_file(p: Path, payload: dict[str, Any]) -> None:
 
 def _coerce(
     data: dict[str, Any],
-) -> tuple[dict[str, int], dict[str, dict[str, str]], str | None]:
+) -> tuple[dict[str, int], dict[str, int], dict[str, dict[str, str]], str | None]:
     qt = data.get("quantity_tiers", {})
+    bt = data.get("backorder_tiers", {})
     af = data.get("atc_flags", {})
     sv = data.get("schema_version")
     if not isinstance(qt, dict):
         logger.warning("state 'quantity_tiers' is not an object; ignoring")
         qt = {}
+    if not isinstance(bt, dict):
+        logger.warning("state 'backorder_tiers' is not an object; ignoring")
+        bt = {}
     if not isinstance(af, dict):
         logger.warning("state 'atc_flags' is not an object; ignoring")
         af = {}
     if sv is not None and not isinstance(sv, str):
         sv = None
-    return qt, af, sv
+    return qt, bt, af, sv
 
 
 # Bump this when a code change makes the OLD state no longer correct.
@@ -108,12 +119,19 @@ def _coerce(
 #                rewire; tightened ATC regex with $-price suffix support;
 #                clears stale title-keyed entries and 5 false-positive
 #                ATC flags from the prior DRY_RUN cycles).
-CURRENT_SCHEMA_VERSION = "v2"
+#   v2    -> v3 (2026-05-20: quantity_tiers now keyed off `available`
+#                not `on_hand`; added parallel backorder_tiers ladder.
+#                v2 entries are tier values on the wrong field, so a
+#                CLAY1=100 entry would suppress a now-CRITICAL alert
+#                that should re-fire under the new logic. Clearing all
+#                prior tiers forces a fresh evaluation.).
+CURRENT_SCHEMA_VERSION = "v3"
 
 
 @dataclass
 class AlertState:
     quantity_tiers: dict[str, int] = field(default_factory=dict)
+    backorder_tiers: dict[str, int] = field(default_factory=dict)
     atc_flags: dict[str, dict[str, str]] = field(default_factory=dict)
     schema_version: str = CURRENT_SCHEMA_VERSION
 
@@ -121,23 +139,30 @@ class AlertState:
     def load(cls, location: Path | str) -> AlertState:
         loc = str(location)
         data = _read_redis(loc) if _is_redis_url(loc) else _read_file(Path(loc))
-        qt, af, sv = _coerce(data)
+        qt, bt, af, sv = _coerce(data)
         if sv != CURRENT_SCHEMA_VERSION:
             logger.warning(
                 "AlertState schema version %r != current %r; clearing "
-                "quantity_tiers (%d) and atc_flags (%d) so stale entries "
-                "from the prior code revision don't suppress new alerts.",
+                "quantity_tiers (%d), backorder_tiers (%d), and atc_flags (%d) "
+                "so stale entries from the prior code revision don't suppress new alerts.",
                 sv,
                 CURRENT_SCHEMA_VERSION,
                 len(qt),
+                len(bt),
                 len(af),
             )
-            qt, af = {}, {}
-        return cls(quantity_tiers=qt, atc_flags=af, schema_version=CURRENT_SCHEMA_VERSION)
+            qt, bt, af = {}, {}, {}
+        return cls(
+            quantity_tiers=qt,
+            backorder_tiers=bt,
+            atc_flags=af,
+            schema_version=CURRENT_SCHEMA_VERSION,
+        )
 
     def save(self, location: Path | str) -> None:
         payload = {
             "quantity_tiers": self.quantity_tiers,
+            "backorder_tiers": self.backorder_tiers,
             "atc_flags": self.atc_flags,
             "schema_version": self.schema_version,
         }
@@ -163,6 +188,24 @@ class AlertState:
         if prev is None:
             return True
         return new_tier < prev
+
+    # Backorder tier API. Values are backorder-bucket thresholds (100, 1000,
+    # 5000, 10000); higher = worse, opposite direction from quantity_tiers.
+    def get_backorder_tier(self, sku: str) -> int | None:
+        return self.backorder_tiers.get(sku)
+
+    def set_backorder_tier(self, sku: str, tier: int) -> None:
+        self.backorder_tiers[sku] = tier
+
+    def clear_backorder_tier(self, sku: str) -> None:
+        self.backorder_tiers.pop(sku, None)
+
+    def crosses_higher_backorder_tier(self, sku: str, new_tier: int) -> bool:
+        """True if new_tier represents a worse backorder bucket than recorded."""
+        prev = self.get_backorder_tier(sku)
+        if prev is None:
+            return True
+        return new_tier > prev
 
     # ATC flag API
     def is_new_atc_flag(self, key: str) -> bool:

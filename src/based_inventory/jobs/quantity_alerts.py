@@ -3,12 +3,28 @@
 Source of truth: ShipHero (Merchdrop warehouse). Shopify is no longer
 trusted for inventory because it shows ~20% of unified channel mix.
 
-Tiers (worst-first):
-  🚨🚨 OVERSOLD       on_hand < 0    — already owe customers units
-  🚨   CRITICAL        on_hand <= 100
-  🔴   LOW STOCK       on_hand <= 500
-  🟠   WARNING         on_hand <= 750
-  🟡   HEADS UP        on_hand <= 1000
+Two ladders run in parallel per SKU; an alert posts if either crosses worse:
+
+Availability ladder (uses `available` = on_hand - allocated, except OVERSOLD
+which uses on_hand to catch physical-negative stock):
+  🚨🚨 OVERSOLD       on_hand < 0    — already owe customers physical units
+  🚨   CRITICAL        available <= 100
+  🔴   LOW STOCK       available <= 500
+  🟠   WARNING         available <= 750
+  🟡   HEADS UP        available <= 1000
+
+Backorder ladder (uses `backorder` = queued customer demand against the SKU):
+  📥📥📥 BACKORDER MASSIVE   backorder >= 10,000
+  📥📥  BACKORDER CRITICAL  backorder >= 5,000
+  📥    BACKORDER ALARM     backorder >= 1,000
+  📥    BACKORDER NOTICE    backorder >= 100
+
+The availability ladder catches the "can a buyer take another unit" question;
+the backorder ladder catches the "how deep is the demand hole" question. A
+SKU like CLAY1 at on_hand=312, allocated=312, backorder=14,796 looked fine
+to the prior on_hand-only logic (LOW STOCK, even an improvement from prior
+CRITICAL=45), while actually catastrophic. Surfacing `available=0` AND a
+14,796-unit backorder queue makes the real state visible.
 
 Live-SKU filter (DiscontinuedFilter) removes test / cruft / EOL SKUs
 before any tier check; otherwise alerts on Tallow Moisturizer-style
@@ -23,9 +39,11 @@ components include the at-risk SKU. Source-of-truth for bundle definitions
 is ShipHero kit_components, supplemented by data/set-components.json
 for Shopify-website bundles ShipHero doesn't model.
 
-Dedup: AlertState's quantity_tiers is now keyed by SKU (was Shopify product
-title). On first run after the rewire, clear the state file or accept
-a one-time burst of "first cross" alerts.
+Dedup: AlertState carries two parallel SKU->tier maps (quantity_tiers,
+backorder_tiers). Each ladder dedups independently; the alert fires if
+EITHER ladder crosses to a worse bucket since the last run. The schema
+bump v2->v3 (2026-05-20) clears prior on_hand-keyed quantity_tiers so the
+first run after deploy re-evaluates all SKUs fresh.
 """
 
 from __future__ import annotations
@@ -52,8 +70,8 @@ DISCONTINUED_PATH = DATA_DIR / "discontinued-skus.json"
 # OVERSOLD uses tier sentinel -1 so it sorts as worst.
 OVERSOLD_TIER = -1
 
-# Threshold ladder (positive on_hand). Same units as legacy version so
-# Slack readers see familiar labels.
+# Availability ladder. Threshold value = upper-bound (lower = worse). Same
+# units as legacy version so Slack readers see familiar labels.
 THRESHOLDS: list[tuple[int, str]] = [
     (100, "🚨 CRITICAL"),
     (500, "🔴 LOW STOCK"),
@@ -61,6 +79,33 @@ THRESHOLDS: list[tuple[int, str]] = [
     (1000, "🟡 HEADS UP"),
 ]
 OVERSOLD_LABEL = "🚨🚨 OVERSOLD"
+
+# Backorder ladder. Threshold value = lower-bound (higher = worse). Walked
+# descending so the worst applicable bucket wins.
+BACKORDER_THRESHOLDS: list[tuple[int, str]] = [
+    (10_000, "📥📥📥 BACKORDER MASSIVE"),
+    (5_000, "📥📥 BACKORDER CRITICAL"),
+    (1_000, "📥 BACKORDER ALARM"),
+    (100, "📥 BACKORDER NOTICE"),
+]
+
+# Interleaved severity rank used for header label + sort. Lower = worse.
+# OVERSOLD pins to top. BACKORDER MASSIVE slots between OVERSOLD and
+# CRITICAL because a 10K+ demand hole is operationally worse than any
+# positive-available bucket. Lower backorder buckets slot below the
+# matching-severity availability bucket so availability still leads when
+# both fire at similar severity.
+SEVERITY_RANK: dict[tuple[str, int], int] = {
+    ("avail", OVERSOLD_TIER): 0,
+    ("avail", 100): 100,
+    ("backorder", 10_000): 150,
+    ("avail", 500): 200,
+    ("backorder", 5_000): 250,
+    ("avail", 750): 300,
+    ("backorder", 1_000): 350,
+    ("avail", 1_000): 400,
+    ("backorder", 100): 450,
+}
 
 # Velocity sourcing knobs. Per-SKU max page cap keeps total run time bounded;
 # effective-window scaling in fetch_sku_depletion handles the saturation case.
@@ -74,7 +119,7 @@ US_MARKETPLACE_ID = "ATVPDKIKX0DER"
 @dataclass
 class Alert:
     label: str
-    tier: int
+    tier: int  # Interleaved severity rank from SEVERITY_RANK; lower = worse.
     sku: str
     product_name: str
     on_hand: int
@@ -93,15 +138,88 @@ class Alert:
     depletion_units: int = 0
     effective_window_days: float = 0.0
     fba_quantity: int | None = None  # Amazon FBA quantity (US marketplace) if present
+    # Dual-ladder breakout. `available` is the on_hand-minus-allocated count
+    # that drives the availability ladder; `backorder` is the queued-demand
+    # count that drives the backorder ladder. `backorder_label` is set when
+    # the backorder ladder also triggered (independent of which ladder owns
+    # the primary `label`); rendered as a secondary line in the message.
+    available: int = 0
+    backorder: int = 0
+    backorder_label: str | None = None
 
 
-def _tier_for(on_hand: int) -> tuple[int, str] | None:
-    if on_hand < 0:
+def _tier_for(value: int) -> tuple[int, str] | None:
+    """Single-int availability tier lookup. Negative → OVERSOLD; else ladder
+    by upper-bound threshold; None if above the top bucket (healthy).
+
+    Used by `_availability_tier` (which decides whether to pass `on_hand`
+    or `available`) and exercised directly in tests.
+    """
+    if value < 0:
         return OVERSOLD_TIER, OVERSOLD_LABEL
     for threshold, label in THRESHOLDS:
-        if on_hand <= threshold:
+        if value <= threshold:
             return threshold, label
     return None
+
+
+def _availability_tier(on_hand: int, available: int) -> tuple[int, str] | None:
+    """Availability ladder picker.
+
+    OVERSOLD fires on physical-negative on_hand (we owe customers units we
+    don't physically have, the most acute operational state). For
+    on_hand >= 0, the ladder runs against `available` (sellable units after
+    existing-order allocation), so a SKU whose stock is 100% promised to
+    queued orders is correctly seen as CRITICAL even when the warehouse
+    physically holds units.
+    """
+    if on_hand < 0:
+        return OVERSOLD_TIER, OVERSOLD_LABEL
+    return _tier_for(available)
+
+
+def _backorder_tier_for(backorder: int) -> tuple[int, str] | None:
+    """Backorder ladder picker. Walks descending so the worst applicable
+    bucket wins. Returns None for backorder < 100 (below noise floor).
+    """
+    if backorder < BACKORDER_THRESHOLDS[-1][0]:
+        return None
+    for threshold, label in BACKORDER_THRESHOLDS:
+        if backorder >= threshold:
+            return threshold, label
+    return None
+
+
+def _severity_rank(
+    avail_tier: int | None, backorder_tier: int | None
+) -> tuple[int, str]:
+    """Pick the worst interleaved rank across both ladders and return
+    (rank, primary_label). primary_label is the header label; the
+    secondary ladder (if any) gets rendered separately by build_blocks
+    via Alert.backorder_label, not threaded through here.
+    """
+    candidates: list[tuple[int, str]] = []
+    if avail_tier is not None:
+        candidates.append(
+            (SEVERITY_RANK[("avail", avail_tier)], _label_for_tier("avail", avail_tier))
+        )
+    if backorder_tier is not None:
+        candidates.append(
+            (
+                SEVERITY_RANK[("backorder", backorder_tier)],
+                _label_for_tier("backorder", backorder_tier),
+            )
+        )
+    candidates.sort(key=lambda c: c[0])
+    return candidates[0]
+
+
+def _label_for_tier(kind: str, tier: int) -> str:
+    if kind == "avail":
+        if tier == OVERSOLD_TIER:
+            return OVERSOLD_LABEL
+        return next(label for threshold, label in THRESHOLDS if threshold == tier)
+    return next(label for threshold, label in BACKORDER_THRESHOLDS if threshold == tier)
 
 
 def _format_cover(weeks: float) -> str:
@@ -192,9 +310,16 @@ def build_blocks(
     for a in alerts:
         text_lines = [
             f"{a.label}  •  *{a.product_name or a.sku}*",
-            f"📦  *{a.on_hand:,}* on hand"
-            + (" (already owe customers units)" if a.on_hand < 0 else ""),
         ]
+        if a.backorder_label and not a.label.startswith("📥"):
+            text_lines.append(a.backorder_label)
+        stock_parts = [f"*{a.on_hand:,}* on hand"]
+        if a.available != a.on_hand:
+            stock_parts.append(f"*{a.available:,}* available")
+        if a.backorder > 0:
+            stock_parts.append(f"*{a.backorder:,}* backordered")
+        owe_suffix = " (already owe customers units)" if a.on_hand < 0 else ""
+        text_lines.append("📦  " + "  •  ".join(stock_parts) + owe_suffix)
         if a.velocity_per_day > 0:
             # Label the velocity correctly: if the sample window is much
             # smaller than requested, this is in-stock burst rate, not avg.
@@ -336,18 +461,43 @@ def _run(cfg: Config) -> None:
         inbound = {}
 
     alerts: list[Alert] = []
-    new_tiers: dict[str, int] = {}
+    new_avail_tiers: dict[str, int] = {}
+    new_backorder_tiers: dict[str, int] = {}
     # FBA quantity is queried lazily per SKU at alert time (cheap; only fires
     # for at-risk SKUs, not every candidate). Only US marketplace is summed.
     for s in candidates:
-        tier_info = _tier_for(s.on_hand)
-        if tier_info is None:
+        avail_info = _availability_tier(s.on_hand, s.available)
+        backorder_info = _backorder_tier_for(s.backorder)
+
+        # Always record current ladder positions for the next-run dedup, even
+        # for SKUs that don't fire this run (otherwise a SKU sitting at the
+        # same tier for weeks would re-fire on every backorder fluctuation).
+        if avail_info is not None:
+            new_avail_tiers[s.sku] = avail_info[0]
+        else:
             state.clear_tier(s.sku)
+        if backorder_info is not None:
+            new_backorder_tiers[s.sku] = backorder_info[0]
+        else:
+            state.clear_backorder_tier(s.sku)
+
+        # Dedup: fire if EITHER ladder crossed to a worse bucket since the
+        # prior run. Quiet recovery (improving tiers) is suppressed by both
+        # cross checks returning False.
+        avail_crossed = avail_info is not None and state.crosses_lower_tier(
+            s.sku, avail_info[0]
+        )
+        backorder_crossed = backorder_info is not None and state.crosses_higher_backorder_tier(
+            s.sku, backorder_info[0]
+        )
+        if not (avail_crossed or backorder_crossed):
             continue
-        tier_value, label = tier_info
-        new_tiers[s.sku] = tier_value
-        if not state.crosses_lower_tier(s.sku, tier_value):
-            continue
+
+        rank, primary_label = _severity_rank(
+            avail_info[0] if avail_info else None,
+            backorder_info[0] if backorder_info else None,
+        )
+
         cover = sku_cover.get(s.sku)
         inb = inbound.get(s.sku) or {}
 
@@ -365,8 +515,8 @@ def _run(cfg: Config) -> None:
 
         alerts.append(
             Alert(
-                label=label,
-                tier=tier_value,
+                label=primary_label,
+                tier=rank,
                 sku=s.sku,
                 product_name=s.product_name,
                 on_hand=s.on_hand,
@@ -380,17 +530,22 @@ def _run(cfg: Config) -> None:
                 depletion_units=depletion.get(s.sku, 0),
                 effective_window_days=eff_windows.get(s.sku, 0.0),
                 fba_quantity=fba_qty,
+                available=s.available,
+                backorder=s.backorder,
+                backorder_label=backorder_info[1] if backorder_info else None,
             )
         )
 
-    state.quantity_tiers = new_tiers
+    state.quantity_tiers = new_avail_tiers
+    state.backorder_tiers = new_backorder_tiers
     state.save(cfg.state_path)
 
     if not alerts:
         return
 
-    # Sort: oversold first (most negative on_hand first), then by tier ASC
-    # (CRITICAL before HEADS UP), then by on_hand ASC within tier.
+    # Sort by interleaved severity rank ASC (0 = OVERSOLD, 100 = CRITICAL,
+    # 150 = BACKORDER MASSIVE, ..., 450 = BACKORDER NOTICE), then by on_hand
+    # ASC as tiebreaker so the most-depleted SKU surfaces first within a rank.
     alerts.sort(key=lambda a: (a.tier, a.on_hand))
 
     # Channel mix snapshot for footer (last 7 days). Cheap, single optional

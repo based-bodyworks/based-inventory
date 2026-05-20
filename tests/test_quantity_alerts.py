@@ -4,7 +4,10 @@ from based_inventory.jobs.quantity_alerts import (
     OVERSOLD_LABEL,
     OVERSOLD_TIER,
     Alert,
+    _availability_tier,
+    _backorder_tier_for,
     _format_cover,
+    _severity_rank,
     _tier_for,
     build_blocks,
 )
@@ -52,6 +55,9 @@ def _alert(**overrides) -> Alert:
         inbound_po_count=0,
         inbound_latest_po_date=None,
         inbound_latest_ship_date=None,
+        available=50,  # default matches on_hand so existing tests don't show "available" line
+        backorder=0,
+        backorder_label=None,
     )
     base.update(overrides)
     return Alert(**base)
@@ -245,3 +251,129 @@ def test_build_blocks_omits_fba_when_no_record() -> None:
     blocks = build_blocks([_alert(fba_quantity=None)])
     text = blocks[2]["text"]["text"]
     assert "Amazon FBA" not in text
+
+
+# --------------------------------------------------------------------------
+# Dual-ladder: availability (uses `available` for non-OVERSOLD) + backorder.
+# 2026-05-20: prior on_hand-only logic missed the CLAY1 case where physical
+# stock (312) hid the fact that all units were allocated (available=0) and
+# 14,796 units were backordered. These tests pin the corrected behavior.
+# --------------------------------------------------------------------------
+
+
+def test_availability_tier_uses_oversold_for_negative_on_hand() -> None:
+    # Physical negative trumps available; this is the "we owe customers" state.
+    assert _availability_tier(on_hand=-53, available=0) == (OVERSOLD_TIER, OVERSOLD_LABEL)
+
+
+def test_availability_tier_uses_available_when_on_hand_nonneg() -> None:
+    # The CLAY1 case: on_hand=312 (looks like LOW STOCK), but available=0
+    # because every unit is allocated. We want CRITICAL, not LOW STOCK.
+    assert _availability_tier(on_hand=312, available=0) == (100, "🚨 CRITICAL")
+    # Ditto: lots of physical stock, all promised.
+    assert _availability_tier(on_hand=10_000, available=50) == (100, "🚨 CRITICAL")
+    # Honest healthy state: available high enough to clear top bucket.
+    assert _availability_tier(on_hand=5_000, available=5_000) is None
+
+
+def test_backorder_tier_for_buckets() -> None:
+    assert _backorder_tier_for(0) is None
+    assert _backorder_tier_for(99) is None  # below floor
+    assert _backorder_tier_for(100) == (100, "📥 BACKORDER NOTICE")
+    assert _backorder_tier_for(999) == (100, "📥 BACKORDER NOTICE")
+    assert _backorder_tier_for(1_000) == (1_000, "📥 BACKORDER ALARM")
+    assert _backorder_tier_for(4_999) == (1_000, "📥 BACKORDER ALARM")
+    assert _backorder_tier_for(5_000) == (5_000, "📥📥 BACKORDER CRITICAL")
+    assert _backorder_tier_for(9_999) == (5_000, "📥📥 BACKORDER CRITICAL")
+    assert _backorder_tier_for(10_000) == (10_000, "📥📥📥 BACKORDER MASSIVE")
+    assert _backorder_tier_for(14_796) == (10_000, "📥📥📥 BACKORDER MASSIVE")  # CLAY1
+    assert _backorder_tier_for(50_000) == (10_000, "📥📥📥 BACKORDER MASSIVE")
+
+
+def test_severity_rank_oversold_pins_top_regardless_of_backorder() -> None:
+    # OVERSOLD (rank 0) is worse than any backorder bucket.
+    rank, label = _severity_rank(avail_tier=OVERSOLD_TIER, backorder_tier=10_000)
+    assert rank == 0
+    assert label == OVERSOLD_LABEL
+
+
+def test_severity_rank_backorder_massive_beats_low_stock() -> None:
+    # A 10K+ backorder hole is worse than LOW STOCK (avail tier 500).
+    rank, label = _severity_rank(avail_tier=500, backorder_tier=10_000)
+    assert label == "📥📥📥 BACKORDER MASSIVE"
+    assert rank == 150
+
+
+def test_severity_rank_critical_beats_backorder_massive() -> None:
+    # Availability CRITICAL (rank 100) still leads over MASSIVE backorder (150);
+    # the unit-zero state is more acute than the demand-queue size.
+    rank, label = _severity_rank(avail_tier=100, backorder_tier=10_000)
+    assert rank == 100
+    assert label == "🚨 CRITICAL"
+
+
+def test_severity_rank_only_backorder_fires() -> None:
+    # Availability healthy (above HEADS UP), but backorder crossed a bucket.
+    rank, label = _severity_rank(avail_tier=None, backorder_tier=5_000)
+    assert rank == 250
+    assert label == "📥📥 BACKORDER CRITICAL"
+
+
+def test_severity_rank_only_availability_fires() -> None:
+    rank, label = _severity_rank(avail_tier=500, backorder_tier=None)
+    assert rank == 200
+    assert label == "🔴 LOW STOCK"
+
+
+def test_build_blocks_renders_available_when_differs_from_on_hand() -> None:
+    # CLAY1: 312 on_hand, 0 available, 14,796 backordered → must surface all three.
+    blocks = build_blocks(
+        [
+            _alert(
+                label="🚨 CRITICAL",
+                tier=100,
+                sku="CLAY1",
+                product_name="Hair Clay",
+                on_hand=312,
+                available=0,
+                backorder=14_796,
+                backorder_label="📥📥📥 BACKORDER MASSIVE",
+                affected_bundles=["Complete Styling Kit"],
+            )
+        ]
+    )
+    text = blocks[2]["text"]["text"]
+    assert "312" in text and "on hand" in text
+    assert "0" in text and "available" in text
+    assert "14,796" in text and "backordered" in text
+    # The backorder ladder triggered too; secondary label should appear.
+    assert "BACKORDER MASSIVE" in text
+
+
+def test_build_blocks_omits_available_when_matches_on_hand() -> None:
+    # Healthy-ish SKU where on_hand == available: don't add a redundant line.
+    blocks = build_blocks([_alert(on_hand=400, available=400, backorder=0)])
+    text = blocks[2]["text"]["text"]
+    assert "on hand" in text
+    assert "available" not in text  # no parenthetical redundancy
+    assert "backordered" not in text
+
+
+def test_build_blocks_does_not_repeat_backorder_label_when_primary() -> None:
+    # When the backorder ladder owns the primary label, we don't want it
+    # echoed on a second line; build_blocks suppresses the secondary echo.
+    blocks = build_blocks(
+        [
+            _alert(
+                label="📥📥📥 BACKORDER MASSIVE",
+                tier=150,
+                on_hand=2_000,
+                available=2_000,
+                backorder=12_000,
+                backorder_label="📥📥📥 BACKORDER MASSIVE",
+            )
+        ]
+    )
+    text = blocks[2]["text"]["text"]
+    # Should only appear once (in the header line), not duplicated as a secondary line.
+    assert text.count("BACKORDER MASSIVE") == 1

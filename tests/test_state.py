@@ -205,3 +205,102 @@ def test_redis_url_with_tls_scheme_dispatches_to_redis():
     with patcher:
         state = AlertState.load("rediss://localhost:6379/0")
     assert state.quantity_tiers == {}
+
+
+# --------------------------------------------------------------------------
+# Backorder tier API (added 2026-05-20 alongside the dual-ladder fix).
+# Direction-of-worse is opposite to quantity_tiers: higher value = worse.
+# --------------------------------------------------------------------------
+
+
+def test_set_and_get_backorder_tier(tmp_path: Path):
+    state = AlertState.load(tmp_path / "s.json")
+    state.set_backorder_tier("CLAY1", 10_000)
+    assert state.get_backorder_tier("CLAY1") == 10_000
+    assert state.get_backorder_tier("UnknownSKU") is None
+
+
+def test_crosses_higher_backorder_tier_first_time_true(tmp_path: Path):
+    state = AlertState.load(tmp_path / "s.json")
+    assert state.crosses_higher_backorder_tier("CLAY1", 1_000) is True
+
+
+def test_crosses_higher_backorder_tier_true_on_escalation(tmp_path: Path):
+    state = AlertState.load(tmp_path / "s.json")
+    state.set_backorder_tier("CLAY1", 1_000)
+    assert state.crosses_higher_backorder_tier("CLAY1", 5_000) is True
+    assert state.crosses_higher_backorder_tier("CLAY1", 10_000) is True
+
+
+def test_crosses_higher_backorder_tier_false_on_same(tmp_path: Path):
+    state = AlertState.load(tmp_path / "s.json")
+    state.set_backorder_tier("CLAY1", 5_000)
+    assert state.crosses_higher_backorder_tier("CLAY1", 5_000) is False
+
+
+def test_crosses_higher_backorder_tier_false_on_recovery(tmp_path: Path):
+    # Backorder bucket dropping is good news — don't re-alert.
+    state = AlertState.load(tmp_path / "s.json")
+    state.set_backorder_tier("CLAY1", 10_000)
+    assert state.crosses_higher_backorder_tier("CLAY1", 5_000) is False
+    assert state.crosses_higher_backorder_tier("CLAY1", 1_000) is False
+
+
+def test_clear_backorder_tier(tmp_path: Path):
+    state = AlertState.load(tmp_path / "s.json")
+    state.set_backorder_tier("CLAY1", 1_000)
+    state.clear_backorder_tier("CLAY1")
+    assert state.get_backorder_tier("CLAY1") is None
+    # Clearing a missing key is a no-op, not an error.
+    state.clear_backorder_tier("NeverSet")
+
+
+def test_backorder_tiers_round_trip_through_save_and_reload(tmp_path: Path):
+    path = tmp_path / "s.json"
+    state = AlertState.load(path)
+    state.set_tier("BB-SHMP", 500)
+    state.set_backorder_tier("CLAY1", 10_000)
+    state.set_backorder_tier("BB-CC-01", 1_000)
+    state.save(path)
+
+    reloaded = AlertState.load(path)
+    assert reloaded.get_tier("BB-SHMP") == 500
+    assert reloaded.get_backorder_tier("CLAY1") == 10_000
+    assert reloaded.get_backorder_tier("BB-CC-01") == 1_000
+
+
+def test_schema_v2_state_is_cleared_on_load_under_v3(tmp_path: Path):
+    """Regression: an old v2 payload had quantity_tiers keyed off on_hand-derived
+    tier values. Reloading that under v3 (which interprets tier values as
+    available-derived) would suppress legitimate new alerts. The schema_version
+    guard MUST wipe both quantity_tiers and backorder_tiers on mismatch so the
+    next run re-evaluates from scratch."""
+    path = tmp_path / "s.json"
+    path.write_text(
+        '{"schema_version": "v2", "quantity_tiers": {"CLAY1": 100}, '
+        '"backorder_tiers": {"CLAY1": 5000}, "atc_flags": {}}'
+    )
+    state = AlertState.load(path)
+    assert state.quantity_tiers == {}
+    assert state.backorder_tiers == {}
+    assert state.schema_version == "v3"
+
+
+def test_load_treats_missing_backorder_tiers_as_empty(tmp_path: Path):
+    # Pre-v3 payloads have no backorder_tiers key — handle gracefully.
+    path = tmp_path / "s.json"
+    path.write_text(
+        '{"schema_version": "v3", "quantity_tiers": {}, "atc_flags": {}}'
+    )
+    state = AlertState.load(path)
+    assert state.backorder_tiers == {}
+
+
+def test_load_treats_non_object_backorder_tiers_as_empty(tmp_path: Path):
+    path = tmp_path / "s.json"
+    path.write_text(
+        '{"schema_version": "v3", "quantity_tiers": {}, '
+        '"backorder_tiers": "oops", "atc_flags": {}}'
+    )
+    state = AlertState.load(path)
+    assert state.backorder_tiers == {}
