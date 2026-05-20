@@ -190,9 +190,7 @@ def _backorder_tier_for(backorder: int) -> tuple[int, str] | None:
     return None
 
 
-def _severity_rank(
-    avail_tier: int | None, backorder_tier: int | None
-) -> tuple[int, str]:
+def _severity_rank(avail_tier: int | None, backorder_tier: int | None) -> tuple[int, str]:
     """Pick the worst interleaved rank across both ladders and return
     (rank, primary_label). primary_label is the header label; the
     secondary ladder (if any) gets rendered separately by build_blocks
@@ -484,9 +482,7 @@ def _run(cfg: Config) -> None:
         # Dedup: fire if EITHER ladder crossed to a worse bucket since the
         # prior run. Quiet recovery (improving tiers) is suppressed by both
         # cross checks returning False.
-        avail_crossed = avail_info is not None and state.crosses_lower_tier(
-            s.sku, avail_info[0]
-        )
+        avail_crossed = avail_info is not None and state.crosses_lower_tier(s.sku, avail_info[0])
         backorder_crossed = backorder_info is not None and state.crosses_higher_backorder_tier(
             s.sku, backorder_info[0]
         )

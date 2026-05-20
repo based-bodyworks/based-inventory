@@ -289,9 +289,7 @@ def test_schema_v2_state_is_cleared_on_load_under_v3(tmp_path: Path):
 def test_load_treats_missing_backorder_tiers_as_empty(tmp_path: Path):
     # Pre-v3 payloads have no backorder_tiers key — handle gracefully.
     path = tmp_path / "s.json"
-    path.write_text(
-        '{"schema_version": "v3", "quantity_tiers": {}, "atc_flags": {}}'
-    )
+    path.write_text('{"schema_version": "v3", "quantity_tiers": {}, "atc_flags": {}}')
     state = AlertState.load(path)
     assert state.backorder_tiers == {}
 
