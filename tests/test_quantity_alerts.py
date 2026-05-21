@@ -5,6 +5,7 @@ from based_inventory.jobs.quantity_alerts import (
     OVERSOLD_TIER,
     Alert,
     _availability_tier,
+    _backorder_is_alertable,
     _backorder_tier_for,
     _format_cover,
     _severity_rank,
@@ -357,6 +358,25 @@ def test_build_blocks_omits_available_when_matches_on_hand() -> None:
     assert "on hand" in text
     assert "available" not in text  # no parenthetical redundancy
     assert "backordered" not in text
+
+
+def test_backorder_is_alertable_fires_when_available_cannot_cover() -> None:
+    # CLAY1-shape case: 0 available, 14,858 backordered -> genuine alert.
+    assert _backorder_is_alertable(available=0, backorder=14_858) is True
+    # Leave-In-shape case: 1,033 available < 3,415 backordered -> uncovered gap, fire.
+    assert _backorder_is_alertable(available=1_033, backorder=3_415) is True
+    # Boundary: available exactly equals backorder -> still alertable (zero margin).
+    assert _backorder_is_alertable(available=500, backorder=500) is True
+
+
+def test_backorder_is_alertable_suppresses_when_stock_covers() -> None:
+    # CRS-shape case (the 2026-05-20 false positive): 107,819 available,
+    # 996 backorder counter sticky from prior depletion -> suppress.
+    assert _backorder_is_alertable(available=107_819, backorder=996) is False
+    # Sea Salt Spray-shape: 35,176 available > 8,516 backorder -> suppress.
+    assert _backorder_is_alertable(available=35_176, backorder=8_516) is False
+    # One-unit margin counts as covered.
+    assert _backorder_is_alertable(available=501, backorder=500) is False
 
 
 def test_build_blocks_does_not_repeat_backorder_label_when_primary() -> None:

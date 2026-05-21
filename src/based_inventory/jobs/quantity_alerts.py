@@ -13,7 +13,8 @@ which uses on_hand to catch physical-negative stock):
   🟠   WARNING         available <= 750
   🟡   HEADS UP        available <= 1000
 
-Backorder ladder (uses `backorder` = queued customer demand against the SKU):
+Backorder ladder (uses `backorder` = queued customer demand against the SKU,
+gated on `available <= backorder` so stale ShipHero counters don't fire):
   📥📥📥 BACKORDER MASSIVE   backorder >= 10,000
   📥📥  BACKORDER CRITICAL  backorder >= 5,000
   📥    BACKORDER ALARM     backorder >= 1,000
@@ -25,6 +26,13 @@ SKU like CLAY1 at on_hand=312, allocated=312, backorder=14,796 looked fine
 to the prior on_hand-only logic (LOW STOCK, even an improvement from prior
 CRITICAL=45), while actually catastrophic. Surfacing `available=0` AND a
 14,796-unit backorder queue makes the real state visible.
+
+The backorder gate exists because ShipHero's `warehouse_products.backorder`
+is sticky after restock (see `_backorder_is_alertable` docstring for the
+2026-05-20 CRS evidence). Without it the v3 release fired backorder alerts
+on 10 healthy SKUs in the first burst (Sea Salt Spray, Pomade, Shampoo,
+etc.) where 70-107K units of available stock dwarfed the residual backorder
+counter from prior depletion events.
 
 Live-SKU filter (DiscontinuedFilter) removes test / cruft / EOL SKUs
 before any tier check; otherwise alerts on Tallow Moisturizer-style
@@ -181,6 +189,9 @@ def _availability_tier(on_hand: int, available: int) -> tuple[int, str] | None:
 def _backorder_tier_for(backorder: int) -> tuple[int, str] | None:
     """Backorder ladder picker. Walks descending so the worst applicable
     bucket wins. Returns None for backorder < 100 (below noise floor).
+
+    Callers MUST also pass the result through `_backorder_is_alertable`
+    against the current `available` count; see that function for why.
     """
     if backorder < BACKORDER_THRESHOLDS[-1][0]:
         return None
@@ -188,6 +199,29 @@ def _backorder_tier_for(backorder: int) -> tuple[int, str] | None:
         if backorder >= threshold:
             return threshold, label
     return None
+
+
+def _backorder_is_alertable(available: int, backorder: int) -> bool:
+    """Operational gate for the backorder ladder.
+
+    ShipHero's `warehouse_products.backorder` field is a sticky counter
+    rather than a live "currently uncovered demand" number. When stock is
+    low it correctly counts units ordered but not in stock; but when
+    restock arrives, ShipHero silently re-allocates those backorder
+    line_items to fresh stock WITHOUT decrementing the warehouse_products
+    backorder counter. Observed 2026-05-20 on BB-CRS-SINGLE (Curl Refresh
+    Spray): on_hand=109,038, available=107,856, backorder=996, yet a scan
+    of the 25 most recent CRS-containing orders since 2026-04-01 showed
+    sum(line_items.backorder_quantity)=0. The 996 is residue from a
+    prior stockout, not a current operational gap.
+
+    Gate rule: only fire when current `available` cannot cover the
+    backorder counter, i.e. there's a genuine "we owe more than we can
+    ship right now" situation. Examples:
+    - CLAY1 (available=0, backorder=14,858): 0 <= 14,858 -> fires (real).
+    - CRS    (available=107,819, backorder=996): 107,819 > 996 -> suppressed (stale counter).
+    """
+    return available <= backorder
 
 
 def _severity_rank(avail_tier: int | None, backorder_tier: int | None) -> tuple[int, str]:
@@ -466,6 +500,11 @@ def _run(cfg: Config) -> None:
     for s in candidates:
         avail_info = _availability_tier(s.on_hand, s.available)
         backorder_info = _backorder_tier_for(s.backorder)
+        if backorder_info is not None and not _backorder_is_alertable(s.available, s.backorder):
+            # ShipHero's backorder counter is sticky after restock; suppress
+            # the ladder when current available stock can cover the queued
+            # backorder. See _backorder_is_alertable docstring for evidence.
+            backorder_info = None
 
         # Always record current ladder positions for the next-run dedup, even
         # for SKUs that don't fire this run (otherwise a SKU sitting at the
