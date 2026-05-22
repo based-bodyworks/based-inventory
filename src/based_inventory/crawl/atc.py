@@ -177,6 +177,14 @@ class AtcCrawler:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        # URLs the crawler skipped because the storefront client-side-redirected
+        # away from the requested path (e.g. /products/scalp-scrubber → /pages/
+        # not-found). atc_audit reads this set to suppress NO_BUY_BUTTON flags
+        # for URLs that didn't actually render — the "no observations" there is
+        # because the page is genuinely gone, not because the ATC is missing.
+        # Populated by audit_url's redirect branch. Lives on the crawler so it
+        # accumulates across all per-URL audit calls in a single run.
+        self.skipped_urls: set[str] = set()
 
     def __enter__(self) -> AtcCrawler:
         self._playwright = sync_playwright().start()
@@ -283,6 +291,7 @@ class AtcCrawler:
                     final_url,
                     elapsed,
                 )
+                self.skipped_urls.add(url)
                 page.close()
                 return []
 
@@ -342,10 +351,17 @@ class AtcCrawler:
                         return false;
                     }""",
                     arg=page_handle,
-                    # Paired with the 20s page-load bump above. If the
-                    # page itself takes 12-15s to settle on prod, ATC mount
-                    # often follows another 1-2s after that.
-                    timeout=12_000,
+                    # Paired with the 20s page-load bump above. Originally
+                    # 12s; bumped to 25s on 2026-05-21 after the first
+                    # post-OOM atc run (2GB plan) produced ~14 false
+                    # NO_BUY_BUTTON flags on bundle / set / duo PDPs where
+                    # the SPAN-wrapped Add-to-Cart leaf is laid out ~30K
+                    # pixels down the page and takes longer to mount under
+                    # sequential-batch load (shared browser context across
+                    # 100+ URLs). Singles still pass in 1-2s; the bump
+                    # only costs time on the genuinely slow-to-hydrate
+                    # bundle PDPs.
+                    timeout=25_000,
                 )
 
             if needs_lazy_scroll:

@@ -4,10 +4,13 @@ import dataclasses
 import json
 
 from based_inventory.crawl.atc import VariantObservation
-from based_inventory.crawl.diff import Flag, FlagType
+from based_inventory.crawl.diff import ExpectedState, Flag, FlagType
 from based_inventory.jobs.atc_audit import (
+    ExpectedProduct,
+    ExpectedVariant,
     _dedupe_flags_by_state_key,
     _flags_for_observation,
+    _maybe_no_buy_button_flag,
     build_atc_blocks,
     compute_expected_products,
 )
@@ -284,3 +287,104 @@ def test_flags_for_observation_skips_when_handle_is_none(tmp_path):
         text="ADD TO CART",
     )
     assert _flags_for_observation(obs, expected) == []
+
+
+# --------------------------------------------------------------------------
+# NO_BUY_BUTTON emission gating. The fourth condition (skipped_urls check)
+# was added 2026-05-21 after the first post-OOM atc run flagged genuine
+# 404 PDPs (e.g. scalp-scrubber redirects to /pages/not-found) as having
+# missing buy buttons. That's misleading — the PDP isn't broken, the
+# storefront has unpublished it while Shopify's catalog still lists it.
+# --------------------------------------------------------------------------
+
+
+def _make_expected_for_handle(handle: str) -> dict[str, ExpectedProduct]:
+    """Test fixture: an expected_by_handle dict with one product."""
+    variant = ExpectedVariant(
+        variant_gid="gid://shopify/ProductVariant/1",
+        product_title="Scalp Scrubber",
+        variant_label="Default Title",
+        expected=ExpectedState(sellable=True, inventory_policy="DENY"),
+    )
+    return {
+        handle: ExpectedProduct(
+            product_handle=handle, product_title="Scalp Scrubber", variants=[variant]
+        )
+    }
+
+
+def test_maybe_no_buy_button_fires_when_pdp_renders_with_no_handle_match():
+    """Baseline: a PDP that loads, isn't skipped, and produces no matching
+    observation should fire NO_BUY_BUTTON. This is the real broken-theme case."""
+    url = "https://based.com/products/scalp-scrubber"
+    flag = _maybe_no_buy_button_flag(
+        url=url,
+        page_handle="scalp-scrubber",
+        expected_by_handle=_make_expected_for_handle("scalp-scrubber"),
+        observed_handles_here=set(),
+        skipped_urls=set(),
+    )
+    assert flag is not None
+    assert flag.flag_type == FlagType.NO_BUY_BUTTON
+    assert flag.url == url
+
+
+def test_maybe_no_buy_button_suppressed_when_url_is_in_skipped_urls():
+    """The 2026-05-21 regression: when the crawler skipped a URL due to a
+    client-side redirect (e.g. scalp-scrubber → /pages/not-found), we MUST
+    NOT emit NO_BUY_BUTTON. The page is genuinely gone, not broken."""
+    url = "https://based.com/products/scalp-scrubber"
+    flag = _maybe_no_buy_button_flag(
+        url=url,
+        page_handle="scalp-scrubber",
+        expected_by_handle=_make_expected_for_handle("scalp-scrubber"),
+        observed_handles_here=set(),
+        skipped_urls={url},
+    )
+    assert flag is None
+
+
+def test_maybe_no_buy_button_suppressed_when_handle_observed():
+    """If the crawler observed an ATC tagged with the page's handle, the
+    button is present and we should not flag."""
+    flag = _maybe_no_buy_button_flag(
+        url="https://based.com/products/shampoo",
+        page_handle="shampoo",
+        expected_by_handle=_make_expected_for_handle("shampoo"),
+        observed_handles_here={"shampoo"},
+        skipped_urls=set(),
+    )
+    assert flag is None
+
+
+def test_maybe_no_buy_button_suppressed_for_unknown_handle():
+    """If Shopify doesn't claim this handle, we have nothing to flag against."""
+    flag = _maybe_no_buy_button_flag(
+        url="https://based.com/products/some-deleted-product",
+        page_handle="some-deleted-product",
+        expected_by_handle=_make_expected_for_handle("scalp-scrubber"),
+        observed_handles_here=set(),
+        skipped_urls=set(),
+    )
+    assert flag is None
+
+
+def test_maybe_no_buy_button_suppressed_for_non_pdp_url():
+    """Collection / landing pages have no page_handle; never flag."""
+    flag = _maybe_no_buy_button_flag(
+        url="https://based.com/collections/skin",
+        page_handle=None,
+        expected_by_handle=_make_expected_for_handle("scalp-scrubber"),
+        observed_handles_here=set(),
+        skipped_urls=set(),
+    )
+    assert flag is None
+
+
+def test_atc_crawler_initializes_with_empty_skipped_urls():
+    """Regression guard: the skipped_urls attribute must exist and start
+    empty so atc_audit can gate NO_BUY_BUTTON on it."""
+    from based_inventory.crawl.atc import AtcCrawler
+
+    crawler = AtcCrawler()
+    assert crawler.skipped_urls == set()

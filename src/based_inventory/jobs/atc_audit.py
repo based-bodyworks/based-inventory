@@ -247,6 +247,54 @@ def _flags_for_observation(
     )
 
 
+def _maybe_no_buy_button_flag(
+    *,
+    url: str,
+    page_handle: str | None,
+    expected_by_handle: dict[str, ExpectedProduct],
+    observed_handles_here: set[str],
+    skipped_urls: set[str],
+) -> Flag | None:
+    """Decide whether to emit a NO_BUY_BUTTON flag for a PDP that produced
+    zero handle-matching observations.
+
+    Conditions that must ALL hold for a flag to fire:
+    - URL is a /products/{handle} PDP (page_handle is non-empty)
+    - Shopify's catalog claims this handle is a published product
+      (page_handle in expected_by_handle)
+    - The crawler did not observe any ATC tagged with this handle on the page
+      (page_handle not in observed_handles_here)
+    - The crawler did not skip this URL due to a client-side redirect
+      (url not in skipped_urls): when the storefront 404s a still-published
+      handle (e.g. /products/scalp-scrubber → /pages/not-found), the missing
+      ATC is a symptom of the page being gone, not of a broken buy button;
+      flagging NO_BUY_BUTTON in that case is misleading. The redirect is
+      already visible in the crawler's "Skipped <url>" log line.
+    """
+    if not page_handle:
+        return None
+    if page_handle not in expected_by_handle:
+        return None
+    if page_handle in observed_handles_here:
+        return None
+    if url in skipped_urls:
+        return None
+    product = expected_by_handle[page_handle]
+    default = product.find_by_label(None)
+    if default is None:
+        return None
+    return Flag(
+        flag_type=FlagType.NO_BUY_BUTTON,
+        product_title=product.product_title,
+        variant_gid=default.variant_gid,
+        variant_label=None,
+        url=url,
+        expected_sellable=default.expected.sellable,
+        observed_text="",
+        state_key=f"{default.variant_gid}::{url}::NO_BUY_BUTTON",
+    )
+
+
 def _run(cfg: Config) -> None:
     token = fetch_access_token(cfg.shopify_store, cfg.shopify_client_id, cfg.shopify_client_secret)
     shopify = ShopifyClient(cfg.shopify_store, token, cfg.shopify_api_version)
@@ -290,28 +338,15 @@ def _run(cfg: Config) -> None:
                 if obs.product_handle:
                     observed_handles_here.add(obs.product_handle)
 
-            # If a PDP rendered but produced ZERO observations for its own
-            # product, the theme is genuinely broken on that page.
-            if (
-                page_handle
-                and page_handle in expected_by_handle
-                and page_handle not in observed_handles_here
-            ):
-                product = expected_by_handle[page_handle]
-                default = product.find_by_label(None)
-                if default is not None:
-                    all_flags.append(
-                        Flag(
-                            flag_type=FlagType.NO_BUY_BUTTON,
-                            product_title=product.product_title,
-                            variant_gid=default.variant_gid,
-                            variant_label=None,
-                            url=url,
-                            expected_sellable=default.expected.sellable,
-                            observed_text="",
-                            state_key=f"{default.variant_gid}::{url}::NO_BUY_BUTTON",
-                        )
-                    )
+            nbb_flag = _maybe_no_buy_button_flag(
+                url=url,
+                page_handle=page_handle,
+                expected_by_handle=expected_by_handle,
+                observed_handles_here=observed_handles_here,
+                skipped_urls=crawler.skipped_urls,
+            )
+            if nbb_flag is not None:
+                all_flags.append(nbb_flag)
 
     logger.info("Found %d flags", len(all_flags))
 
