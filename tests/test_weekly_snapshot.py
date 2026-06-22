@@ -1,5 +1,7 @@
 """Tests for weekly_snapshot block construction (ShipHero-sourced)."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -14,13 +16,20 @@ from based_inventory.jobs.weekly_snapshot import (
 from based_inventory.shiphero import WarehouseStock
 
 
-def _stock(sku: str, name: str, on_hand: int, is_kit: bool = False) -> WarehouseStock:
+def _stock(
+    sku: str,
+    name: str,
+    on_hand: int,
+    is_kit: bool = False,
+    available: int | None = None,
+    backorder: int = 0,
+) -> WarehouseStock:
     return WarehouseStock(
         sku=sku,
         on_hand=on_hand,
-        available=on_hand,
-        allocated=0,
-        backorder=0,
+        available=on_hand if available is None else available,
+        allocated=0 if available is None else max(0, on_hand - available),
+        backorder=backorder,
         reserve_inventory=0,
         sell_ahead=0,
         product_name=name,
@@ -105,15 +114,20 @@ def test_snapshot_renders_not_found_when_sku_missing() -> None:
 
 
 def test_snapshot_emoji_tier_for_oversold() -> None:
+    """Legacy ladder test. The signature changed in 2026-05-08 from
+    `_emoji(qty)` (where qty meant on_hand) to `_emoji(available, backorder,
+    on_hand)`. With the new contract, ⛔ requires explicit on_hand < 0; a
+    negative value passed as `available` falls through to the available
+    ladder (it's not the right input to express physical-oversold)."""
     from based_inventory.jobs.weekly_snapshot import _emoji
 
-    assert _emoji(-53) == "⛔"
-    assert _emoji(50) == "🚨"
-    assert _emoji(500) == "🔴"
-    assert _emoji(750) == "🟠"
-    assert _emoji(1000) == "🟡"
-    assert _emoji(5000) == "📊"
-    assert _emoji(50000) == "🟢"
+    assert _emoji(available=0, on_hand=-53) == "⛔"
+    assert _emoji(available=50) == "🚨"
+    assert _emoji(available=500) == "🔴"
+    assert _emoji(available=750) == "🟠"
+    assert _emoji(available=1000) == "🟡"
+    assert _emoji(available=5000) == "📊"
+    assert _emoji(available=50000) == "🟢"
 
 
 # Resolver fallback + alias regression tests.
@@ -244,10 +258,182 @@ def test_load_aliases_parses_valid_file(tmp_path: Path) -> None:
 
 
 def test_resolved_dataclass_fields() -> None:
-    r = Resolved(primary_sku="X", qty=10, skus=("X",))
+    r = Resolved(primary_sku="X", on_hand=10, skus=("X",))
     assert r.primary_sku == "X"
-    assert r.qty == 10
+    assert r.on_hand == 10
+    assert r.qty == 10  # back-compat alias
     assert r.skus == ("X",)
+    # New fields default to 0; available defaults explicitly (not on_hand)
+    # since callers may legitimately want to express "0 sellable" via Resolved.
+    assert r.available == 0
+    assert r.backorder == 0
+
+
+def test_resolved_carries_available_and_backorder() -> None:
+    r = Resolved(primary_sku="X", on_hand=4724, available=0, backorder=6080, skus=("X",))
+    assert r.on_hand == 4724
+    assert r.available == 0
+    assert r.backorder == 6080
+
+
+def test_resolve_pulls_available_and_backorder_from_warehouse_stock() -> None:
+    """The conditioner case: 4,724 on_hand with 0 available + 6,080 backordered.
+    Before this fix, the snapshot rendered '4,724' and looked healthy. After,
+    the resolver carries all three numbers downstream."""
+    stocks = [_stock("BB-COND", "Conditioner", 4724, available=0, backorder=6080)]
+    by_name, by_sku = _index(stocks)
+    resolved = _resolve_to_stock(
+        "Conditioner", by_name, by_sku, frozenset(), _empty_disc(), aliases={}
+    )
+    assert resolved is not None
+    assert resolved.on_hand == 4724
+    assert resolved.available == 0
+    assert resolved.backorder == 6080
+
+
+def test_resolve_alias_sums_available_and_backorder_across_skus() -> None:
+    """For multi-SKU aliases (Tallow 50ml + 100ml), all three quantity
+    fields must be summed, not just on_hand."""
+    stocks = [
+        _stock("BB-ONE-BTAL-50ML", "Tallow Moisturizer 50ml", 120, available=100, backorder=20),
+        _stock("BB-ONE-BTAL-100ML", "Tallow 100ml", 80, available=50, backorder=30),
+    ]
+    by_name, by_sku = _index(stocks)
+    aliases = {"Tallow Moisturizer": {"skus": ["BB-ONE-BTAL-50ML", "BB-ONE-BTAL-100ML"]}}
+    resolved = _resolve_to_stock(
+        "Tallow Moisturizer", by_name, by_sku, frozenset(), _empty_disc(), aliases=aliases
+    )
+    assert resolved is not None
+    assert resolved.on_hand == 200
+    assert resolved.available == 150
+    assert resolved.backorder == 50
+
+
+# --------------------------------------------------------------------------
+# Render: healthy compact vs. at-risk expanded
+# --------------------------------------------------------------------------
+
+
+def test_render_healthy_sku_shows_compact_available_only() -> None:
+    from based_inventory.jobs.weekly_snapshot import _render_line
+
+    line = ProductLine(
+        name="Shampoo",
+        on_hand=73932,
+        available=73932,
+        backorder=0,
+        sku="BB-SHMP",
+        affected_bundles=[],
+    )
+    out = _render_line(line)
+    assert out == "🟢 Shampoo: *73,932* available"
+    assert "on hand" not in out
+    assert "backordered" not in out
+
+
+def test_render_at_risk_sku_shows_full_picture() -> None:
+    """The headline regression case: Conditioner at 4,724 on_hand, 0
+    available, 6,080 backordered should render as a CRITICAL alert with
+    all three numbers visible — not as 'Conditioner: 4,724' which looks
+    healthy."""
+    from based_inventory.jobs.weekly_snapshot import _render_line
+
+    line = ProductLine(
+        name="Conditioner",
+        on_hand=4724,
+        available=0,
+        backorder=6080,
+        sku="BB-COND",
+        affected_bundles=[],
+    )
+    out = _render_line(line)
+    assert out.startswith("🚨")  # available=0 triggers critical, not 📊 1K-5K
+    assert "4,724" in out
+    assert "0" in out
+    assert "6,080" in out
+    assert "on hand" in out
+    assert "available" in out
+    assert "backordered" in out
+
+
+def test_render_backorder_with_healthy_available_triggers_expanded() -> None:
+    """Healthy available but a backorder queue still warrants the expanded
+    format so the queue is visible. Emoji stays healthy (the queue isn't
+    big enough to dent sellable stock) but the line is no longer compact."""
+    from based_inventory.jobs.weekly_snapshot import _render_line
+
+    line = ProductLine(
+        name="Shampoo",
+        on_hand=30000,
+        available=30000,
+        backorder=124,
+        sku="BB-SHMP",
+        affected_bundles=[],
+    )
+    out = _render_line(line)
+    assert "on hand" in out
+    assert "available" in out
+    assert "backordered" in out
+    assert "124" in out
+
+
+def test_render_emoji_tier_picks_from_available_not_on_hand() -> None:
+    """Regression guard: a SKU with 4,724 on_hand but 0 available must NOT
+    render with the '📊 1K-5K' healthy band emoji. It should be 🚨 because
+    available <= 100."""
+    from based_inventory.jobs.weekly_snapshot import _emoji
+
+    assert _emoji(available=0, backorder=6080) == "🚨"
+    # on_hand is irrelevant to the band — the function shouldn't be tricked
+    # into thinking high on_hand means healthy.
+    assert _emoji(available=0, backorder=6080, on_hand=4724) == "🚨"
+    # Oversold sentinel still fires when on_hand goes physical-negative.
+    assert _emoji(available=0, on_hand=-15) == "⛔"
+    # available alone, no backorder: standard ladder.
+    assert _emoji(available=50000) == "🟢"
+    assert _emoji(available=2000) == "📊"
+    assert _emoji(available=900) == "🟡"
+    assert _emoji(available=600) == "🟠"
+    assert _emoji(available=300) == "🔴"
+    assert _emoji(available=50) == "🚨"
+
+
+def test_render_preserves_fba_qty_annotation_in_both_formats() -> None:
+    from based_inventory.jobs.weekly_snapshot import _render_line
+
+    healthy = ProductLine(
+        name="Shampoo", on_hand=50000, available=50000, sku="BB-SHMP",
+        affected_bundles=[], fba_qty=1200,
+    )
+    risky = ProductLine(
+        name="Conditioner", on_hand=4724, available=0, backorder=6080,
+        sku="BB-COND", affected_bundles=[], fba_qty=0,
+    )
+    assert "🅰️" in _render_line(healthy)
+    assert "1,200" in _render_line(healthy)
+    assert "🅰️" in _render_line(risky)
+
+
+def test_render_fetch_error_takes_precedence() -> None:
+    from based_inventory.jobs.weekly_snapshot import _render_line
+
+    line = ProductLine(name="Hair Clay", on_hand=0, sku=None, affected_bundles=[], fetch_error=True)
+    out = _render_line(line)
+    assert "lookup failed" in out
+    assert "retry" in out
+
+
+def test_snapshot_legend_explains_available_vs_on_hand() -> None:
+    """The legend must teach readers that the emoji ladder is driven by
+    `available` (sellable) and that at-risk rows expand to show all three
+    numbers. Without that text, a reader sees 'Conditioner: 4,724 on hand
+    · 0 available · 6,080 backordered' and may not understand why the
+    headline number isn't first."""
+    blocks = build_snapshot_blocks([], date_str="May 8, 2026")
+    legend = blocks[-1]["elements"][0]["text"]
+    assert "available" in legend
+    assert "sellable" in legend.lower()
+    assert "backordered" in legend
 
 
 def test_shipped_audit_aliases_file_is_valid() -> None:
