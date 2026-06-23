@@ -80,7 +80,7 @@ def test_snapshot_renders_categories() -> None:
     blocks = build_snapshot_blocks(sections, date_str="Apr 15, 2026")
 
     assert blocks[0]["type"] == "header"
-    assert "Weekly Inventory Audit" in blocks[0]["text"]["text"]
+    assert "Inventory Snapshot" in blocks[0]["text"]["text"]
 
     texts = [b["text"]["text"] for b in blocks if b["type"] == "section"]
     assert any("*Hair Care*" in t for t in texts)
