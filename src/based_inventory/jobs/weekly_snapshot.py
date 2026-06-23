@@ -203,11 +203,7 @@ def _is_risk(line: ProductLine) -> bool:
     - backorder queue exists (any positive value),
     - on_hand is physically negative (oversold).
     """
-    return (
-        line.available <= RISK_AVAILABLE_LOW
-        or line.backorder > 0
-        or line.on_hand < 0
-    )
+    return line.available <= RISK_AVAILABLE_LOW or line.backorder > 0 or line.on_hand < 0
 
 
 def _render_line(line: ProductLine) -> str:

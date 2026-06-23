@@ -61,7 +61,12 @@ def main() -> None:
         fields = payload["data"]["__type"]["fields"]
         for f in fields:
             n = f["name"]
-            if "fba" in n.lower() or "inventory" in n.lower() or "amazon" in n.lower() or "kit" in n.lower():
+            if (
+                "fba" in n.lower()
+                or "inventory" in n.lower()
+                or "amazon" in n.lower()
+                or "kit" in n.lower()
+            ):
                 print(f"  {n}: {f['type']}")
     except Exception as e:
         print(f"  introspection error: {e}")
@@ -129,13 +134,17 @@ def main() -> None:
                     for row in fba:
                         print(f"    {json.dumps(row, indent=6, default=str)}")
                 else:
-                    print(f"\n  {sku} ({n.get('name','')[:40]}): {json.dumps(fba, indent=4, default=str)}")
+                    print(
+                        f"\n  {sku} ({n.get('name','')[:40]}): {json.dumps(fba, indent=4, default=str)}"
+                    )
         except Exception as e:
             err = str(e)
             print(f"\n  {sku}: ERROR {err[:200]}")
             # If we hit a schema field error, the field set is wrong; abort the loop
             if "Cannot query field" in err:
-                print("\n  (Aborting hero SKU loop — schema field invalid; introspection above shows the real fields.)")
+                print(
+                    "\n  (Aborting hero SKU loop — schema field invalid; introspection above shows the real fields.)"
+                )
                 break
 
 

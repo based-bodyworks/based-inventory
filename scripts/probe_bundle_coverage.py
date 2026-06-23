@@ -146,13 +146,9 @@ def main() -> None:
                 # Extract the visible SKU between <a ...> and </a>.
                 import re
 
-                m = re.search(
-                    r"kit sku\s*<a [^>]*>([^<]+)</a>", reason, re.IGNORECASE | re.DOTALL
-                )
+                m = re.search(r"kit sku\s*<a [^>]*>([^<]+)</a>", reason, re.IGNORECASE | re.DOTALL)
                 if not m:
-                    m = re.search(
-                        r"kit sku[\s:]+([A-Za-z0-9\-_]+)", reason, re.IGNORECASE
-                    )
+                    m = re.search(r"kit sku[\s:]+([A-Za-z0-9\-_]+)", reason, re.IGNORECASE)
                 kit = m.group(1).strip() if m else "(unparsed)"
                 kit_sku_counts[kit] += 1
                 kit_sku_units[kit] += -change
@@ -185,8 +181,10 @@ def main() -> None:
     print()
     print("Depletion breakdown:")
     print(f"  Direct 'Order ... shipped':       {direct_count:>4} events, {direct_units:>5} units")
-    print(f"  Kit-rollup events (sum):           "
-          f"{sum(kit_sku_counts.values()):>4} events, {sum(kit_sku_units.values()):>5} units")
+    print(
+        f"  Kit-rollup events (sum):           "
+        f"{sum(kit_sku_counts.values()):>4} events, {sum(kit_sku_units.values()):>5} units"
+    )
     print(f"  Other (non-shipping reasons):     {other_count:>4} events, {other_units:>5} units")
     total_units = direct_units + sum(kit_sku_units.values())
     print(f"  TOTAL depletion (shipped + kits): {total_units:>5} units")
@@ -199,14 +197,18 @@ def main() -> None:
             note = f"  (kit_build={match.is_kit_build}, name={match.name[:40]})"
         else:
             note = "  (NOT IN ShipHero kit registry — uncategorized)"
-        print(f"  {kit_sku:<30} {kit_sku_units[kit_sku]:>5} units / {kit_sku_counts[kit_sku]:>3} events{note}")
+        print(
+            f"  {kit_sku:<30} {kit_sku_units[kit_sku]:>5} units / {kit_sku_counts[kit_sku]:>3} events{note}"
+        )
 
     # Identify kits that contain curl cream but did NOT fire any rollup events
     fired = set(kit_sku_counts.keys())
     expected = {k.sku for k in cc_kits}
     silent = sorted(expected - fired)
     print()
-    print(f"Curl-cream-containing kits that fired ZERO rollup events in window ({len(silent)} of {len(cc_kits)}):")
+    print(
+        f"Curl-cream-containing kits that fired ZERO rollup events in window ({len(silent)} of {len(cc_kits)}):"
+    )
     for sku in silent:
         match = next((k for k in cc_kits if k.sku == sku), None)
         kb = match.is_kit_build if match else "?"
@@ -268,7 +270,11 @@ def main() -> None:
             label = "(direct sale of BB-CC-SINGLE)"
         else:
             match = next((k for k in kits if k.sku == sku), None)
-            label = f"(kit_build={match.is_kit_build}, name={match.name[:40]})" if match else "(unknown SKU)"
+            label = (
+                f"(kit_build={match.is_kit_build}, name={match.name[:40]})"
+                if match
+                else "(unknown SKU)"
+            )
         print(f"  {sku:<30} {units:>5} units  {label}")
 
 

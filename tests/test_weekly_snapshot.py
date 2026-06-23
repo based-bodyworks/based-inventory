@@ -402,12 +402,21 @@ def test_render_preserves_fba_qty_annotation_in_both_formats() -> None:
     from based_inventory.jobs.weekly_snapshot import _render_line
 
     healthy = ProductLine(
-        name="Shampoo", on_hand=50000, available=50000, sku="BB-SHMP",
-        affected_bundles=[], fba_qty=1200,
+        name="Shampoo",
+        on_hand=50000,
+        available=50000,
+        sku="BB-SHMP",
+        affected_bundles=[],
+        fba_qty=1200,
     )
     risky = ProductLine(
-        name="Conditioner", on_hand=4724, available=0, backorder=6080,
-        sku="BB-COND", affected_bundles=[], fba_qty=0,
+        name="Conditioner",
+        on_hand=4724,
+        available=0,
+        backorder=6080,
+        sku="BB-COND",
+        affected_bundles=[],
+        fba_qty=0,
     )
     assert "🅰️" in _render_line(healthy)
     assert "1,200" in _render_line(healthy)

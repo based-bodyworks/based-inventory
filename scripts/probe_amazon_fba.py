@@ -81,9 +81,7 @@ def main() -> None:
     )
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(
-        json.dumps([s.raw for s in summaries], indent=2, default=str)
-    )
+    OUTPUT_PATH.write_text(json.dumps([s.raw for s in summaries], indent=2, default=str))
     print(f"\nFull raw responses dumped to {OUTPUT_PATH}")
     print("\nNext: cross-reference seller_sku values against ShipHero physical SKUs.")
     print("  - SKUs that match -> direct FBA listing of a single component")
