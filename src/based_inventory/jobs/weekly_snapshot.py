@@ -1,4 +1,9 @@
-"""Fridays 9am PST: post full inventory snapshot to Slack.
+"""Mon/Wed/Fri 9am PT: post full inventory snapshot to Slack.
+
+Cadence was Fridays-only until 2026-05-08; bumped to 3x/week so backorder
+buildup is visible mid-week instead of waiting until the next Friday.
+File name + Render service name (`weekly_snapshot`, `based-inventory-weekly`)
+are preserved for state-continuity reasons.
 
 Source of truth: ShipHero (Merchdrop warehouse). Resolves the
 AUDIT_LAYOUT product names to ShipHero SKUs via the BundleRegistry's
@@ -240,7 +245,7 @@ def build_snapshot_blocks(
 ) -> list[dict[str, Any]]:
     total = sum(len(lines) for _, lines in sections)
     blocks: list[dict[str, Any]] = [
-        header("📦 Weekly Inventory Audit"),
+        header("📦 Inventory Snapshot"),
         section(
             f"Tracking *{total}* products at *single-SKU level* (ShipHero source of truth)\n"
             f"Bundles excluded; constrained by lowest component  |  🗓️ {date_str}"
@@ -475,7 +480,7 @@ def _run(cfg: Config) -> None:
 
     date_str = time.strftime("%b %d, %Y")
     blocks = build_snapshot_blocks(sections, date_str)
-    fallback = f"📦 Weekly Inventory Audit: {date_str}"
+    fallback = f"📦 Inventory Snapshot: {date_str}"
     slack.post_message(fallback, blocks)
 
 
