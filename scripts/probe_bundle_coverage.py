@@ -22,14 +22,14 @@ from __future__ import annotations
 import os
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
@@ -71,7 +71,7 @@ def main() -> None:
     print(f"{'KIT_SKU':<35} {'BUILD':<6} {'NAME'}")
     print("-" * 72)
     for k in sorted(cc_kits, key=lambda x: (not x.is_kit_build, x.sku)):
-        print(f"{k.sku:<35} {str(k.is_kit_build):<6} {k.name[:60]}")
+        print(f"{k.sku:<35} {k.is_kit_build!s:<6} {k.name[:60]}")
 
     # ----------------------------- 3. INVENTORY_CHANGES REASON DISTRIBUTION
     print()
@@ -101,9 +101,9 @@ def main() -> None:
     other_count = 0
     cur_date_from = since
     pages = 0
-    MAX_PAGES = 30  # safety cap
+    max_pages = 30  # safety cap
 
-    while pages < MAX_PAGES:
+    while pages < max_pages:
         pages += 1
         payload = client._execute(
             query,
@@ -175,7 +175,7 @@ def main() -> None:
         cur_date_from = last_created
         time.sleep(0.2)
 
-    print(f"Pages fetched: {pages} (cap {MAX_PAGES})")
+    print(f"Pages fetched: {pages} (cap {max_pages})")
     print(f"Distinct events: {len(seen_ids)}")
     print()
     print("Distinct reason strings (top 10 by event count):")
@@ -192,7 +192,7 @@ def main() -> None:
     print(f"  TOTAL depletion (shipped + kits): {total_units:>5} units")
     print()
     print("Top kit SKUs firing rollup events on BB-CC-SINGLE (by units):")
-    for kit_sku, units in kit_sku_units.most_common():
+    for kit_sku, _units in kit_sku_units.most_common():
         # Cross-reference with the kit list to show the kit's name + kit_build flag
         match = next((k for k in kits if k.sku == kit_sku), None)
         if match:
@@ -216,7 +216,7 @@ def main() -> None:
     # ---------------------- 4. CROSS-CHECK: ORDERS + LINE_ITEMS AGGREGATION
     print()
     print("=" * 72)
-    print(f"4. CROSS-CHECK: ORDERS+LINE_ITEMS AGGREGATION (last 7 days)")
+    print("4. CROSS-CHECK: ORDERS+LINE_ITEMS AGGREGATION (last 7 days)")
     print("=" * 72)
     print("Pulling 1 recent day (full 7d would exceed 4004-credit per-op cap)...")
     days = [(datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d")]
