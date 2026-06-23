@@ -66,14 +66,60 @@ DISCONTINUED_PATH = DATA_DIR / "discontinued-skus.json"
 ALIASES_PATH = DATA_DIR / "audit-aliases.json"
 
 
-@dataclass
+@dataclass(init=False)
 class ProductLine:
+    """One row in the weekly audit. Carries the three load-bearing inventory
+    numbers from ShipHero so the renderer can tell whether a SKU is actually
+    sellable (vs just physically present).
+
+    - on_hand: physical units in warehouse (what ShipHero shows as inventory).
+    - available: sellable / unallocated units (on_hand minus allocated minus
+      reserved). This is the right risk signal: a SKU with 4,724 on_hand but
+      0 available is fully promised to existing orders, not safe to promote.
+    - backorder: queued customer demand against this SKU (units already owed
+      to customers when we can't fulfill from current stock).
+
+    Constructor accepts the legacy `qty=` kwarg for back-compat with older
+    tests + call sites; if neither `on_hand` nor `qty` is supplied, defaults
+    to 0. If `available` is omitted, it mirrors `on_hand` (matches the
+    pre-2026-05-08 behavior where the renderer only knew about on_hand).
+    """
+
     name: str
-    qty: int
+    on_hand: int
     sku: str | None
     affected_bundles: list[str]
-    fba_qty: int | None = None  # Amazon FBA US-marketplace quantity, if any
-    fetch_error: bool = False  # True if alias SKU lookup failed (rate limit etc)
+    available: int
+    backorder: int
+    fba_qty: int | None
+    fetch_error: bool
+
+    def __init__(
+        self,
+        name: str,
+        sku: str | None,
+        affected_bundles: list[str],
+        on_hand: int | None = None,
+        available: int | None = None,
+        backorder: int = 0,
+        qty: int | None = None,
+        fba_qty: int | None = None,
+        fetch_error: bool = False,
+    ) -> None:
+        resolved_on_hand = on_hand if on_hand is not None else (qty if qty is not None else 0)
+        self.name = name
+        self.on_hand = resolved_on_hand
+        self.sku = sku
+        self.affected_bundles = affected_bundles
+        self.available = available if available is not None else resolved_on_hand
+        self.backorder = backorder
+        self.fba_qty = fba_qty
+        self.fetch_error = fetch_error
+
+    @property
+    def qty(self) -> int:
+        """Back-compat alias. New code should use `on_hand`."""
+        return self.on_hand
 
 
 @dataclass(frozen=True)
@@ -82,14 +128,24 @@ class Resolved:
 
     `skus` lists every contributing physical SKU (single-element for
     direct matches; multi-element for aliased aggregates like
-    "Tallow Moisturizer" = 50ml + 100ml). `qty` is the sum across
-    those SKUs. `primary_sku` is the representative SKU shown in any
-    UI that needs a single label (defaults to the first / largest).
+    "Tallow Moisturizer" = 50ml + 100ml). The three quantity fields
+    (`on_hand`, `available`, `backorder`) are summed across those SKUs.
+    `primary_sku` is the representative SKU shown in any UI that needs
+    a single label (defaults to the highest-on_hand contributor).
+
+    `qty` is kept as a back-compat alias for `on_hand`.
     """
 
     primary_sku: str
-    qty: int
+    on_hand: int
     skus: tuple[str, ...]
+    available: int = 0
+    backorder: int = 0
+
+    @property
+    def qty(self) -> int:
+        """Back-compat alias. New code should use `on_hand`."""
+        return self.on_hand
 
 
 def _load_aliases(path: Path) -> dict[str, dict[str, Any]]:
@@ -104,20 +160,50 @@ def _load_aliases(path: Path) -> dict[str, dict[str, Any]]:
     return {k: v for k, v in aliases.items() if isinstance(v, dict)}
 
 
-def _emoji(qty: int) -> str:
-    if qty < 0:
+def _emoji(available: int, backorder: int = 0, on_hand: int | None = None) -> str:
+    """Risk emoji driven by `available` (sellable units).
+
+    - ⛔ Oversold: on_hand < 0. Physical-negative stock; the most acute state.
+    - 🚨 Critical: available <= 100, OR available <= 0 with queued backorder.
+    - 🔴 / 🟠 / 🟡: standard ladder on `available`.
+    - 📊 1K-5K, 🟢 >5K: healthy bands.
+
+    Pre-2026-05-08 this took a single `qty` arg that meant `on_hand`, which
+    let lines like "Conditioner: 4,724" look healthy when available was 0
+    and 6K units were backordered. Switching the ladder to `available`
+    fixes that. `on_hand` is still consulted for the ⛔ case so we don't
+    miss physical-oversold situations.
+    """
+    if on_hand is not None and on_hand < 0:
         return "⛔"
-    if qty <= 100:
+    if available <= 0 and backorder > 0:
         return "🚨"
-    if qty <= 500:
+    if available <= 100:
+        return "🚨"
+    if available <= 500:
         return "🔴"
-    if qty <= 750:
+    if available <= 750:
         return "🟠"
-    if qty <= 1000:
+    if available <= 1000:
         return "🟡"
-    if qty <= 5000:
+    if available <= 5000:
         return "📊"
     return "🟢"
+
+
+# Risk threshold for triggering the expanded per-row format. Matches the
+# 🟡 HEADS UP boundary in quantity_alerts.THRESHOLDS; a SKU that would
+# trigger an alert there gets full detail here too.
+RISK_AVAILABLE_LOW = 1000
+
+
+def _is_risk(line: ProductLine) -> bool:
+    """A row is 'at risk' (expanded format) when any of:
+    - available is at or below the low-stock threshold,
+    - backorder queue exists (any positive value),
+    - on_hand is physically negative (oversold).
+    """
+    return line.available <= RISK_AVAILABLE_LOW or line.backorder > 0 or line.on_hand < 0
 
 
 def _render_line(line: ProductLine) -> str:
@@ -125,7 +211,25 @@ def _render_line(line: ProductLine) -> str:
         return f"⚠️ {line.name}: ShipHero lookup failed (retry next run)"
     if line.sku is None:
         return f"❓ {line.name}: not found in ShipHero"
-    text = f"{_emoji(line.qty)} {line.name}: *{line.qty:,}*"
+
+    emoji = _emoji(line.available, line.backorder, line.on_hand)
+
+    if _is_risk(line):
+        # Expanded: show the full stock picture so a reader can tell whether
+        # there's real sellable inventory vs. just on_hand that's already
+        # spoken for. Format matches the brief: `🚨 Conditioner: 4,724 on
+        # hand · 0 available · 6,080 backordered`.
+        parts = [
+            f"*{line.on_hand:,}* on hand",
+            f"*{line.available:,}* available",
+        ]
+        if line.backorder > 0:
+            parts.append(f"*{line.backorder:,}* backordered")
+        text = f"{emoji} {line.name}: " + "  ·  ".join(parts)
+    else:
+        # Healthy: compact; lead with sellable (`available`), not on_hand.
+        text = f"{emoji} {line.name}: *{line.available:,}* available"
+
     if line.fba_qty is not None:
         text += f"  (🅰️  FBA: *{line.fba_qty:,}*)"
     return text
@@ -151,7 +255,10 @@ def build_snapshot_blocks(
     blocks.append(divider())
     blocks.append(
         context(
-            "🟢 5K+  ·  📊 1K-5K  ·  🟡 ≤1K  ·  🟠 ≤750  ·  🔴 ≤500  ·  🚨 ≤100  ·  ⛔ Oversold  "
+            "Tiers driven by *available* (sellable units after allocation), not on_hand. "
+            "🟢 5K+  ·  📊 1K-5K  ·  🟡 ≤1K  ·  🟠 ≤750  ·  🔴 ≤500  ·  🚨 ≤100  ·  "
+            "⛔ Oversold (physical-negative).  At-risk rows expand to on-hand · available · "
+            "backordered so you can tell when on-hand is already promised to existing orders.  "
             "·  source: ShipHero (Merchdrop)  ·  🅰️  FBA = Amazon US-marketplace on-hand "
             "(only shown for SKUs with FBA listings; full FBA breakdown requires Amazon SP-API)"
         )
@@ -187,19 +294,29 @@ def _resolve_to_stock(
         if "sku" in alias:
             stock = by_sku.get(alias["sku"])
             if stock is not None:
-                return Resolved(primary_sku=stock.sku, qty=stock.on_hand, skus=(stock.sku,))
+                return Resolved(
+                    primary_sku=stock.sku,
+                    on_hand=stock.on_hand,
+                    available=stock.available,
+                    backorder=stock.backorder,
+                    skus=(stock.sku,),
+                )
         if "skus" in alias:
             members = [by_sku[s] for s in alias["skus"] if s in by_sku]
             if members:
-                # Pick highest-on_hand SKU as the primary label; sum the rest.
+                # Pick highest-on_hand SKU as the primary label; sum the rest
+                # across on_hand, available, and backorder so aggregated rows
+                # (e.g. Tallow 50ml + 100ml) reflect the true total picture.
                 primary = max(members, key=lambda s: s.on_hand)
                 return Resolved(
                     primary_sku=primary.sku,
-                    qty=sum(s.on_hand for s in members),
+                    on_hand=sum(s.on_hand for s in members),
+                    available=sum(s.available for s in members),
+                    backorder=sum(s.backorder for s in members),
                     skus=tuple(s.sku for s in members),
                 )
         # Alias present but its SKUs aren't in this warehouse: fall through
-        # to fuzzy match rather than silently lying with qty=0.
+        # to fuzzy match rather than silently lying with on_hand=0.
 
     for candidate in _name_matches(name, by_name):
         if candidate.is_kit:
@@ -210,7 +327,9 @@ def _resolve_to_stock(
             continue
         return Resolved(
             primary_sku=candidate.sku,
-            qty=candidate.on_hand,
+            on_hand=candidate.on_hand,
+            available=candidate.available,
+            backorder=candidate.backorder,
             skus=(candidate.sku,),
         )
     return None
@@ -344,7 +463,9 @@ def _run(cfg: Config) -> None:
             lines.append(
                 ProductLine(
                     name=name,
-                    qty=resolved.qty,
+                    on_hand=resolved.on_hand,
+                    available=resolved.available,
+                    backorder=resolved.backorder,
                     sku=resolved.primary_sku,
                     affected_bundles=_affected_bundle_names(resolved.skus, registry),
                     fba_qty=_fba_qty_for(resolved.skus),
