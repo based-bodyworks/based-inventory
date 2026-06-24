@@ -45,6 +45,26 @@ def _midpoint_iso(from_iso: str, to_iso: str) -> str | None:
 
 MERCHDROP_WAREHOUSE_ID = "V2FyZWhvdXNlOjExNzY2MQ=="
 
+# ShipHero credit pool defaults (observed 2026-06-03 via extensions.throttling):
+# max_available=4004, increment_rate=60 credits/sec. Used as fallbacks when a
+# response omits the live quota.
+_DEFAULT_CREDIT_REFILL_RATE = 60.0
+
+
+def _credits_refill_wait(credits_remaining: int, floor: int, increment_rate: float) -> float:
+    """Seconds to wait for the credit pool to refill back up to `floor`.
+
+    Returns 0 when already at/above the floor, when pacing is disabled
+    (floor <= 0), or when the refill rate is non-positive. Otherwise the
+    deficit divided by the per-second refill rate. Keeping the pool above a
+    floor between calls leaves headroom for other ShipHero consumers (the ops
+    team, the ShipHero UI) instead of draining the shared pool to zero.
+    """
+    if floor <= 0 or increment_rate <= 0 or credits_remaining >= floor:
+        return 0.0
+    return (floor - credits_remaining) / increment_rate
+
+
 _ORDER_SHIPPED_REASON = re.compile(r"order .*shipped", re.IGNORECASE)
 # NOTE: When querying inventory_changes WITH a sku filter, kit-rollup events
 # ("Inventory updated because its kit sku <X> was updated. Order #Y shipped.")
@@ -77,13 +97,24 @@ class KitDefinition:
 
 class ShipHeroClient:
     def __init__(
-        self, token: str, api_url: str = "https://public-api.shiphero.com/graphql"
+        self,
+        token: str,
+        api_url: str = "https://public-api.shiphero.com/graphql",
+        min_credits_floor: int = 0,
+        max_pacing_sleep: float = 90.0,
     ) -> None:
         self.endpoint = api_url
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}",
         }
+        # When > 0, after each call wait (proactively) until the live credit
+        # pool refills back to this floor, so we sip the shared pool instead of
+        # draining it to zero in bursts. 0 keeps the legacy drain-then-throttle
+        # behavior. Sleeps are capped at max_pacing_sleep so a wrong reading
+        # can't hang a run.
+        self.min_credits_floor = min_credits_floor
+        self.max_pacing_sleep = max_pacing_sleep
 
     def _execute(
         self, query: str, variables: dict[str, Any] | None = None, retries: int = 6
@@ -113,8 +144,27 @@ class ShipHeroClient:
                     continue
                 raise RuntimeError(f"ShipHero GraphQL errors: {payload['errors']}")
             r.raise_for_status()
+            self._pace_from_quota(payload)
             return payload
         raise RuntimeError(f"ShipHero retries exhausted: {last_exc}")
+
+    def _pace_from_quota(self, payload: dict[str, Any]) -> None:
+        """Proactively wait so the credit pool stays above min_credits_floor.
+
+        Reads the live quota ShipHero returns on every response under
+        extensions.throttling.user_quota. No-op when pacing is disabled
+        (min_credits_floor <= 0) or the quota is absent.
+        """
+        if self.min_credits_floor <= 0:
+            return
+        quota = ((payload.get("extensions") or {}).get("throttling") or {}).get("user_quota") or {}
+        remaining = quota.get("credits_remaining")
+        if remaining is None:
+            return
+        rate = quota.get("increment_rate") or _DEFAULT_CREDIT_REFILL_RATE
+        wait = _credits_refill_wait(int(remaining), self.min_credits_floor, float(rate))
+        if wait > 0:
+            time.sleep(min(wait, self.max_pacing_sleep))
 
     # -----------------------------------------------------------------------
     # Inventory snapshot
@@ -842,6 +892,98 @@ class ShipHeroClient:
         """
         payload = self._execute(query, {"since": po_date_from_iso})
         return [e["node"] for e in payload["data"]["purchase_orders"]["data"]["edges"]]
+
+    _ORDERS_LINE_ITEMS_CAP = 15
+
+    def fetch_orders_window(
+        self,
+        since_iso: str,
+        warehouse_id: str = MERCHDROP_WAREHOUSE_ID,
+        max_pages: int = 80,
+        until_iso: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch orders whose order_date is in [since_iso, until_iso], with line_items.
+
+        Pagination is on the ORDERS side, by advancing order_date_from to the
+        latest order_date seen (ShipHero's data connection has no cursor),
+        deduped by order_number. The nested line_items connection is capped via
+        first:N to stay under the per-operation credit cap (see
+        _ORDERS_LINE_ITEMS_CAP); time-bisection does NOT help here because the
+        cost is fixed by query structure, not by the window.
+
+        High-volume caveat: a wide window (e.g. 48h) at Based's order rate spans
+        many 100-order pages, so this issues many sequential calls and can burn
+        a meaningful slice of the credit pool per run.
+
+        since_iso format: 'YYYY-MM-DDTHH:MM:SS' (UTC). When until_iso is None the
+        upper bound defaults to now (UTC); pass an explicit until_iso to bound a
+        chunk (e.g. a single day [day 00:00:00, day+1 00:00:00]) so a long
+        multi-day backfill can be checkpointed chunk-by-chunk.
+        """
+        from datetime import datetime as _dt
+
+        now_iso = until_iso or _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        query = (
+            """
+        query($since: ISODateTime!, $until: ISODateTime!, $warehouse_id: String!) {
+          orders(
+            order_date_from: $since
+            order_date_to: $until
+            warehouse_id: $warehouse_id
+          ) {
+            data {
+              edges {
+                node {
+                  order_number
+                  order_date
+                  shop_name
+                  line_items(first: """
+            + str(self._ORDERS_LINE_ITEMS_CAP)
+            + """) {
+                    edges { node { sku quantity } }
+                  }
+                }
+              }
+              pageInfo { hasNextPage }
+            }
+          }
+        }
+        """
+        )
+
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cur_since = since_iso
+        for _ in range(max_pages):
+            payload = self._execute(
+                query, {"since": cur_since, "until": now_iso, "warehouse_id": warehouse_id}
+            )
+            edges = payload["data"]["orders"]["data"]["edges"]
+            if not edges:
+                break
+            page_max_date = cur_since
+            new = 0
+            for e in edges:
+                n = e["node"]
+                num = n.get("order_number") or ""
+                if num and num in seen:
+                    continue
+                if num:
+                    seen.add(num)
+                new += 1
+                od = n.get("order_date") or page_max_date
+                if od > page_max_date:
+                    page_max_date = od
+                out.append(n)
+            if new == 0:
+                break
+            if not payload["data"]["orders"]["data"]["pageInfo"]["hasNextPage"]:
+                break
+            if page_max_date == cur_since:
+                break
+            cur_since = page_max_date
+            time.sleep(0.2)
+        return out
 
 
 # ---------------------------------------------------------------------------
