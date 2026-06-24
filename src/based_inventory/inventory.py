@@ -223,3 +223,87 @@ def _bundle_entries_from_kits(kits: list[KitDefinition]) -> list[BundleEntry]:
         )
         for k in kits
     ]
+
+
+@dataclass(frozen=True)
+class DemandSample:
+    """48h order-intake demand for one component SKU.
+
+    units: total units ordered across the window, with bundles exploded into
+        component quantities (a Curly Kit order adds to Curl Cream).
+    order_count: number of DISTINCT orders that contained this component
+        (directly or via any bundle). An order that holds the component both
+        as a single and inside a kit counts once.
+    """
+
+    units: int
+    order_count: int
+
+
+def aggregate_orders_demand(
+    orders: list[dict],
+    registry: BundleRegistry,
+) -> dict[str, DemandSample]:
+    """Aggregate order-intake demand per component SKU over a set of orders.
+
+    ShipHero order line_items contain BOTH the kit SKU (a logical wrapper
+    line) AND the kit's components pre-exploded as separate lines, at
+    quantities matching the kit definition (verified empirically on
+    2026-06-10: 5,695/5,696 kit-orders matched exactly). So per order:
+
+      - A kit line whose components are already pre-listed at >= definition
+        quantities is a MARKER: the component lines carry the demand and the
+        kit line adds nothing. Exploding it on top would double-count.
+      - A kit line whose components are NOT pre-listed (e.g. some website
+        set SKUs) is exploded into components via the BundleRegistry.
+
+    Mirrors order_physical_contents in based-packaging-optimization/
+    scripts/analyze_order_profiles.py (the verified reference): larger kits
+    are checked first so a duo doesn't claim a deluxe kit's pre-listed
+    components.
+
+    For each component SKU we track two things:
+      - units: total deduped units across all orders.
+      - order_count: distinct orders that touched this component. A single
+        order is counted once per component even if the component appears both
+        as a standalone line and inside a bundle line in that same order.
+
+    Returns: SKU -> DemandSample.
+    """
+    by_bundle = registry.by_bundle_sku
+    units: dict[str, int] = {}
+    order_count: dict[str, int] = {}
+    for order in orders:
+        # Pass 1: collapse this order's lines into sku -> qty.
+        lines: dict[str, int] = {}
+        for li in (order.get("line_items") or {}).get("edges", []):
+            n = li.get("node") or {}
+            sku = n.get("sku")
+            qty = int(n.get("quantity") or 0)
+            if not sku or qty <= 0:
+                continue
+            lines[sku] = lines.get(sku, 0) + qty
+
+        # Pass 2: non-kit lines are physical demand as-is; kit lines are
+        # markers when pre-exploded, definitions to add when not.
+        physical: dict[str, int] = {s: q for s, q in lines.items() if s not in by_bundle}
+        kit_lines = [(s, q) for s, q in lines.items() if s in by_bundle]
+        kit_lines.sort(key=lambda kq: -len(by_bundle[kq[0]].components_resolved))
+        for kit_sku, kit_qty in kit_lines:
+            needed: dict[str, int] = {}
+            for comp_sku, _name, comp_qty in by_bundle[kit_sku].components_resolved:
+                if comp_sku is None:
+                    continue
+                needed[comp_sku] = needed.get(comp_sku, 0) + comp_qty * kit_qty
+            if needed and all(physical.get(c, 0) >= n for c, n in needed.items()):
+                continue  # pre-exploded: component lines already carry it
+            for comp_sku, n in needed.items():
+                physical[comp_sku] = physical.get(comp_sku, 0) + n
+
+        for sku, qty in physical.items():
+            units[sku] = units.get(sku, 0) + qty
+            order_count[sku] = order_count.get(sku, 0) + 1
+    return {
+        sku: DemandSample(units=units.get(sku, 0), order_count=order_count.get(sku, 0))
+        for sku in units
+    }

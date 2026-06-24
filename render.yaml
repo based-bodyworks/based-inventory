@@ -158,3 +158,52 @@ services:
         value: "0"
       - key: LOG_LEVEL
         value: INFO
+
+  # Daily sales velocity: ShipHero orders -> per-channel demand workbook, posted
+  # to #alerts-inventory. Heaviest ShipHero job (~15min, all of the day's
+  # orders), so it runs at 11:00 UTC -- a quiet window before the inventory
+  # cluster -- to avoid contending for the credit pool. Time is adjustable.
+  # Runs the shell wrapper (generate -> rename -> post); PYBIN=python (no venv).
+  - type: cron
+    name: based-inventory-velocity
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    schedule: "0 11 * * *"
+    dockerCommand: bash scripts/run_daily_velocity.sh
+    plan: starter
+    envVars:
+      - key: PYBIN
+        value: python
+      - fromService:
+          name: based-inventory-quantity
+          type: cron
+          envVarKey: SHIPHERO_ACCESS_TOKEN
+        key: SHIPHERO_ACCESS_TOKEN
+      - fromService:
+          name: based-inventory-quantity
+          type: cron
+          envVarKey: SHIPHERO_REFRESH_TOKEN
+        key: SHIPHERO_REFRESH_TOKEN
+      - key: SHIPHERO_API_URL
+        value: https://public-api.shiphero.com/graphql
+      - key: SHOPIFY_STORE
+        value: basedbodyworks.myshopify.com
+      - key: SHOPIFY_CLIENT_ID
+        value: not-used-by-velocity
+      - key: SHOPIFY_CLIENT_SECRET
+        value: not-used-by-velocity
+      - key: SHOPIFY_API_VERSION
+        value: "2026-01"
+      - fromService:
+          name: based-inventory-quantity
+          type: cron
+          envVarKey: SLACK_BOT_TOKEN
+        key: SLACK_BOT_TOKEN
+      - key: SLACK_CHANNEL
+        value: C0AK6UGA1NJ
+      - key: ENV
+        value: prod
+      - key: DRY_RUN
+        value: "0"
+      - key: LOG_LEVEL
+        value: INFO
