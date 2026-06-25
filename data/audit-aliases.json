@@ -7,6 +7,8 @@
     "Wooden Hair Comb": {"sku": "BB-GWP-COMB-DARK"},
     "Scalp Scrubber": {"sku": "BB-ACCS-SCLPSCRBR-V2"},
     "Tallow Moisturizer": {"skus": ["BB-ONE-BTAL-50ML", "BB-ONE-BTAL-100ML"]},
-    "Body Lotion": {"sku": "BB-BDYLTN-SINGLE-SNTL"}
+    "Body Lotion": {"sku": "BB-BDYLTN-SINGLE-SNTL"},
+    "Body Wash": {"skus": ["BB-SS-01", "BB-GN-01", "BB-CC-01"]},
+    "Deodorant": {"skus": ["BB-DEO-BM-01", "BB-DEO-GN-01", "BB-DEO-SS-01"]}
   }
 }
