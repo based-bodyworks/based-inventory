@@ -484,6 +484,22 @@ def test_body_wash_alias_avoids_packaging_components() -> None:
         ), f"Body Wash alias must not include packaging components ({sku})"
 
 
+def test_body_lotion_alias_includes_all_active_shopify_singles() -> None:
+    """Per Shopify (2026-05-09 probe), the active 'Body Lotion' product has
+    two single-variant scents: Santal (BB-BDYLTN-SINGLE-SNTL) and Amber
+    (BB-BDYLTN-SINGLE-AMBR). The alias must aggregate both so the audit
+    surfaces Amber inventory once the launch ships."""
+    repo_root = Path(__file__).resolve().parents[1]
+    aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
+    entry = aliases.get("Body Lotion")
+    assert entry is not None, "Body Lotion must be aliased"
+    skus = set(entry.get("skus") or ([entry["sku"]] if "sku" in entry else []))
+    assert "BB-BDYLTN-SINGLE-SNTL" in skus, "Santal single must be present"
+    assert (
+        "BB-BDYLTN-SINGLE-AMBR" in skus
+    ), "Amber single must be present (active scent in Shopify since 2026 launch)"
+
+
 def test_deodorant_alias_avoids_packaging_components() -> None:
     """Regression: same bug as Body Wash. 'Deodorant: 76,800' was actually
     `DEO-BV-IFC001` (Packaging, IFC, 2.6 oz, Deodorant). Alias must pin to
