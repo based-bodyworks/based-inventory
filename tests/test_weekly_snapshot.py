@@ -453,8 +453,94 @@ def test_shipped_audit_aliases_file_is_valid() -> None:
     """
     repo_root = Path(__file__).resolve().parents[1]
     aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
-    assert aliases, "audit-aliases.json should ship with the 5 known overrides"
+    assert aliases, "audit-aliases.json should ship with the known overrides"
     for name, entry in aliases.items():
         has_sku = "sku" in entry and isinstance(entry["sku"], str)
         has_skus = "skus" in entry and isinstance(entry["skus"], list) and entry["skus"]
         assert has_sku or has_skus, f"alias {name!r} needs 'sku' or non-empty 'skus'"
+
+
+def test_body_wash_alias_avoids_packaging_components() -> None:
+    """Regression: the 2026-05-09 weekly snapshot showed 'Body Wash: 25,000'
+    which was actually `BW-SNTL-PK001` (Container, Cap, Body Wash) — a
+    packaging component the substring fallback grabbed because it has the
+    highest on_hand of any name containing 'Body Wash'. The alias must pin
+    Body Wash to the real BB-*-01 product SKUs across scent variants.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
+    entry = aliases.get("Body Wash")
+    assert entry is not None, "Body Wash must be aliased to dodge packaging-component fuzzy match"
+    skus = set(entry.get("skus") or ([entry["sku"]] if "sku" in entry else []))
+    assert skus, "Body Wash alias must list at least one SKU"
+    # All scent variants of the actual finished good follow BB-{SS,GN,CC}-01.
+    assert skus.issubset(
+        {"BB-SS-01", "BB-GN-01", "BB-CC-01"}
+    ), f"Body Wash alias should only contain BB-*-01 finished-good SKUs, got {skus}"
+    # Must NOT contain packaging-component patterns (BW-*-PK*).
+    for sku in skus:
+        assert not sku.startswith(
+            "BW-"
+        ), f"Body Wash alias must not include packaging components ({sku})"
+
+
+def test_body_lotion_alias_includes_all_active_shopify_singles() -> None:
+    """Per Shopify (2026-05-09 probe), the active 'Body Lotion' product has
+    two single-variant scents: Santal (BB-BDYLTN-SINGLE-SNTL) and Amber
+    (BB-BDYLTN-SINGLE-AMBR). The alias must aggregate both so the audit
+    surfaces Amber inventory once the launch ships."""
+    repo_root = Path(__file__).resolve().parents[1]
+    aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
+    entry = aliases.get("Body Lotion")
+    assert entry is not None, "Body Lotion must be aliased"
+    skus = set(entry.get("skus") or ([entry["sku"]] if "sku" in entry else []))
+    assert "BB-BDYLTN-SINGLE-SNTL" in skus, "Santal single must be present"
+    assert (
+        "BB-BDYLTN-SINGLE-AMBR" in skus
+    ), "Amber single must be present (active scent in Shopify since 2026 launch)"
+
+
+def test_deodorant_alias_avoids_packaging_components() -> None:
+    """Regression: same bug as Body Wash. 'Deodorant: 76,800' was actually
+    `DEO-BV-IFC001` (Packaging, IFC, 2.6 oz, Deodorant). Alias must pin to
+    BB-DEO-{BM,GN,SS}-01 across scent variants.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
+    entry = aliases.get("Deodorant")
+    assert entry is not None, "Deodorant must be aliased to dodge packaging-component fuzzy match"
+    skus = set(entry.get("skus") or ([entry["sku"]] if "sku" in entry else []))
+    assert skus, "Deodorant alias must list at least one SKU"
+    assert skus.issubset(
+        {"BB-DEO-BM-01", "BB-DEO-GN-01", "BB-DEO-SS-01"}
+    ), f"Deodorant alias should only contain BB-DEO-*-01 finished-good SKUs, got {skus}"
+    for sku in skus:
+        assert not sku.startswith(
+            "DEO-"
+        ), f"Deodorant alias must not include packaging components ({sku})"
+
+
+def test_body_wash_resolves_to_aggregate_not_packaging_component() -> None:
+    """Simulate the bug + fix together: with the wrong packaging SKU + the
+    real product SKUs both present in stock, the resolver should pick the
+    aggregate via alias, not the packaging component that the substring
+    fallback would otherwise prefer."""
+    stocks = [
+        # The packaging component that bit us in prod
+        _stock("BW-SNTL-PK001", "Container, Cap, Body Wash", 25000),
+        # Real finished goods across the three scents
+        _stock("BB-SS-01", "Body Wash Santal Sandalwood", 855, available=2, backorder=3),
+        _stock("BB-GN-01", "Body Wash Guava Nectar", 11, available=0, backorder=270),
+        _stock("BB-CC-01", "Body Wash Caribbean Coconut", 0, available=0, backorder=700),
+    ]
+    by_name, by_sku = _index(stocks)
+    aliases = {"Body Wash": {"skus": ["BB-SS-01", "BB-GN-01", "BB-CC-01"]}}
+    resolved = _resolve_to_stock(
+        "Body Wash", by_name, by_sku, frozenset(), _empty_disc(), aliases=aliases
+    )
+    assert resolved is not None
+    # Aggregate of the three finished goods, NOT the 25,000 packaging hit
+    assert resolved.on_hand == 866
+    assert resolved.available == 2
+    assert resolved.backorder == 973
+    assert resolved.primary_sku == "BB-SS-01"  # highest on_hand of the three

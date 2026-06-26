@@ -1,12 +1,15 @@
 {
-  "_note": "Pin weekly_snapshot AUDIT_LAYOUT names to ShipHero SKUs when fuzzy name matching can't bridge the gap (audit-layout 'Hair Clay' vs ShipHero 'Clay'; legacy V1 SKU mis-flagged is_kit=True hiding the real V2 single; etc.). Keys are AUDIT_LAYOUT names (case-sensitive). Each entry pins to either a single 'sku' (one trusted physical SKU) or a list of 'skus' (sum on_hand across multiple physical SKUs that the audit layout treats as one product, e.g. 50ml + 100ml size variants).",
-  "_format": "Each entry: <AUDIT_LAYOUT name> -> {sku: <ShipHero SKU>} | {skus: [<ShipHero SKU>, ...]}. Edit when ShipHero canonical names drift or new size variants ship.",
+  "_note": "Pin weekly_snapshot AUDIT_LAYOUT names to ShipHero SKUs when fuzzy name matching can't bridge the gap (audit-layout 'Hair Clay' vs ShipHero 'Clay'; legacy V1 SKU mis-flagged is_kit=True hiding the real V2 single; packaging components like BW-SNTL-PK001 outranking the real product on on_hand; etc.). Keys are AUDIT_LAYOUT names (case-sensitive). Each entry pins to either a single 'sku' (one trusted physical SKU) or a list of 'skus' (sum on_hand across multiple physical SKUs that the audit layout treats as one product, e.g. 50ml + 100ml size variants, or scent variants under a single product page).",
+  "_methodology": "Cross-reference against Shopify (source of truth) before adding/editing an entry. For multi-variant products (Body Wash, Body Lotion, Deodorant, Tallow Moisturizer), the 'skus' list should be the SKU of every Shopify variant tagged as a single/just-one variant under that product page. Use scripts/probe_shopify_canonical_skus.py to print the current Shopify mapping.",
+  "_format": "Each entry: <AUDIT_LAYOUT name> -> {sku: <ShipHero SKU>} | {skus: [<ShipHero SKU>, ...]}. Edit when ShipHero canonical names drift, new size/scent variants ship, or Shopify reorganizes a product.",
   "aliases": {
     "Hair Clay": {"sku": "CLAY1"},
     "Leave-In Conditioner": {"sku": "BB-LEAVEIN-ONE"},
     "Wooden Hair Comb": {"sku": "BB-GWP-COMB-DARK"},
     "Scalp Scrubber": {"sku": "BB-ACCS-SCLPSCRBR-V2"},
     "Tallow Moisturizer": {"skus": ["BB-ONE-BTAL-50ML", "BB-ONE-BTAL-100ML"]},
-    "Body Lotion": {"sku": "BB-BDYLTN-SINGLE-SNTL"}
+    "Body Wash": {"skus": ["BB-SS-01", "BB-GN-01", "BB-CC-01"]},
+    "Body Lotion": {"skus": ["BB-BDYLTN-SINGLE-SNTL", "BB-BDYLTN-SINGLE-AMBR"]},
+    "Deodorant": {"skus": ["BB-DEO-BM-01", "BB-DEO-GN-01", "BB-DEO-SS-01"]}
   }
 }
