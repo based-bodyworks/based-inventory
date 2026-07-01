@@ -9,8 +9,11 @@ PER SALES CHANNEL, 0-filled for SKU-days with no sales.
 - XLSX: an ABOUT sheet plus one tab per channel -- "DAILY VELOCITY - TIKTOK",
   "DAILY VELOCITY - SHOPIFY", "DAILY VELOCITY - AMAZON (FBM)" -- each Date, SKU,
   QTY SOLD[, SKU CODE]. All tabs share the same SKU rows so they line up.
+  Plus a "BUNDLE SALES" tab: each bundle/multipack AS-SOLD (un-exploded), per
+  channel, for visibility -- those units are ALREADY inside the channel tabs.
 - CSV: long format Date, SKU, Channel, QTY SOLD[, SKU CODE] -- one file holding
-  every channel (sum across channels = blended demand).
+  every channel (sum across channels = blended demand). A sibling .bundles.csv
+  carries the as-sold bundle rows (Date, Bundle, Channel, QTY SOLD[, SKU CODE]).
 
 Amazon is FBM-only: ShipHero sees merchant-fulfilled Amazon orders (shipped from
 Merchdrop), NOT Amazon FBA (ships from Amazon's warehouses, never hits this
@@ -41,8 +44,9 @@ SCOPE
 -----
 Rows = single/component SKUs that actually SOLD in the window (default; pass
 --all-active-skus to instead 0-fill every active non-kit SKU). Kits/bundles get
-NO row of their own; their sales roll INTO the component SKUs. Warehouse =
-Merchdrop.
+NO row of their own in the channel tabs; their sales roll INTO the component
+SKUs. The separate BUNDLE SALES tab / .bundles.csv shows them as-sold (never
+add it on top of the channel tabs -- that double-counts). Warehouse = Merchdrop.
 
 Only real sales channels are counted (shop_name allowlist: BASED / Shopify /
 Amazon). Internal "Manual Order" records -- ShipHero's label for manually
@@ -153,8 +157,10 @@ CHANNEL_ORDER = (
 )
 
 # Checkpoint schema. v1 stored a single combined {sku: units} per day; v2 stores
-# per-channel {shop_name: {sku: units}}. A v1 checkpoint is discarded on load.
-CHECKPOINT_SCHEMA = 2
+# per-channel {shop_name: {sku: units}}; v3 adds the sibling bundle_days map
+# (per-day AS-SOLD bundle units). Older checkpoints are discarded on load --
+# resuming a v2 file would skip cached days and leave bundle_days empty.
+CHECKPOINT_SCHEMA = 3
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +248,110 @@ def units_ordered_by_channel(
     return out
 
 
+def bundle_units_by_channel(
+    orders: list[dict], registry: BundleRegistry, day_str: str, channels: set[str]
+) -> dict[str, dict[str, int]]:
+    """Per-channel {shop_name -> {bundle_sku -> units AS-SOLD}} for one day.
+
+    UN-exploded: each bundle/multipack line is counted at its raw ordered
+    quantity, with NO component resolution -- this is the visibility view
+    (which packs/kits sold), not the demand view. Only SKUs the registry
+    knows as bundles are counted; singles never appear here. Every shop in
+    `channels` gets an entry (empty if no bundle sold) so tabs stay stable.
+
+    These units are ALREADY inside the exploded component numbers from
+    units_ordered_by_channel; never add the two together.
+    """
+    out: dict[str, dict[str, int]] = {shop: {} for shop in channels}
+    for o in orders:
+        if (o.get("order_date") or "")[:10] != day_str:
+            continue
+        shop = o.get("shop_name") or "(none)"
+        if shop not in out:
+            continue
+        for li in (o.get("line_items") or {}).get("edges", []):
+            n = li.get("node") or {}
+            sku = n.get("sku")
+            qty = int(n.get("quantity") or 0)
+            if sku in registry.bundle_skus and qty > 0:
+                out[shop][sku] = out[shop].get(sku, 0) + qty
+    return out
+
+
+def unregistered_kit_skus(stock: list[WarehouseStock], registry: BundleRegistry) -> set[str]:
+    """Warehouse SKUs flagged is_kit but absent from the bundle registry.
+
+    Such a SKU's demand would be silently DROPPED by build_sku_universe (it is
+    excluded as a kit but never exploded into components), so any non-empty
+    result must be reported loudly, not swallowed.
+    """
+    return {s.sku for s in stock if s.is_kit} - registry.bundle_skus
+
+
+def nested_bundle_skus(registry: BundleRegistry) -> set[str]:
+    """Bundle SKUs that appear as a COMPONENT of another registered bundle.
+
+    ShipHero pre-explodes kit components as their own order lines, so a bundle
+    nested inside a larger kit shows up as a line on the parent's orders and
+    the AS-SOLD view would count it on top of the parent -- an overcount in
+    the visibility numbers (the exploded demand path is unaffected; its marker
+    logic handles nesting). None exist today; this feeds a warning if one
+    ever appears.
+    """
+    out: set[str] = set()
+    for entry in registry.bundles:
+        for comp_sku, _name, _qty in entry.components_resolved:
+            if comp_sku and comp_sku in registry.bundle_skus and comp_sku != entry.bundle_sku:
+                out.add(comp_sku)
+    return out
+
+
+# Tokens that mark a SKU code / product name as bundle-shaped. Same-product
+# multipacks are ONLY exploded when ShipHero registers them as kits (set-
+# components.json never lists them), so a new pack that slips through shows
+# up as its own row -- these tokens catch that stray row for the run warning.
+_BUNDLEISH_CODE_TOKENS = {"PCK", "PACK", "PK", "BNDL", "BUNDLE", "KIT", "DUO", "TRIO", "SET"}
+_BUNDLEISH_NAME_TOKENS = {
+    "pack",
+    "packs",
+    "bundle",
+    "duo",
+    "trio",
+    "kit",
+    "kits",
+    "set",
+    "essentials",
+}
+
+
+def suspicious_unexploded_skus(sku_codes: set[str], name_map: dict[str, str]) -> list[str]:
+    """SKUs that got their own row but look like unregistered bundles/multipacks.
+
+    Heuristic (best-effort; the hard guard is unregistered_kit_skus): a
+    hyphen-separated code segment or a whitespace-separated name word matching
+    the bundle-ish tokens. By construction the row universe already excludes
+    every registered bundle, so any hit here is a pack the registry missed.
+    """
+    import re
+
+    flagged: list[str] = []
+    for code in sorted(sku_codes):
+        segments = {seg.upper() for seg in code.split("-")}
+        # digits allowed on either side so 2PCK, SET1, KIT3 all hit (house style
+        # puts trailing digits on codes: CLAY1, POMADE2, ...).
+        if any(
+            re.fullmatch(r"\d*" + t + r"\d*", seg)
+            for t in _BUNDLEISH_CODE_TOKENS
+            for seg in segments
+        ):
+            flagged.append(code)
+            continue
+        words = {w for w in re.split(r"[^a-z]+", (name_map.get(code) or "").lower()) if w}
+        if words & _BUNDLEISH_NAME_TOKENS:
+            flagged.append(code)
+    return flagged
+
+
 def ordered_channels(channel_keys: set[str]) -> list[str]:
     """Channels in display order: known channels (CHANNEL_ORDER) first, then the rest."""
     keys = set(channel_keys)
@@ -314,6 +424,87 @@ def build_grid_rows(
     return rows
 
 
+def build_about_lines(
+    *,
+    start_date: date,
+    end_date: date,
+    n_days: int,
+    line_items_cap: int,
+    sku_count: int,
+    total_units: int,
+    channel_totals: list[tuple[str, int]],
+    include_shops_key: list[str] | None,
+    excluded_shops: dict[str, int],
+    all_active_skus: bool,
+    amazon_present: bool,
+    bundle_count: int,
+    bundle_units: int,
+    generated_at: str,
+) -> list[str]:
+    """The ABOUT sheet / README methodology block (shared by both surfaces).
+
+    Pure so the content is unit-testable; run() feeds it the computed totals.
+    """
+    channels_line = (
+        "Sales channels counted (shop_name allowlist): " + ", ".join(include_shops_key)
+        if include_shops_key
+        else "Sales channels: ALL (no channel filter applied)"
+    )
+    excluded_line = (
+        "Excluded non-sales channels (orders dropped): "
+        + ", ".join(
+            f"{shop} ({n})" for shop, n in sorted(excluded_shops.items(), key=lambda x: -x[1])
+        )
+        if excluded_shops
+        else "Excluded non-sales channels: none seen in window."
+    )
+    scope_line = (
+        "Scope: every active non-kit SKU (0-filled even where it never sold); kits/bundles get no row."
+        if all_active_skus
+        else "Scope: only SKUs that sold in-window (kits/bundles excluded; their sales rolled into components)."
+    )
+    per_channel_line = "Per-channel total units: " + " | ".join(
+        f"{label}: {t}" for label, t in channel_totals
+    )
+    lines = [
+        "Based BodyWorks - Daily Sales Velocity (ShipHero)",
+        "QTY SOLD = units ORDERED per day (demand), from ShipHero `orders` by order_date.",
+        "Kit/bundle demand is resolved to component SKUs: ShipHero pre-explodes kit components",
+        "as their own lines, so those lines are counted and the kit line is a marker; a kit",
+        "whose components are NOT pre-listed is exploded using CURRENT kit recipes",
+        "(slightly off if a kit's components changed inside the window).",
+        "Multipacks/bundles get NO row of their own in the channel tabs; their units roll into",
+        "the component SKUs. The BUNDLE SALES tab (and the .bundles.csv) lists them AS-SOLD for",
+        "visibility -- those units are already inside the channel tabs, so do not add them on top.",
+    ]
+    if amazon_present:
+        lines.append(
+            "AMAZON = FBM ONLY (Merchdrop-fulfilled). Amazon FBA ships from Amazon's "
+            "warehouses and is NOT in ShipHero, so Amazon undercounts any FBA-fulfilled SKU."
+        )
+    lines += [
+        "One tab per sales channel (TikTok / Shopify / Amazon); same SKU rows on each tab.",
+        f"Warehouse: Merchdrop ({MERCHDROP_WAREHOUSE_ID}).",
+        channels_line,
+        excluded_line,
+    ]
+    if include_shops_key and excluded_shops:
+        lines.append(
+            "NOTE: strict allowlist -- if any excluded channel above is a real sales channel, "
+            "re-run with --include-shop '<name>'."
+        )
+    lines += [
+        f"Nested line_items capped at first:{line_items_cap} per order (rare >15-line orders truncate their tail).",
+        f"Window: {start_date} .. {end_date} ({n_days} days, UTC). The most recent day may be partial.",
+        scope_line,
+        f"SKUs (rows per tab): {sku_count}  |  Total units ordered (all channels): {total_units}",
+        per_channel_line,
+        f"Bundles/multipacks AS-SOLD in window: {bundle_count} ({bundle_units} units) -- BUNDLE SALES tab.",
+        f"Generated: {generated_at} UTC",
+    ]
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
@@ -321,12 +512,14 @@ def write_csv(
     channel_rows: list[tuple[str, list[tuple[str, str, int, str]]]],
     path: Path,
     include_code: bool = True,
+    sku_header: str = "SKU",
 ) -> None:
     """Long-format CSV: Date, SKU, Channel, QTY SOLD[, SKU CODE].
 
     channel_rows is [(channel_label, rows), ...]; one output row per
     date x SKU x channel (0-filled), so the file holds every channel and sums to
-    the blended total. Sorted by date, then SKU, then channel.
+    the blended total. Sorted by date, then SKU, then channel. sku_header
+    relabels the name column (the bundles file uses "Bundle").
     """
     import csv
 
@@ -338,7 +531,7 @@ def write_csv(
 
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        header = ["Date", "SKU", "Channel", "QTY SOLD"]
+        header = ["Date", sku_header, "Channel", "QTY SOLD"]
         if include_code:
             header.append("SKU CODE")
         w.writerow(header)
@@ -354,8 +547,13 @@ def write_xlsx(
     path: Path,
     about_lines: list[str],
     include_code: bool = True,
+    extra_long_sheets: list[tuple[str, list[str], list[list]]] | None = None,
 ) -> None:
-    """ABOUT sheet + one tab per (title, rows) in `sheets`."""
+    """ABOUT sheet + one tab per (title, rows) in `sheets`.
+
+    extra_long_sheets appends tabs with their own (title, header, rows) shape,
+    e.g. the BUNDLE SALES tab whose long rows carry a Channel column.
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
@@ -379,6 +577,18 @@ def write_xlsx(
             ws.append([day, name, qty] + ([code] if include_code else []))
         ws.freeze_panes = "A2"
         for i, wdt in enumerate(widths[: len(header)], start=1):
+            ws.column_dimensions[get_column_letter(i)].width = wdt
+
+    extra_widths = [12, 34, 14, 10, 26]
+    for title, xheader, xrows in extra_long_sheets or []:
+        ws = wb.create_sheet(title)
+        ws.append(xheader)
+        for c in range(1, len(xheader) + 1):
+            ws.cell(row=1, column=c).font = Font(bold=True)
+        for row in xrows:
+            ws.append(list(row))
+        ws.freeze_panes = "A2"
+        for i, wdt in enumerate(extra_widths[: len(xheader)], start=1):
             ws.column_dimensions[get_column_letter(i)].width = wdt
 
     wb.save(path)
@@ -610,10 +820,13 @@ def run(args: argparse.Namespace) -> int:
             "line_items_cap": ShipHeroClient._ORDERS_LINE_ITEMS_CAP,
             "include_shops": include_shops_key,
             "days": {},
+            "bundle_days": {},
             "excluded_shops": {},
         }
-    # days_done[day] = {shop_name: {sku: units}}  (per-channel)
+    # days_done[day] = {shop_name: {sku: units}}  (per-channel, exploded)
     days_done: dict[str, dict[str, dict[str, int]]] = state["days"]
+    # bundle_days[day] = {shop_name: {bundle_sku: units}}  (AS-SOLD, un-exploded)
+    bundle_days: dict[str, dict[str, dict[str, int]]] = state.setdefault("bundle_days", {})
     excluded_shops: dict[str, int] = state.setdefault("excluded_shops", {})
 
     # --- fetch each day not already checkpointed ---
@@ -640,6 +853,7 @@ def run(args: argparse.Namespace) -> int:
         )
         channel_maps = units_ordered_by_channel(sales_orders, registry, day, day_channels)
         days_done[day] = channel_maps
+        bundle_days[day] = bundle_units_by_channel(sales_orders, registry, day, day_channels)
         save_checkpoint(ckpt_path, state)
         per_ch = ", ".join(
             f"{channel_label(s)}:{sum(channel_maps[s].values())}"
@@ -691,71 +905,127 @@ def run(args: argparse.Namespace) -> int:
         channel_totals.append((label, sum(r[2] for r in rows)))
 
     total_units = sum(t for _label, t in channel_totals)
-    channels_line = (
-        "Sales channels counted (shop_name allowlist): " + ", ".join(include_shops_key)
-        if include_shops_key
-        else "Sales channels: ALL (no channel filter applied)"
-    )
-    excluded_line = (
-        "Excluded non-sales channels (orders dropped): "
-        + ", ".join(
-            f"{shop} ({n})" for shop, n in sorted(excluded_shops.items(), key=lambda x: -x[1])
+
+    # --- bundle/multipack AS-SOLD view (un-exploded; informational only) ---
+    # These units are already inside the exploded channel tabs above; this view
+    # exists so packs/kits/duos are visible as their own lines.
+    bundle_skus_seen: set[str] = set()
+    for day in day_strs:
+        for ch_map in bundle_days.get(day, {}).values():
+            bundle_skus_seen |= set(ch_map.keys())
+    bundle_name_map = {
+        sku: (registry.by_bundle_sku[sku].bundle_name if sku in registry.by_bundle_sku else sku)
+        for sku in bundle_skus_seen
+    }
+    bundle_channel_rows: list[tuple[str, list[tuple[str, str, int, str]]]] = []
+    for shop in emit_channels:
+        ch_day_maps = {day: bundle_days.get(day, {}).get(shop, {}) for day in day_strs}
+        bundle_channel_rows.append(
+            (
+                channel_label(shop),
+                build_grid_rows(ch_day_maps, bundle_skus_seen, bundle_name_map, day_strs),
+            )
         )
-        if excluded_shops
-        else "Excluded non-sales channels: none seen in window."
-    )
-    scope_line = (
-        "Scope: every active non-kit SKU (0-filled even where it never sold); kits/bundles get no row."
-        if args.all_active_skus
-        else "Scope: only SKUs that sold in-window (kits/bundles excluded; their sales rolled into components)."
-    )
-    per_channel_line = "Per-channel total units: " + " | ".join(
-        f"{label}: {t}" for label, t in channel_totals
-    )
-    about_lines = [
-        "Based BodyWorks - Daily Sales Velocity (ShipHero)",
-        "QTY SOLD = units ORDERED per day (demand), from ShipHero `orders` by order_date.",
-        "Kit/bundle demand is resolved to component SKUs: ShipHero pre-explodes kit components",
-        "as their own lines, so those lines are counted and the kit line is a marker; a kit",
-        "whose components are NOT pre-listed is exploded using CURRENT kit recipes",
-        "(slightly off if a kit's components changed inside the window).",
-        "One tab per sales channel (TikTok / Shopify / Amazon); same SKU rows on each tab.",
-        f"Warehouse: Merchdrop ({MERCHDROP_WAREHOUSE_ID}).",
-        channels_line,
-        excluded_line,
-        f"Nested line_items capped at first:{ShipHeroClient._ORDERS_LINE_ITEMS_CAP} per order (rare >15-line orders truncate their tail).",
-        f"Window: {start_date} .. {end_date} ({len(day_strs)} days, UTC). The most recent day may be partial.",
-        scope_line,
-        f"SKUs (rows per tab): {len(sku_codes)}  |  Total units ordered (all channels): {total_units}",
-        per_channel_line,
-        f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
-    ]
-    if AMAZON_SHOP in emit_channels:
-        about_lines.insert(
-            6,
-            "AMAZON = FBM ONLY (Merchdrop-fulfilled). Amazon FBA ships from Amazon's "
-            "warehouses and is NOT in ShipHero, so Amazon undercounts any FBA-fulfilled SKU.",
+    bundle_units_total = sum(qty for _l, rows in bundle_channel_rows for _d, _n, qty, _c in rows)
+
+    # --- coverage guards: an unregistered bundle must never vanish silently ---
+    missing_kits = unregistered_kit_skus(stock, registry)
+    if missing_kits:
+        logger.warning(
+            "COVERAGE GUARD: %d kit-flagged SKUs missing from the bundle registry -- their "
+            "demand is being DROPPED, not exploded: %s",
+            len(missing_kits),
+            ", ".join(sorted(missing_kits)),
         )
-    if include_shops_key and excluded_shops:
-        about_lines.insert(
-            9 if AMAZON_SHOP in emit_channels else 8,
-            "NOTE: strict allowlist -- if any excluded channel above is a real sales channel, "
-            "re-run with --include-shop '<name>'.",
+    stray_bundles = suspicious_unexploded_skus(sku_codes, name_map)
+    if stray_bundles:
+        logger.warning(
+            "COVERAGE GUARD: %d row SKUs look like unregistered bundles/multipacks (counted "
+            "raw, NOT exploded into components): %s",
+            len(stray_bundles),
+            ", ".join(stray_bundles),
+        )
+    nested = nested_bundle_skus(registry) & bundle_skus_seen
+    if nested:
+        logger.warning(
+            "COVERAGE GUARD: %d bundles are nested inside other bundles -- their AS-SOLD "
+            "counts may include lines pre-exploded from the parent kit: %s",
+            len(nested),
+            ", ".join(sorted(nested)),
         )
 
+    about_lines = build_about_lines(
+        start_date=start_date,
+        end_date=end_date,
+        n_days=len(day_strs),
+        line_items_cap=ShipHeroClient._ORDERS_LINE_ITEMS_CAP,
+        sku_count=len(sku_codes),
+        total_units=total_units,
+        channel_totals=channel_totals,
+        include_shops_key=include_shops_key,
+        excluded_shops=excluded_shops,
+        all_active_skus=args.all_active_skus,
+        amazon_present=AMAZON_SHOP in emit_channels,
+        bundle_count=len(bundle_skus_seen),
+        bundle_units=bundle_units_total,
+        generated_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    guard_lines: list[str] = []
+    if missing_kits:
+        guard_lines.append(
+            f"WARNING: {len(missing_kits)} kit-flagged SKUs missing from the bundle registry "
+            f"(their demand is dropped): {', '.join(sorted(missing_kits))}"
+        )
+    if stray_bundles:
+        guard_lines.append(
+            "WARNING: possible unregistered multipacks counted as their own rows "
+            f"(not exploded): {', '.join(stray_bundles)}"
+        )
+    if nested:
+        guard_lines.append(
+            "WARNING: bundles nested inside other bundles -- their as-sold counts may "
+            f"include the parent kit's pre-exploded lines: {', '.join(sorted(nested))}"
+        )
+    # Inside the body, above the Generated footer -- warnings must be read.
+    about_lines[-1:-1] = guard_lines
+
     # CSV is long-format (a Channel column) so it carries every channel in one
-    # file; the XLSX gives each channel its own tab.
+    # file; the XLSX gives each channel its own tab. Bundles get their own
+    # sibling .bundles.csv so the main CSV keeps summing to blended demand.
     csv_path = out_dir / f"{slug}.csv"
     write_csv(channel_rows, csv_path, include_code=not args.no_sku_code)
+    bundles_csv_path = out_dir / f"{slug}.bundles.csv"
+    write_csv(
+        bundle_channel_rows,
+        bundles_csv_path,
+        include_code=not args.no_sku_code,
+        sku_header="Bundle",
+    )
     readme_path = out_dir / f"{slug}.README.txt"
     readme_path.write_text("\n".join(about_lines) + "\n")
-    written = [csv_path, readme_path]
+    written = [csv_path, bundles_csv_path, readme_path]
 
     if not args.no_xlsx:
         try:
             xlsx_path = out_dir / f"{slug}.xlsx"
             sheets = [(_sheet_title(label), rows) for label, rows in channel_rows]
-            write_xlsx(sheets, xlsx_path, about_lines, include_code=not args.no_sku_code)
+            bundle_header = ["Date", "Bundle", "Channel", "QTY SOLD"] + (
+                ["SKU CODE"] if not args.no_sku_code else []
+            )
+            bundle_flat: list[list] = []
+            for label, rows in bundle_channel_rows:
+                for day, name, qty, code in rows:
+                    bundle_flat.append(
+                        [day, name, label, qty] + ([code] if not args.no_sku_code else [])
+                    )
+            bundle_flat.sort(key=lambda r: (r[0], str(r[1]).lower(), r[2]))
+            write_xlsx(
+                sheets,
+                xlsx_path,
+                about_lines,
+                include_code=not args.no_sku_code,
+                extra_long_sheets=[("BUNDLE SALES", bundle_header, bundle_flat)],
+            )
             written.append(xlsx_path)
         except ImportError:
             logger.warning("openpyxl not available; skipped XLSX (CSV written).")
