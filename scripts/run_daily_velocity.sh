@@ -51,7 +51,7 @@ echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') :: pulling $DAY (UTC day) ===" >> "$LO
 
 # Rename the window-slug outputs to the friendly daily name; drop the checkpoint.
 SLUG="daily-sales-velocity_${DAY}_${DAY}"
-for ext in xlsx csv README.txt; do
+for ext in xlsx csv bundles.csv README.txt; do
   if [ -f "$OUTDIR/$SLUG.$ext" ]; then
     mv -f "$OUTDIR/$SLUG.$ext" "$OUTDIR/daily-velocity_${DAY}.$ext"
   fi
