@@ -3,7 +3,7 @@
 
 Reads the sibling long-format CSV (Date, SKU, Channel, QTY SOLD, SKU CODE) to
 build the summary, then uploads the .xlsx to the channel. Used by the daily
-launchd job after the pull completes.
+Render cron (based-inventory-velocity; see render.yaml) after the pull completes.
 
 Usage:
     post_velocity_to_slack.py --xlsx <path> --day YYYY-MM-DD --channel <id>

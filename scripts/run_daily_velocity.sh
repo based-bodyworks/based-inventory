@@ -2,14 +2,15 @@
 # Daily sales-velocity pull: writes the PREVIOUS complete UTC day's per-channel
 # velocity to data/sales-velocity/daily/daily-velocity_YYYY-MM-DD.xlsx (+ .csv).
 #
-# Run by the launchd agent com.based.daily-velocity (or by hand). Reuses the
+# Run by the Render cron 'based-inventory-velocity' (schedule 0 11 * * *; see
+# render.yaml); also runnable locally by hand. Reuses the
 # main daily_sales_velocity.py with a 1-day window, then renames the output to
 # the friendly daily name and drops the per-day checkpoint. Days are UTC, to
 # match the 6-month report.
 set -euo pipefail
 
 # ROOT defaults to the repo root (two levels up from this script) so the job
-# runs both locally (launchd) and inside the Render container; override via env.
+# runs inside the Render container (the scheduler) and locally by hand; override via env.
 ROOT="${VELOCITY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 # PYBIN defaults to the local venv; Render (no venv) sets PYBIN=python.
 PYBIN="${PYBIN:-$ROOT/.venv/bin/python}"
@@ -20,7 +21,7 @@ mkdir -p "$OUTDIR" "$LOGDIR"
 
 # Target = yesterday in UTC (a complete calendar day). Override by passing a
 # YYYY-MM-DD as $1 (handy for backfilling a missed day). Date math works on
-# both GNU date (Linux/Render) and BSD date (macOS/launchd).
+# both GNU date (Linux/Render) and BSD date (macOS).
 DAY="${1:-$(date -u -d '1 day ago' +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d)}"
 LOG="$LOGDIR/daily-velocity_${DAY}.log"
 SLACK_CHANNEL_ID="${SLACK_CHANNEL:-C0AK6UGA1NJ}"
