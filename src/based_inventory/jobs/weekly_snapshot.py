@@ -9,9 +9,13 @@ Source of truth: ShipHero (Merchdrop warehouse). Resolves the
 AUDIT_LAYOUT product names to ShipHero SKUs via the BundleRegistry's
 substring-fallback name matcher.
 
-Tracks 23 products across 6 categories at the trusted-single level.
-Bundles excluded; their cover is pinned by lowest component (per the
-weekend-merch report).
+Tracks every sellable variant across 6 categories at the trusted-single
+level (29 rows as of 2026-07-13). Bundles excluded; their cover is pinned
+by lowest component (per the weekend-merch report).
+
+ONE ROW PER VARIANT: scent and size variants each get their own row rather
+than being summed into one product row. Aggregating masked real stockouts
+(see AUDIT_LAYOUT comment + data/audit-aliases.json `_variant_rule`).
 """
 
 from __future__ import annotations
@@ -51,7 +55,28 @@ AUDIT_LAYOUT: list[tuple[str, list[str]]] = [
             "Curl Refresh Spray",
         ],
     ),
-    ("Body", ["Body Wash", "Body Lotion", "Deodorant"]),
+    # Scent/size variants get their OWN row rather than one aggregate row per
+    # product (Avi 2026-07-13). Aggregating hid real stockouts: on 2026-07-13
+    # the "Deodorant" row read 🟢 33,779 available while Deodorant Santal was
+    # at 0 available with 1,369 backordered, because Bergamot + Guava carried
+    # the total. Same for Body Wash (Guava + Coconut both fully out behind a
+    # healthy Santal). One row per sellable variant means each variant's tier
+    # is computed from its own available/backorder and can't be masked.
+    #
+    # Each name here pins to a single ShipHero SKU via data/audit-aliases.json.
+    (
+        "Body",
+        [
+            "Body Wash Santal",
+            "Body Wash Guava Nectar",
+            "Body Wash Caribbean Coconut",
+            "Body Lotion Santal",
+            "Body Lotion Amber",
+            "Deodorant Bergamot & Vanilla",
+            "Deodorant Guava Nectar",
+            "Deodorant Santal",
+        ],
+    ),
     (
         "Skin",
         [
@@ -59,7 +84,8 @@ AUDIT_LAYOUT: list[tuple[str, list[str]]] = [
             "Daily Facial Moisturizer",
             "Skin Revival Spray",
             "Under Eye Elixir",
-            "Tallow Moisturizer",
+            "Tallow Moisturizer 50ml",
+            "Tallow Moisturizer 100ml",
         ],
     ),
     ("Accessories", ["Toiletry Bag", "Scalp Scrubber", "Wooden Hair Comb"]),
