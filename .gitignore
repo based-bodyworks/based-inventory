@@ -30,3 +30,6 @@ data/alert-state-shiphero.json
 # Playwright
 playwright-report/
 test-results/
+
+# Local velocity report output (Render writes to its own container)
+data/sales-velocity/
