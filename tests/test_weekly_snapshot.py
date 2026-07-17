@@ -460,64 +460,116 @@ def test_shipped_audit_aliases_file_is_valid() -> None:
         assert has_sku or has_skus, f"alias {name!r} needs 'sku' or non-empty 'skus'"
 
 
-def test_body_wash_alias_avoids_packaging_components() -> None:
-    """Regression: the 2026-05-09 weekly snapshot showed 'Body Wash: 25,000'
-    which was actually `BW-SNTL-PK001` (Container, Cap, Body Wash) — a
-    packaging component the substring fallback grabbed because it has the
-    highest on_hand of any name containing 'Body Wash'. The alias must pin
-    Body Wash to the real BB-*-01 product SKUs across scent variants.
+# --------------------------------------------------------------------------
+# One row per sellable variant (Avi 2026-07-13).
+#
+# Aggregating scent/size variants into a single row masked real stockouts:
+# on 2026-07-13 the "Deodorant" row read 🟢 33,779 available while Deodorant
+# Santal sat at 0 available / 1,369 backordered (Bergamot + Guava carried the
+# total), and "Body Wash" hid TWO fully-OOS scents (Guava 273 backordered,
+# Coconut 700 backordered) behind a healthy Santal. Each variant now gets its
+# own AUDIT_LAYOUT row pinned to its own single SKU, so its tier is computed
+# from its own available/backorder and cannot be masked.
+# --------------------------------------------------------------------------
+
+# The canonical Shopify single/just-one variant per scent or size, verified via
+# scripts/probe_shopify_canonical_skus.py. Each MUST be its own audit row.
+EXPECTED_VARIANT_ROWS: dict[str, str] = {
+    "Body Wash Santal": "BB-SS-01",
+    "Body Wash Guava Nectar": "BB-GN-01",
+    "Body Wash Caribbean Coconut": "BB-CC-01",
+    "Body Lotion Santal": "BB-BDYLTN-SINGLE-SNTL",
+    "Body Lotion Amber": "BB-BDYLTN-SINGLE-AMBR",
+    "Deodorant Bergamot & Vanilla": "BB-DEO-BM-01",
+    "Deodorant Guava Nectar": "BB-DEO-GN-01",
+    "Deodorant Santal": "BB-DEO-SS-01",
+    "Tallow Moisturizer 50ml": "BB-ONE-BTAL-50ML",
+    "Tallow Moisturizer 100ml": "BB-ONE-BTAL-100ML",
+}
+
+# Packaging-component / raw-material SKU prefixes. These are NOT finished goods
+# and must never back an audit row. The 2026-05-09 bug pinned Body Wash to
+# BW-SNTL-PK001 (Container, Cap) at 25,000 and Deodorant to DEO-BV-IFC001
+# (Packaging, IFC) at 76,800 because they outrank the real product on on_hand.
+_PACKAGING_PREFIXES = ("BW-", "DEO-", "BL-", "SH-", "CN-", "SSS-", "SRS-")
+
+
+def test_every_variant_has_its_own_row_pinned_to_one_sku() -> None:
+    """Each scent/size variant is its own row pinned to exactly one SKU.
+
+    A `skus` list here would mean two variants were merged back into one row,
+    which is the masking bug this design exists to prevent.
     """
     repo_root = Path(__file__).resolve().parents[1]
     aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
-    entry = aliases.get("Body Wash")
-    assert entry is not None, "Body Wash must be aliased to dodge packaging-component fuzzy match"
-    skus = set(entry.get("skus") or ([entry["sku"]] if "sku" in entry else []))
-    assert skus, "Body Wash alias must list at least one SKU"
-    # All scent variants of the actual finished good follow BB-{SS,GN,CC}-01.
-    assert skus.issubset(
-        {"BB-SS-01", "BB-GN-01", "BB-CC-01"}
-    ), f"Body Wash alias should only contain BB-*-01 finished-good SKUs, got {skus}"
-    # Must NOT contain packaging-component patterns (BW-*-PK*).
-    for sku in skus:
-        assert not sku.startswith(
-            "BW-"
-        ), f"Body Wash alias must not include packaging components ({sku})"
+    for name, expected_sku in EXPECTED_VARIANT_ROWS.items():
+        entry = aliases.get(name)
+        assert entry is not None, f"{name!r} must have its own alias row"
+        assert "sku" in entry, (
+            f"{name!r} must pin a single 'sku' (found {entry!r}); a 'skus' list "
+            "would re-aggregate variants and mask a per-variant stockout"
+        )
+        assert (
+            entry["sku"] == expected_sku
+        ), f"{name!r} should pin {expected_sku}, got {entry['sku']}"
 
 
-def test_body_lotion_alias_includes_all_active_shopify_singles() -> None:
-    """Per Shopify (2026-05-09 probe), the active 'Body Lotion' product has
-    two single-variant scents: Santal (BB-BDYLTN-SINGLE-SNTL) and Amber
-    (BB-BDYLTN-SINGLE-AMBR). The alias must aggregate both so the audit
-    surfaces Amber inventory once the launch ships."""
+def test_no_aggregate_variant_rows_remain() -> None:
+    """Regression guard: the old aggregate rows must be gone from both the
+    layout and the aliases, or a scent stockout can hide behind a total."""
+    from based_inventory.jobs.weekly_snapshot import AUDIT_LAYOUT
+
     repo_root = Path(__file__).resolve().parents[1]
     aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
-    entry = aliases.get("Body Lotion")
-    assert entry is not None, "Body Lotion must be aliased"
-    skus = set(entry.get("skus") or ([entry["sku"]] if "sku" in entry else []))
-    assert "BB-BDYLTN-SINGLE-SNTL" in skus, "Santal single must be present"
-    assert (
-        "BB-BDYLTN-SINGLE-AMBR" in skus
-    ), "Amber single must be present (active scent in Shopify since 2026 launch)"
+    layout_names = {name for _cat, names in AUDIT_LAYOUT for name in names}
+    for aggregate in ("Body Wash", "Body Lotion", "Deodorant", "Tallow Moisturizer"):
+        assert (
+            aggregate not in layout_names
+        ), f"{aggregate!r} is an aggregate row; split it into per-variant rows"
+        assert (
+            aggregate not in aliases
+        ), f"{aggregate!r} aggregate alias should be replaced by per-variant pins"
 
 
-def test_deodorant_alias_avoids_packaging_components() -> None:
-    """Regression: same bug as Body Wash. 'Deodorant: 76,800' was actually
-    `DEO-BV-IFC001` (Packaging, IFC, 2.6 oz, Deodorant). Alias must pin to
-    BB-DEO-{BM,GN,SS}-01 across scent variants.
+def test_no_alias_pins_a_packaging_component() -> None:
+    """No audit row may resolve to packaging/raw-material SKUs. Covers the
+    2026-05-09 Body Wash (BW-SNTL-PK001) and Deodorant (DEO-BV-IFC001) bugs."""
+    repo_root = Path(__file__).resolve().parents[1]
+    aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
+    for name, entry in aliases.items():
+        skus = entry.get("skus") or ([entry["sku"]] if "sku" in entry else [])
+        for sku in skus:
+            assert not sku.startswith(_PACKAGING_PREFIXES), (
+                f"alias {name!r} pins packaging/raw-material SKU {sku!r}; "
+                "audit rows must use finished-good SKUs only"
+            )
+
+
+def test_every_audit_layout_name_resolves_or_is_fuzzy_matched() -> None:
+    """Every variant row named in AUDIT_LAYOUT has a matching alias key.
+
+    Catches a typo between the layout and the aliases file, which would
+    silently fall through to fuzzy matching and could grab a packaging
+    component again.
     """
+    from based_inventory.jobs.weekly_snapshot import AUDIT_LAYOUT
+
     repo_root = Path(__file__).resolve().parents[1]
     aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
-    entry = aliases.get("Deodorant")
-    assert entry is not None, "Deodorant must be aliased to dodge packaging-component fuzzy match"
-    skus = set(entry.get("skus") or ([entry["sku"]] if "sku" in entry else []))
-    assert skus, "Deodorant alias must list at least one SKU"
-    assert skus.issubset(
-        {"BB-DEO-BM-01", "BB-DEO-GN-01", "BB-DEO-SS-01"}
-    ), f"Deodorant alias should only contain BB-DEO-*-01 finished-good SKUs, got {skus}"
-    for sku in skus:
-        assert not sku.startswith(
-            "DEO-"
-        ), f"Deodorant alias must not include packaging components ({sku})"
+    layout_names = {name for _cat, names in AUDIT_LAYOUT for name in names}
+    for name in EXPECTED_VARIANT_ROWS:
+        assert name in layout_names, f"{name!r} is aliased but missing from AUDIT_LAYOUT"
+        assert name in aliases, f"{name!r} is in AUDIT_LAYOUT but has no alias pin"
+
+
+def test_body_lotion_amber_has_its_own_row() -> None:
+    """Avi's original ask (2026-07-13): Amber vs Santal Body Lotion must be
+    distinguishable. Previously both were summed into one 'Body Lotion' row,
+    so Amber at 2,018 (📊 band) was hidden inside a 🟢 15,772 total."""
+    repo_root = Path(__file__).resolve().parents[1]
+    aliases = _load_aliases(repo_root / "data" / "audit-aliases.json")
+    assert aliases.get("Body Lotion Santal", {}).get("sku") == "BB-BDYLTN-SINGLE-SNTL"
+    assert aliases.get("Body Lotion Amber", {}).get("sku") == "BB-BDYLTN-SINGLE-AMBR"
 
 
 def test_body_wash_resolves_to_aggregate_not_packaging_component() -> None:
