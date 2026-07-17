@@ -1,12 +1,26 @@
 {
-  "_note": "Pin weekly_snapshot AUDIT_LAYOUT names to ShipHero SKUs when fuzzy name matching can't bridge the gap (audit-layout 'Hair Clay' vs ShipHero 'Clay'; legacy V1 SKU mis-flagged is_kit=True hiding the real V2 single; etc.). Keys are AUDIT_LAYOUT names (case-sensitive). Each entry pins to either a single 'sku' (one trusted physical SKU) or a list of 'skus' (sum on_hand across multiple physical SKUs that the audit layout treats as one product, e.g. 50ml + 100ml size variants).",
-  "_format": "Each entry: <AUDIT_LAYOUT name> -> {sku: <ShipHero SKU>} | {skus: [<ShipHero SKU>, ...]}. Edit when ShipHero canonical names drift or new size variants ship.",
+  "_note": "Pin weekly_snapshot AUDIT_LAYOUT names to ShipHero SKUs when fuzzy name matching can't bridge the gap (audit-layout 'Hair Clay' vs ShipHero 'Clay'; legacy V1 SKU mis-flagged is_kit=True hiding the real V2 single; packaging components like BW-SNTL-PK001 outranking the real product on on_hand; etc.). Keys are AUDIT_LAYOUT names (case-sensitive). Each entry pins to either a single 'sku' (one trusted physical SKU) or a list of 'skus' (sum across multiple physical SKUs treated as one row).",
+  "_variant_rule": "ONE ROW PER SELLABLE VARIANT (Avi 2026-07-13). Do NOT aggregate scent or size variants into a single row. Aggregating hides stockouts: on 2026-07-13 the aggregated 'Deodorant' row read healthy at 33,779 available while Deodorant Santal sat at 0 available / 1,369 backordered, because Bergamot + Guava carried the total. Body Wash had two fully-OOS scents (Guava, Coconut) behind a healthy Santal. Each scent/size now pins to its own single SKU so its tier is computed from its own available/backorder. The multi-SKU 'skus' form is still supported by the resolver but no longer used by any shipped entry; prefer a new single-SKU row over adding a SKU to an existing aggregate.",
+  "_methodology": "Cross-reference against Shopify (source of truth) before adding/editing an entry. Every Shopify variant tagged as a single/just-one under a product page should get its own AUDIT_LAYOUT row + single-SKU alias here. Use scripts/probe_shopify_canonical_skus.py to print the current Shopify mapping. When a new scent launches, add a row to AUDIT_LAYOUT and a pin here.",
+  "_format": "Each entry: <AUDIT_LAYOUT name> -> {sku: <ShipHero SKU>} | {skus: [<ShipHero SKU>, ...]}. Edit when ShipHero canonical names drift, new size/scent variants ship, or Shopify reorganizes a product.",
   "aliases": {
     "Hair Clay": {"sku": "CLAY1"},
     "Leave-In Conditioner": {"sku": "BB-LEAVEIN-ONE"},
     "Wooden Hair Comb": {"sku": "BB-GWP-COMB-DARK"},
     "Scalp Scrubber": {"sku": "BB-ACCS-SCLPSCRBR-V2"},
-    "Tallow Moisturizer": {"skus": ["BB-ONE-BTAL-50ML", "BB-ONE-BTAL-100ML"]},
-    "Body Lotion": {"sku": "BB-BDYLTN-SINGLE-SNTL"}
+
+    "Body Wash Santal": {"sku": "BB-SS-01"},
+    "Body Wash Guava Nectar": {"sku": "BB-GN-01"},
+    "Body Wash Caribbean Coconut": {"sku": "BB-CC-01"},
+
+    "Body Lotion Santal": {"sku": "BB-BDYLTN-SINGLE-SNTL"},
+    "Body Lotion Amber": {"sku": "BB-BDYLTN-SINGLE-AMBR"},
+
+    "Deodorant Bergamot & Vanilla": {"sku": "BB-DEO-BM-01"},
+    "Deodorant Guava Nectar": {"sku": "BB-DEO-GN-01"},
+    "Deodorant Santal": {"sku": "BB-DEO-SS-01"},
+
+    "Tallow Moisturizer 50ml": {"sku": "BB-ONE-BTAL-50ML"},
+    "Tallow Moisturizer 100ml": {"sku": "BB-ONE-BTAL-100ML"}
   }
 }
