@@ -10,7 +10,7 @@ AUDIT_LAYOUT product names to ShipHero SKUs via the BundleRegistry's
 substring-fallback name matcher.
 
 Tracks every sellable variant across 6 categories at the trusted-single
-level (29 rows as of 2026-07-13). Bundles excluded; their cover is pinned
+level (31 rows as of 2026-08-31). Bundles excluded; their cover is pinned
 by lowest component (per the weekend-merch report).
 
 ONE ROW PER VARIANT: scent and size variants each get their own row rather
@@ -72,6 +72,8 @@ AUDIT_LAYOUT: list[tuple[str, list[str]]] = [
             "Body Wash Caribbean Coconut",
             "Body Lotion Santal",
             "Body Lotion Amber",
+            "Body Lotion Dusk",
+            "Body Lotion Dawn",
             "Deodorant Bergamot & Vanilla",
             "Deodorant Guava Nectar",
             "Deodorant Santal",
