@@ -480,6 +480,8 @@ EXPECTED_VARIANT_ROWS: dict[str, str] = {
     "Body Wash Caribbean Coconut": "BB-CC-01",
     "Body Lotion Santal": "BB-BDYLTN-SINGLE-SNTL",
     "Body Lotion Amber": "BB-BDYLTN-SINGLE-AMBR",
+    "Body Lotion Dusk": "BB-BDYLTN-SINGLE-DUSK",
+    "Body Lotion Dawn": "BB-BDYLTN-SINGLE-DAWN",
     "Deodorant Bergamot & Vanilla": "BB-DEO-BM-01",
     "Deodorant Guava Nectar": "BB-DEO-GN-01",
     "Deodorant Santal": "BB-DEO-SS-01",
