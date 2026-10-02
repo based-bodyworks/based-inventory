@@ -31,3 +31,5 @@ jobs:
       - run: ruff check
       - run: ruff format --check
       - run: pytest
+      - name: Build production image
+        run: docker build -t based-inventory-ci .
