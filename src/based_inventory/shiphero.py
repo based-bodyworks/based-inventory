@@ -49,6 +49,15 @@ MERCHDROP_WAREHOUSE_ID = "V2FyZWhvdXNlOjExNzY2MQ=="
 # max_available=4004, increment_rate=60 credits/sec. Used as fallbacks when a
 # response omits the live quota.
 _DEFAULT_CREDIT_REFILL_RATE = 60.0
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _response_type(response: requests.Response) -> str:
+    """Classify the content type without echoing a provider header into logs."""
+    media_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if media_type == "application/json" or media_type.endswith("+json"):
+        return "json"
+    return "non-json" if media_type else "unspecified"
 
 
 def _credits_refill_wait(credits_remaining: int, floor: int, increment_rate: float) -> float:
@@ -119,7 +128,8 @@ class ShipHeroClient:
     def _execute(
         self, query: str, variables: dict[str, Any] | None = None, retries: int = 6
     ) -> dict[str, Any]:
-        last_exc: Exception | None = None
+        if type(retries) is not int or not 0 <= retries <= 6:
+            raise ValueError("ShipHero retries must be between 0 and 6")
         for attempt in range(retries + 1):
             try:
                 r = requests.post(
@@ -128,25 +138,82 @@ class ShipHeroClient:
                     headers=self.headers,
                     timeout=60,
                 )
-            except (requests.ConnectionError, requests.Timeout) as e:
-                last_exc = e
+            except (requests.ConnectionError, requests.Timeout):
                 if attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
                     continue
-                raise RuntimeError(f"ShipHero network error after {retries} retries: {e}") from e
-            payload = r.json() if r.content else {}
+                raise RuntimeError(f"ShipHero network error after {retries} retries") from None
+
+            status = r.status_code
+            response_type = _response_type(r)
+            if not 200 <= status < 300:
+                if status in _RETRYABLE_HTTP_STATUSES and attempt < retries:
+                    wait = min(2**attempt * 2, 30)
+                    if status == 429 and response_type != "non-json" and r.content:
+                        try:
+                            throttle_payload = r.json()
+                        except ValueError:
+                            throttle_payload = None
+                        if isinstance(throttle_payload, dict):
+                            errors = throttle_payload.get("errors")
+                            first = errors[0] if isinstance(errors, list) and errors else None
+                            if isinstance(first, dict) and first.get("code") == 30:
+                                raw = str(first.get("time_remaining") or "60")[:32]
+                                digits = "".join(c for c in raw if c.isdigit()) or "60"
+                                wait = min(int(digits) + 1, 90)
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"ShipHero HTTP {status} ({response_type} response) after {attempt} retries"
+                )
+
+            if response_type == "non-json" or not r.content:
+                if attempt < retries:
+                    time.sleep(min(2**attempt * 2, 30))
+                    continue
+                raise RuntimeError(
+                    f"ShipHero HTTP {status} invalid {response_type} response after {attempt} retries"
+                )
+            try:
+                payload = r.json()
+            except ValueError:
+                if attempt < retries:
+                    time.sleep(min(2**attempt * 2, 30))
+                    continue
+                raise RuntimeError(
+                    f"ShipHero HTTP {status} invalid {response_type} response after {attempt} retries"
+                ) from None
+            if not isinstance(payload, dict):
+                if attempt < retries:
+                    time.sleep(min(2**attempt * 2, 30))
+                    continue
+                raise RuntimeError(
+                    f"ShipHero HTTP {status} invalid {response_type} response after {attempt} retries"
+                )
             if "errors" in payload:
-                err = payload["errors"][0] if payload["errors"] else {}
+                errors = payload["errors"]
+                err = errors[0] if isinstance(errors, list) and errors else {}
+                if not isinstance(err, dict):
+                    err = {}
                 if err.get("code") == 30 and attempt < retries:
-                    raw = str(err.get("time_remaining") or "60")
+                    raw = str(err.get("time_remaining") or "60")[:32]
                     digits = "".join(c for c in raw if c.isdigit()) or "60"
                     time.sleep(min(int(digits) + 1, 90))
                     continue
-                raise RuntimeError(f"ShipHero GraphQL errors: {payload['errors']}")
-            r.raise_for_status()
+                # Two bounded callers split a date window when ShipHero says
+                # the query exceeded its per-operation credit cap. Keep that
+                # fixed signal without echoing the provider's error message.
+                if isinstance(errors, list) and any(
+                    isinstance(item, dict)
+                    and type(item.get("message")) is str
+                    and "credits" in item["message"][:512].lower()
+                    for item in errors
+                ):
+                    raise RuntimeError("ShipHero GraphQL credits limit")
+                raise RuntimeError("ShipHero GraphQL error")
             self._pace_from_quota(payload)
             return payload
-        raise RuntimeError(f"ShipHero retries exhausted: {last_exc}")
+        raise RuntimeError("ShipHero retries exhausted")
 
     def _pace_from_quota(self, payload: dict[str, Any]) -> None:
         """Proactively wait so the credit pool stays above min_credits_floor.
