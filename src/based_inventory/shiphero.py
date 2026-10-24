@@ -200,6 +200,16 @@ class ShipHeroClient:
                     digits = "".join(c for c in raw if c.isdigit()) or "60"
                     time.sleep(min(int(digits) + 1, 90))
                     continue
+                # Two bounded callers split a date window when ShipHero says
+                # the query exceeded its per-operation credit cap. Keep that
+                # fixed signal without echoing the provider's error message.
+                if isinstance(errors, list) and any(
+                    isinstance(item, dict)
+                    and type(item.get("message")) is str
+                    and "credits" in item["message"][:512].lower()
+                    for item in errors
+                ):
+                    raise RuntimeError("ShipHero GraphQL credits limit")
                 raise RuntimeError("ShipHero GraphQL error")
             self._pace_from_quota(payload)
             return payload

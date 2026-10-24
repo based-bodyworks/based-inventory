@@ -129,6 +129,68 @@ def test_graphql_error_does_not_reveal_provider_message(monkeypatch) -> None:
     assert "secret" not in str(caught.value)
 
 
+def test_credit_cap_error_keeps_a_fixed_bisection_signal(monkeypatch) -> None:
+    body = json.dumps({"errors": [{"message": "Exceeded available credits: private details"}]})
+    _scripted_post(monkeypatch, [_response(200, body)])
+
+    with pytest.raises(RuntimeError, match="ShipHero GraphQL credits limit") as caught:
+        ShipHeroClient(token="secret")._execute("query", retries=0)
+    assert "private details" not in str(caught.value)
+
+
+def test_channel_mix_bisects_on_sanitized_credit_error(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    calls = []
+
+    def execute(query, variables=None, retries=6):
+        calls.append(variables)
+        if len(calls) == 1:
+            raise RuntimeError("ShipHero GraphQL credits limit")
+        order = {"order_number": str(len(calls)), "shop_name": "BASED"}
+        return {
+            "data": {
+                "orders": {"data": {"edges": [{"node": order}], "pageInfo": {"hasNextPage": False}}}
+            }
+        }
+
+    monkeypatch.setattr(client, "_execute", execute)
+    assert client.fetch_channel_mix("2026-10-01T00:00:00") == {"BASED": 2}
+    assert len(calls) == 3
+    assert calls[1]["until"] == calls[2]["since"]
+
+
+def test_inbound_bisects_on_sanitized_credit_error(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    calls = []
+
+    def execute(query, variables=None, retries=6):
+        calls.append(variables)
+        if len(calls) == 1:
+            raise RuntimeError("ShipHero GraphQL credits limit")
+        po = {
+            "po_number": str(len(calls)),
+            "po_date": "2026-10-01T00:00:00",
+            "ship_date": None,
+            "line_items": {
+                "edges": [{"node": {"sku": "SKU1", "quantity": 10, "quantity_received": 2}}]
+            },
+        }
+        return {
+            "data": {
+                "purchase_orders": {
+                    "data": {"edges": [{"node": po}], "pageInfo": {"hasNextPage": False}}
+                }
+            }
+        }
+
+    monkeypatch.setattr(client, "_execute", execute)
+    result = client.fetch_inbound_outstanding_by_sku("2026-10-01T00:00:00")
+    assert len(calls) == 3
+    assert calls[1]["until"] == calls[2]["since"]
+    assert result["SKU1"]["outstanding"] == 16
+    assert result["SKU1"]["po_count"] == 2
+
+
 def test_network_error_is_sanitized(monkeypatch) -> None:
     def failed_post(*args, **kwargs):
         raise requests.ConnectionError("private URL and token secret")
