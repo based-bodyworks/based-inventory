@@ -410,6 +410,26 @@ def _affected_bundle_names(sku: str, registry) -> list[str]:
     return sorted(set(out))
 
 
+def _fetch_candidate_depletion(
+    client: ShipHeroClient, candidates: list, since: str
+) -> tuple[dict[str, int], dict[str, float]]:
+    """Keep missing source data from becoming a false zero-velocity claim."""
+    depletion: dict[str, int] = {}
+    eff_windows: dict[str, float] = {}
+    for stock in candidates:
+        # A failed read must stop this alert run. Zero is a valid observed
+        # depletion value, not a fallback for an unavailable ShipHero response.
+        amount, effective_window = client.fetch_sku_depletion(
+            sku=stock.sku,
+            date_from_iso=since,
+            warehouse_id=MERCHDROP_WAREHOUSE_ID,
+            max_pages=VELOCITY_MAX_PAGES,
+        )
+        depletion[stock.sku] = amount
+        eff_windows[stock.sku] = effective_window
+    return depletion, eff_windows
+
+
 def _run(cfg: Config) -> None:
     access_token = resolve_access_token(
         refresh_token=cfg.shiphero_refresh_token,
@@ -460,21 +480,7 @@ def _run(cfg: Config) -> None:
         "%Y-%m-%dT%H:%M:%S",
         time.gmtime(time.time() - VELOCITY_WINDOW_DAYS * 86400),
     )
-    depletion: dict[str, int] = {}
-    eff_windows: dict[str, float] = {}
-    for s in candidates:
-        try:
-            d, eff = client.fetch_sku_depletion(
-                sku=s.sku,
-                date_from_iso=since,
-                warehouse_id=MERCHDROP_WAREHOUSE_ID,
-                max_pages=VELOCITY_MAX_PAGES,
-            )
-            depletion[s.sku] = d
-            eff_windows[s.sku] = eff
-        except RuntimeError:
-            depletion[s.sku] = 0
-            eff_windows[s.sku] = float(VELOCITY_WINDOW_DAYS)
+    depletion, eff_windows = _fetch_candidate_depletion(client, candidates, since)
 
     sku_cover = compute_sku_cover(
         candidates,
