@@ -26,11 +26,6 @@ DAY="${1:-$(date -u -d '1 day ago' +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m
 LOG="$LOGDIR/daily-velocity_${DAY}.log"
 SLACK_CHANNEL_ID="${SLACK_CHANNEL:-C0AK6UGA1NJ}"
 
-# Keep the local log, and stream the same output to Render so errors survive
-# the cron container. Flush Python output while a long fetch is still running.
-exec > >(tee -a "$LOG") 2>&1
-export PYTHONUNBUFFERED=1
-
 # Alert to Slack on ANY non-zero exit so a broken run never goes silent again
 # (failed pull, no xlsx, etc.). NOTE: this cannot cover the script-file-missing
 # case itself (the trap lives inside the script) -- that recurrence is prevented
@@ -62,36 +57,46 @@ notify_failure() {
   fi
   exit "$code"
 }
-trap notify_failure EXIT
 
-echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') :: pulling $DAY (UTC day) ==="
+# A foreground pipeline waits for tee to drain before Render ends the
+# container. Capture the workload's status rather than replacing it with the
+# logger's. The workload keeps errexit enabled inside its own subshell.
+set +e
+(
+  set -e
+  trap notify_failure EXIT
+  export PYTHONUNBUFFERED=1
 
-"$PYBIN" "$SCRIPT" \
-  --start-date "$DAY" --end-date "$DAY" \
-  --out-dir "$OUTDIR" --fresh
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') :: pulling $DAY (UTC day) ==="
 
-# Rename the window-slug outputs to the friendly daily name; drop the checkpoint.
-SLUG="daily-sales-velocity_${DAY}_${DAY}"
-for ext in xlsx csv bundles.csv README.txt; do
-  if [ -f "$OUTDIR/$SLUG.$ext" ]; then
-    mv -f "$OUTDIR/$SLUG.$ext" "$OUTDIR/daily-velocity_${DAY}.$ext"
+  "$PYBIN" "$SCRIPT" \
+    --start-date "$DAY" --end-date "$DAY" \
+    --out-dir "$OUTDIR" --fresh
+
+  # Rename the window-slug outputs to the friendly daily name; drop the checkpoint.
+  SLUG="daily-sales-velocity_${DAY}_${DAY}"
+  for ext in xlsx csv bundles.csv README.txt; do
+    if [ -f "$OUTDIR/$SLUG.$ext" ]; then
+      mv -f "$OUTDIR/$SLUG.$ext" "$OUTDIR/daily-velocity_${DAY}.$ext"
+    fi
+  done
+  rm -f "$OUTDIR/$SLUG.checkpoint.json"
+
+  if [ -f "$OUTDIR/daily-velocity_${DAY}.xlsx" ]; then
+    echo "OK -> $OUTDIR/daily-velocity_${DAY}.xlsx"
+  else
+    echo "FAILED: no xlsx produced for $DAY"
+    exit 1
   fi
-done
-rm -f "$OUTDIR/$SLUG.checkpoint.json"
 
-if [ -f "$OUTDIR/daily-velocity_${DAY}.xlsx" ]; then
-  echo "OK -> $OUTDIR/daily-velocity_${DAY}.xlsx"
-else
-  echo "FAILED: no xlsx produced for $DAY"
-  exit 1
-fi
-
-# Post the workbook + a summary to Slack. A Slack failure does NOT fail the run
-# (the file is already on disk); it's just logged.
-if "$PYBIN" "$ROOT/scripts/post_velocity_to_slack.py" \
-     --xlsx "$OUTDIR/daily-velocity_${DAY}.xlsx" \
-     --day "$DAY" --channel "$SLACK_CHANNEL_ID"; then
-  echo "Slack: posted to $SLACK_CHANNEL_ID"
-else
-  echo "Slack: post FAILED (file still saved locally)"
-fi
+  # A workbook-post failure stays nonfatal because the report is already saved.
+  if "$PYBIN" "$ROOT/scripts/post_velocity_to_slack.py" \
+       --xlsx "$OUTDIR/daily-velocity_${DAY}.xlsx" \
+       --day "$DAY" --channel "$SLACK_CHANNEL_ID"; then
+    echo "Slack: posted to $SLACK_CHANNEL_ID"
+  else
+    echo "Slack: post FAILED (file still saved locally)"
+  fi
+) 2>&1 | tee -a "$LOG"
+run_status=${PIPESTATUS[0]}
+exit "$run_status"

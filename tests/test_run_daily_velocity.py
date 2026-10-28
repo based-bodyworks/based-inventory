@@ -157,3 +157,28 @@ def test_missing_workbook_is_still_a_failed_run(job):
     assert result.returncode == 1
     assert "no xlsx produced" in result.stdout + result.stderr
     assert not Path(job[1]["POST_MARKER"]).exists()
+
+
+def test_wrapper_waits_until_final_output_is_saved_before_exiting(job):
+    root, env = job
+    delayed_tee = Path(env["PATH"].split(":")[0]) / "tee"
+    delayed_tee.write_text('#!/bin/sh\nsleep 0.5\nexec /usr/bin/tee "$@"\n')
+    delayed_tee.chmod(0o755)
+    output = root / "render-output.log"
+    # Ordinary files do not keep subprocess.run waiting for inherited pipes.
+    # The parent wrapper itself must wait for its logging child to drain.
+    with output.open("w") as stream:
+        result = subprocess.run(
+            ["/bin/bash", str(WRAPPER), DAY],
+            env=env,
+            stdout=stream,
+            stderr=stream,
+            timeout=10,
+        )
+    assert result.returncode == 17
+    log = root / "data" / "sales-velocity" / "daily" / "logs" / f"daily-velocity_{DAY}.log"
+    assert log.exists()
+    for path in (output, log):
+        text = path.read_text()
+        assert "fetch stderr detail" in text
+        assert "exit 17" in text
