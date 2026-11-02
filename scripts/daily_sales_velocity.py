@@ -674,6 +674,10 @@ _RETRYABLE_NETWORK_HINTS = (
 # Generous cap so a long outage (overnight sleep without caffeinate, ISP drop)
 # is ridden through; progress is checkpointed per day regardless.
 _DAY_FETCH_MAX_NETWORK_RETRIES = 240
+# The shared client already retries individual credit-limited requests. If
+# its retry budget runs out, allow a bounded refill pause before restarting
+# the whole day. Keep this separate from the much longer network budget.
+_DAY_FETCH_MAX_CREDIT_RETRIES = 12
 
 # Hard wall-clock cap on a SINGLE day's fetch. A healthy day finishes in well
 # under this even at peak volume (~8-16 min); anything past it is a wedged
@@ -730,10 +734,13 @@ def _fetch_orders_resilient(
     A transient connectivity failure (wifi blip, DNS failure, sleep/wake, a
     ShipHero 5xx) OR a wedged socket that hangs past the per-day watchdog waits
     with escalating backoff and retries the SAME day instead of crashing or
-    stalling the whole run. Non-network errors propagate. Either way progress is
-    checkpointed per completed day, so nothing already pulled is lost.
+    stalling the whole run. A depleted ShipHero credit pool gets a separate,
+    shorter retry budget with fixed refill pauses. Other errors propagate.
+    Each retry starts the same complete day again and can repeat fetched
+    pages. A failed attempt returns no partial day. Completed days remain checkpointed.
     """
     attempt = 0
+    credit_retries = 0
     while True:
         previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
         try:
@@ -745,6 +752,28 @@ def _fetch_orders_resilient(
             )
         except (RuntimeError, requests.RequestException, _FetchTimeoutError) as e:
             _clear_watchdog(previous)  # disarm BEFORE the backoff sleep
+            message = str(e).lower()
+            if (
+                isinstance(e, RuntimeError)
+                and "not enough credits" in message
+                and "requires too many credits" not in message
+            ):
+                if credit_retries >= _DAY_FETCH_MAX_CREDIT_RETRIES:
+                    raise RuntimeError(
+                        f"ShipHero credit pool unavailable after {credit_retries} retries on {day}; "
+                        "no partial day accepted. Completed days are checkpointed; "
+                        "re-run the same command to resume."
+                    ) from e
+                credit_retries += 1
+                logger.warning(
+                    "ShipHero credit shortage on %s (retry %d/%d); waiting 30s "
+                    "then restarting the same complete day.",
+                    day,
+                    credit_retries,
+                    _DAY_FETCH_MAX_CREDIT_RETRIES,
+                )
+                time.sleep(30)
+                continue
             if not _is_retryable_network_error(e):
                 raise
             attempt += 1
