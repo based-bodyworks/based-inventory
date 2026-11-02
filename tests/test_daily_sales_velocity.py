@@ -12,6 +12,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -592,6 +594,125 @@ def test_fetch_orders_resilient_retries_then_succeeds(monkeypatch) -> None:
     out = dsv._fetch_orders_resilient(FlakyClient(), "2026-03-01", "s", "u", 10)
     assert out == [{"order_number": "1"}]
     assert calls["n"] == 3  # failed twice, succeeded on the third
+
+
+_OBSERVED_CREDIT_SHORTAGE = (
+    "ShipHero GraphQL errors: [{'message': 'There are not enough credits to perform the operation', "
+    "'required_credits': 1601, 'remaining_credits': 594, 'time_remaining': '17 seconds', 'code': 30}]"
+)
+
+
+def test_fetch_orders_resilient_recovers_credit_shortages_without_changing_window(monkeypatch):
+    events = []
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "prior-handler")
+    monkeypatch.setattr(dsv, "_clear_watchdog", lambda previous: events.append(("clear", previous)))
+    monkeypatch.setattr(dsv.time, "sleep", lambda wait: events.append(("sleep", wait)))
+    requests = []
+    complete_day = [{"order_number": "first"}, {"order_number": "last"}]
+
+    class CreditLimitedClient:
+        def fetch_orders_window(self, **kwargs):
+            requests.append(kwargs)
+            if len(requests) < 3:
+                raise RuntimeError(_OBSERVED_CREDIT_SHORTAGE)
+            return complete_day
+
+    result = dsv._fetch_orders_resilient(
+        CreditLimitedClient(), "2026-11-01", "2026-11-01T00:00:00", "2026-11-02T00:00:00", 100
+    )
+
+    assert result == [{"order_number": "first"}, {"order_number": "last"}]
+    assert (
+        requests
+        == [
+            {
+                "since_iso": "2026-11-01T00:00:00",
+                "until_iso": "2026-11-02T00:00:00",
+                "warehouse_id": "V2FyZWhvdXNlOjExNzY2MQ==",
+                "max_pages": 100,
+            }
+        ]
+        * 3
+    )
+    assert events == [
+        ("clear", "prior-handler"),
+        ("sleep", 30),
+        ("clear", "prior-handler"),
+        ("sleep", 30),
+        ("clear", "prior-handler"),
+    ]
+
+
+def test_fetch_orders_resilient_credit_retries_stop_without_partial_result(monkeypatch):
+    monkeypatch.setattr(dsv, "_DAY_FETCH_MAX_CREDIT_RETRIES", 2, raising=False)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "prior-handler")
+    cleared = []
+    waits = []
+    monkeypatch.setattr(dsv, "_clear_watchdog", cleared.append)
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    calls = []
+
+    class ExhaustedClient:
+        def fetch_orders_window(self, **kwargs):
+            calls.append(kwargs)
+            raise RuntimeError(_OBSERVED_CREDIT_SHORTAGE)
+
+    with pytest.raises(RuntimeError, match="credit pool unavailable after 2 retries on 2026-11-01"):
+        dsv._fetch_orders_resilient(ExhaustedClient(), "2026-11-01", "since", "until", 100)
+
+    assert len(calls) == 3
+    assert waits == [30, 30]
+    assert cleared == ["prior-handler"] * 3
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ShipHero GraphQL errors: [{'message': 'bad field', 'code': 1}]",
+        "ShipHero GraphQL errors: [{'message': 'permission denied', 'code': 5}]",
+        "ShipHero GraphQL errors: [{'message': 'operation requires too many credits', 'code': 30}]",
+    ],
+)
+def test_fetch_orders_resilient_does_not_retry_permanent_graphql_errors(monkeypatch, message):
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "prior-handler")
+    cleared = []
+    waits = []
+    monkeypatch.setattr(dsv, "_clear_watchdog", cleared.append)
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+
+    class InvalidQueryClient:
+        def fetch_orders_window(self, **kwargs):
+            raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError) as caught:
+        dsv._fetch_orders_resilient(InvalidQueryClient(), "2026-11-01", "since", "until", 100)
+
+    assert str(caught.value) == message
+    assert waits == []
+    assert cleared == ["prior-handler"]
+
+
+def test_fetch_orders_resilient_network_backoff_is_separate_from_credit_backoff(monkeypatch):
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: None)
+    monkeypatch.setattr(dsv, "_clear_watchdog", lambda _p: None)
+    waits = []
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    failures = [
+        "ShipHero network error after 6 retries: Max retries exceeded",
+        _OBSERVED_CREDIT_SHORTAGE,
+        "ShipHero network error after 6 retries: Max retries exceeded",
+    ]
+
+    class MixedFailureClient:
+        def fetch_orders_window(self, **kwargs):
+            if failures:
+                raise RuntimeError(failures.pop(0))
+            return [{"order_number": "complete"}]
+
+    assert dsv._fetch_orders_resilient(
+        MixedFailureClient(), "2026-11-01", "since", "until", 100
+    ) == [{"order_number": "complete"}]
+    assert waits == [30, 30, 60]
 
 
 def test_fetch_timeout_is_retryable() -> None:
