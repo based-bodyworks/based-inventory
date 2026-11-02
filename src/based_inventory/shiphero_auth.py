@@ -19,36 +19,76 @@ this token type.
 from __future__ import annotations
 
 import logging
+import time
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 _REFRESH_URL = "https://public-api.shiphero.com/auth/refresh"
+_REFRESH_RETRY_DELAYS = (5, 15, 30)
 
 
 def refresh_access_token(refresh_token: str, timeout: int = 15) -> str:
     """Exchange a ShipHero refresh token for a fresh access token.
 
-    Returns the new access_token. Raises RuntimeError on any failure
-    (HTTP error, missing access_token in response, network issue) so the
-    calling cron job fails loudly rather than silently using stale data.
+    Temporary network/provider failures get four attempts over at most
+    50 seconds of backoff. A non-JSON 403 can come from an upstream proxy;
+    a JSON 403 is an authentication rejection and fails immediately.
+    Errors never include provider response bodies or transport details.
     """
-    response = requests.post(
-        _REFRESH_URL,
-        json={"refresh_token": refresh_token},
-        headers={"Content-Type": "application/json"},
-        timeout=timeout,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"ShipHero token refresh failed: HTTP {response.status_code} " f"{response.text[:200]}"
+    attempts = len(_REFRESH_RETRY_DELAYS) + 1
+    for attempt in range(attempts):
+        try:
+            response = requests.post(
+                _REFRESH_URL,
+                json={"refresh_token": refresh_token},
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+        except (requests.ConnectionError, requests.Timeout):
+            reason = "network failure"
+            retryable = True
+        else:
+            try:
+                payload = response.json()
+                is_json = True
+            except ValueError:
+                payload = None
+                is_json = False
+
+            status = response.status_code
+            if status == 200 and is_json:
+                token = payload.get("access_token") if isinstance(payload, dict) else None
+                if not isinstance(token, str) or not token.strip():
+                    raise RuntimeError("ShipHero refresh response missing or invalid access_token")
+                return token
+
+            reason = f"HTTP {status}" + (" (non-JSON response)" if not is_json else "")
+            retryable = (
+                status in (408, 429)
+                or 500 <= status <= 599
+                or (status in (200, 403) and not is_json)
+            )
+
+        if not retryable:
+            raise RuntimeError(f"ShipHero token refresh failed: {reason}") from None
+        if attempt == attempts - 1:
+            raise RuntimeError(
+                f"ShipHero token refresh failed: {reason} after {attempts} attempts"
+            ) from None
+
+        delay = _REFRESH_RETRY_DELAYS[attempt]
+        logger.warning(
+            "ShipHero token refresh temporary failure: %s; retrying in %ds (attempt %d/%d)",
+            reason,
+            delay,
+            attempt + 1,
+            attempts,
         )
-    payload = response.json()
-    new_token = payload.get("access_token")
-    if not new_token:
-        raise RuntimeError(f"ShipHero refresh response missing access_token: {payload}")
-    return new_token
+        time.sleep(delay)
+
+    raise RuntimeError("ShipHero token refresh attempts exhausted")
 
 
 def resolve_access_token(
