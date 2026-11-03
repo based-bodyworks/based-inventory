@@ -397,3 +397,113 @@ def test_build_blocks_does_not_repeat_backorder_label_when_primary() -> None:
     text = blocks[2]["text"]["text"]
     # Should only appear once (in the header line), not duplicated as a secondary line.
     assert text.count("BACKORDER MASSIVE") == 1
+
+
+def test_build_blocks_uses_utc_for_posted_time(monkeypatch) -> None:
+    from based_inventory.jobs import quantity_alerts as job
+
+    monkeypatch.setattr(job.time, "time", lambda: 1793628000.0)  # Nov 2, 14:00 UTC
+    footer = build_blocks([_alert()])[-1]["elements"][0]["text"]
+    assert "Posted: 2026-11-02 14:00:00 UTC" in footer
+    assert "PST" not in footer
+
+
+def _run_with_stock_clock(monkeypatch, tmp_path, available):
+    import json
+    from types import SimpleNamespace
+
+    from based_inventory.jobs import quantity_alerts as job
+    from based_inventory.shiphero import KitDefinition, WarehouseStock
+    from based_inventory.state import AlertState
+
+    clock = [1793628000.0]  # Nov 2, 14:00 UTC
+    monkeypatch.setattr(job.time, "time", lambda: clock[0])
+    posted = []
+    stock = WarehouseStock(
+        sku="single",
+        on_hand=available,
+        available=available,
+        allocated=0,
+        backorder=0,
+        reserve_inventory=0,
+        sell_ahead=0,
+        product_name="Single",
+        is_kit=False,
+    )
+
+    class InventorySource:
+        def fetch_warehouse_stock(self, **kwargs):
+            clock[0] += 300
+            return []
+
+        def fetch_all_kits(self):
+            clock[0] += 60
+            return [KitDefinition("kit", "Kit", (("single", 1),), False)]
+
+        def fetch_warehouse_product_for_sku(self, sku, warehouse_id):
+            assert sku == "single"
+            clock[0] += 60
+            return stock
+
+        def fetch_sku_depletion(self, **kwargs):
+            clock[0] = 1793631600.0  # 15:00 UTC, well after the stock read
+            return 14, 7.0
+
+        def fetch_inbound_outstanding_by_sku(self, **kwargs):
+            return {}
+
+        def fetch_fba_inventory(self, sku):
+            return []
+
+        def fetch_channel_mix(self, **kwargs):
+            return {}
+
+    class ReportDestination:
+        def post_message(self, fallback, blocks):
+            posted.append(blocks)
+            return True
+
+    monkeypatch.setattr(job, "resolve_access_token", lambda **kwargs: "test-token")
+    monkeypatch.setattr(job, "ShipHeroClient", lambda **kwargs: InventorySource())
+    monkeypatch.setattr(job, "SlackClient", lambda *args, **kwargs: ReportDestination())
+    components = tmp_path / "components.json"
+    components.write_text(json.dumps({"sets": {}}))
+    monkeypatch.setattr(job, "COMPONENTS_PATH", components)
+    state_path = tmp_path / "state.json"
+    AlertState().save(state_path)
+    cfg = SimpleNamespace(
+        shiphero_refresh_token=None,
+        shiphero_access_token="test-token",
+        shiphero_api_url="https://example.invalid/graphql",
+        state_path=str(state_path),
+        slack_bot_token="test-slack-token",
+        slack_channel="test-channel",
+        dry_run=True,
+    )
+    job._run(cfg)
+    return posted
+
+
+def test_quantity_alert_preserves_stock_read_window_after_enrichment(monkeypatch, tmp_path, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="based_inventory.jobs.quantity_alerts"):
+        posted = _run_with_stock_clock(monkeypatch, tmp_path, available=50)
+
+    assert len(posted) == 1
+    footer = posted[0][-1]["elements"][0]["text"]
+    assert "Stock read: 2026-11-02 14:00:00 UTC to 2026-11-02 14:07:00 UTC" in footer
+    assert "Posted: 2026-11-02 15:00:00 UTC" in footer
+    assert "Quantity stock read started: 2026-11-02 14:00:00 UTC" in caplog.text
+    assert "Quantity scan complete: 1 candidate SKUs; 1 threshold alerts" in caplog.text
+
+
+def test_quantity_scan_logs_freshness_without_threshold_alerts(monkeypatch, tmp_path, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="based_inventory.jobs.quantity_alerts"):
+        posted = _run_with_stock_clock(monkeypatch, tmp_path, available=5000)
+
+    assert posted == []
+    assert "Quantity scan complete: 1 candidate SKUs; 0 threshold alerts" in caplog.text
+    assert "stock read 2026-11-02 14:00:00 UTC to 2026-11-02 14:07:00 UTC" in caplog.text

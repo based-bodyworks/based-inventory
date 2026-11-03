@@ -32,45 +32,71 @@ SLACK_CHANNEL_ID="${SLACK_CHANNEL:-C0AK6UGA1NJ}"
 # by committing this toolchain to git so a stash/clean can't delete it.
 notify_failure() {
   local code=$?
+  trap - EXIT
   [ "$code" -eq 0 ] && return 0
-  local tok
-  tok="$(grep -E '^SLACK_BOT_TOKEN=' "$ROOT/.env" 2>/dev/null | cut -d= -f2-)"
-  [ -n "$tok" ] && curl -fsS -X POST https://slack.com/api/chat.postMessage \
-    -H "Authorization: Bearer $tok" \
-    -H 'Content-type: application/json; charset=utf-8' \
-    --data "$(printf '{"channel":"%s","text":":warning: Daily velocity job FAILED for %s (exit %s). Log: %s"}' "$SLACK_CHANNEL_ID" "$DAY" "$code" "$LOG")" \
-    >/dev/null 2>&1 || true
-}
-trap notify_failure EXIT
-
-echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') :: pulling $DAY (UTC day) ===" >> "$LOG"
-
-"$PYBIN" "$SCRIPT" \
-  --start-date "$DAY" --end-date "$DAY" \
-  --out-dir "$OUTDIR" --fresh >> "$LOG" 2>&1
-
-# Rename the window-slug outputs to the friendly daily name; drop the checkpoint.
-SLUG="daily-sales-velocity_${DAY}_${DAY}"
-for ext in xlsx csv bundles.csv README.txt; do
-  if [ -f "$OUTDIR/$SLUG.$ext" ]; then
-    mv -f "$OUTDIR/$SLUG.$ext" "$OUTDIR/daily-velocity_${DAY}.$ext"
+  echo "FAILED: daily velocity for $DAY (exit $code). Log: $LOG"
+  # Render injects credentials into the environment; .env is only a local
+  # fallback. A missing file or failed alert must never replace the real exit.
+  local tok="${SLACK_BOT_TOKEN:-}"
+  if [ -z "$tok" ] && [ -f "$ROOT/.env" ]; then
+    tok="$(grep -E '^SLACK_BOT_TOKEN=' "$ROOT/.env" 2>/dev/null | cut -d= -f2- || true)"
   fi
-done
-rm -f "$OUTDIR/$SLUG.checkpoint.json"
+  if [ -z "$tok" ]; then
+    echo "Slack: failure alert skipped (SLACK_BOT_TOKEN is not configured)"
+  else
+    local response
+    if ! response="$(curl -fsS --connect-timeout 5 --max-time 15 \
+      -X POST https://slack.com/api/chat.postMessage \
+      -H "Authorization: Bearer $tok" \
+      --data-urlencode "channel=$SLACK_CHANNEL_ID" \
+      --data-urlencode "text=:warning: Daily velocity job FAILED for $DAY (exit $code). Log: $LOG")"; then
+      echo "Slack: failure alert request failed"
+    elif ! "$PYBIN" -c 'import json, sys; sys.exit(0 if json.load(sys.stdin).get("ok") is True else 1)' <<< "$response"; then
+      echo "Slack: failure alert rejected or returned an invalid response"
+    fi
+  fi
+  exit "$code"
+}
 
-if [ -f "$OUTDIR/daily-velocity_${DAY}.xlsx" ]; then
-  echo "OK -> $OUTDIR/daily-velocity_${DAY}.xlsx" >> "$LOG"
-else
-  echo "FAILED: no xlsx produced for $DAY" >> "$LOG"
-  exit 1
-fi
+# A foreground pipeline waits for tee to drain before Render ends the
+# container. Capture the workload's status rather than replacing it with the
+# logger's. The workload keeps errexit enabled inside its own subshell.
+set +e
+(
+  set -e
+  trap notify_failure EXIT
+  export PYTHONUNBUFFERED=1
 
-# Post the workbook + a summary to Slack. A Slack failure does NOT fail the run
-# (the file is already on disk); it's just logged.
-if "$PYBIN" "$ROOT/scripts/post_velocity_to_slack.py" \
-     --xlsx "$OUTDIR/daily-velocity_${DAY}.xlsx" \
-     --day "$DAY" --channel "$SLACK_CHANNEL_ID" >> "$LOG" 2>&1; then
-  echo "Slack: posted to $SLACK_CHANNEL_ID" >> "$LOG"
-else
-  echo "Slack: post FAILED (file still saved locally)" >> "$LOG"
-fi
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') :: pulling $DAY (UTC day) ==="
+
+  "$PYBIN" "$SCRIPT" \
+    --start-date "$DAY" --end-date "$DAY" \
+    --out-dir "$OUTDIR" --fresh
+
+  # Rename the window-slug outputs to the friendly daily name; drop the checkpoint.
+  SLUG="daily-sales-velocity_${DAY}_${DAY}"
+  for ext in xlsx csv bundles.csv README.txt; do
+    if [ -f "$OUTDIR/$SLUG.$ext" ]; then
+      mv -f "$OUTDIR/$SLUG.$ext" "$OUTDIR/daily-velocity_${DAY}.$ext"
+    fi
+  done
+  rm -f "$OUTDIR/$SLUG.checkpoint.json"
+
+  if [ -f "$OUTDIR/daily-velocity_${DAY}.xlsx" ]; then
+    echo "OK -> $OUTDIR/daily-velocity_${DAY}.xlsx"
+  else
+    echo "FAILED: no xlsx produced for $DAY"
+    exit 1
+  fi
+
+  # A workbook-post failure stays nonfatal because the report is already saved.
+  if "$PYBIN" "$ROOT/scripts/post_velocity_to_slack.py" \
+       --xlsx "$OUTDIR/daily-velocity_${DAY}.xlsx" \
+       --day "$DAY" --channel "$SLACK_CHANNEL_ID"; then
+    echo "Slack: posted to $SLACK_CHANNEL_ID"
+  else
+    echo "Slack: post FAILED (file still saved locally)"
+  fi
+) 2>&1 | tee -a "$LOG"
+run_status=${PIPESTATUS[0]}
+exit "$run_status"
