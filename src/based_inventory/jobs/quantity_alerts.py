@@ -56,6 +56,7 @@ first run after deploy re-evaluates all SKUs fresh.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,8 @@ from based_inventory.shiphero import MERCHDROP_WAREHOUSE_ID, ShipHeroClient
 from based_inventory.shiphero_auth import resolve_access_token
 from based_inventory.slack import SlackClient, context, divider, header, section
 from based_inventory.state import AlertState
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parents[3] / "data"
 COMPONENTS_PATH = DATA_DIR / "set-components.json"
@@ -332,7 +335,9 @@ def _format_channel_mix(counts: dict[str, int]) -> str | None:
 
 
 def build_blocks(
-    alerts: list[Alert], channel_mix_summary: str | None = None
+    alerts: list[Alert],
+    channel_mix_summary: str | None = None,
+    stock_read_window: tuple[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [
         header("⚡ Inventory Alert"),
@@ -393,8 +398,10 @@ def build_blocks(
         blocks.append(section("\n".join(text_lines)))
 
     blocks.append(divider())
-    ts = time.strftime("%b %d, %I:%M %p PST", time.gmtime(time.time() - 7 * 3600))
-    footer = f"🕐  {ts}  ·  source: ShipHero (Merchdrop)"
+    ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time()))
+    footer = f"🕐  Posted: {ts}  ·  source: ShipHero (Merchdrop)"
+    if stock_read_window:
+        footer += f"\nStock read: {stock_read_window[0]} to {stock_read_window[1]}"
     if channel_mix_summary:
         footer += f"  ·  last 7d channel mix: {channel_mix_summary}"
     blocks.append(context(footer))
@@ -441,6 +448,8 @@ def _run(cfg: Config) -> None:
     state = AlertState.load(cfg.state_path)
     slack = SlackClient(cfg.slack_bot_token, cfg.slack_channel, dry_run=cfg.dry_run)
 
+    stock_read_started = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time()))
+    logger.info("Quantity stock read started: %s", stock_read_started)
     stock = client.fetch_warehouse_stock(warehouse_id=MERCHDROP_WAREHOUSE_ID)
     kits = client.fetch_all_kits()
 
@@ -456,6 +465,13 @@ def _run(cfg: Config) -> None:
         except RuntimeError:
             continue
 
+    stock_read_finished = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time()))
+    logger.info(
+        "Quantity stock read completed: %s to %s; %d warehouse SKUs",
+        stock_read_started,
+        stock_read_finished,
+        len(stock),
+    )
     registry = build_registry(kits, stock, COMPONENTS_PATH)
 
     # Scope candidates to KIT COMPONENT SKUs only. ShipHero's catalog has
@@ -581,6 +597,13 @@ def _run(cfg: Config) -> None:
     state.backorder_tiers = new_backorder_tiers
     state.save(cfg.state_path)
 
+    logger.info(
+        "Quantity scan complete: %d candidate SKUs; %d threshold alerts; stock read %s to %s",
+        len(candidates),
+        len(alerts),
+        stock_read_started,
+        stock_read_finished,
+    )
     if not alerts:
         return
 
@@ -597,7 +620,11 @@ def _run(cfg: Config) -> None:
     except RuntimeError:
         channel_summary = None
 
-    blocks = build_blocks(alerts, channel_mix_summary=channel_summary)
+    blocks = build_blocks(
+        alerts,
+        channel_mix_summary=channel_summary,
+        stock_read_window=(stock_read_started, stock_read_finished),
+    )
     fallback = f"⚡ Inventory Alert: {len(alerts)} SKU(s) below threshold"
     slack.post_message(fallback, blocks)
 
