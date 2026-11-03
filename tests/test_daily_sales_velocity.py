@@ -8,11 +8,13 @@ ShipHeroClient.fetch_orders_window.
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date
 from pathlib import Path
 
 import pytest
+import requests
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -600,6 +602,117 @@ _OBSERVED_CREDIT_SHORTAGE = (
     "ShipHero GraphQL errors: [{'message': 'There are not enough credits to perform the operation', "
     "'required_credits': 1601, 'remaining_credits': 594, 'time_remaining': '17 seconds', 'code': 30}]"
 )
+
+
+def _graphql_response(payload):
+    response = requests.Response()
+    response.status_code = 200
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps(payload).encode()
+    return response
+
+
+def _credit_error(message="There are not enough credits to perform the operation"):
+    return _graphql_response(
+        {
+            "errors": [
+                {
+                    "message": message + ": private-provider-detail",
+                    "code": 30,
+                    "time_remaining": "17 seconds",
+                }
+            ]
+        }
+    )
+
+
+def _orders_response(orders, has_next_page=False):
+    return _graphql_response(
+        {
+            "data": {
+                "orders": {
+                    "data": {
+                        "edges": [{"node": order} for order in orders],
+                        "pageInfo": {"hasNextPage": has_next_page},
+                    }
+                }
+            }
+        }
+    )
+
+
+def test_real_client_credit_retry_restarts_complete_day(monkeypatch, caplog):
+    since, until = "2026-11-01T00:00:00", "2026-11-02T00:00:00"
+    first = {"order_number": "first", "order_date": "2026-11-01T09:00:00"}
+    last = {"order_number": "last", "order_date": "2026-11-01T23:00:00"}
+    responses = iter(
+        [_orders_response([first], True)]
+        + [_credit_error() for _ in range(7)]
+        + [_orders_response([first, last])]
+    )
+    windows, waits = [], []
+
+    def post(*_args, **kwargs):
+        windows.append(kwargs["json"]["variables"].copy())
+        return next(responses)
+
+    monkeypatch.setattr("based_inventory.shiphero.requests.post", post)
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _: None)
+    result = dsv._fetch_orders_resilient(
+        ShipHeroClient(token="private-token"), "2026-11-01", since, until, 100
+    )
+
+    assert result == [first, last]
+    assert len(windows) == 9
+    assert windows[0] == windows[-1]
+    assert all(window["since"] == first["order_date"] for window in windows[1:-1])
+    assert all(window["until"] == until for window in windows)
+    assert waits == [0.2] + [18] * 6 + [30]
+    assert "private-provider-detail" not in caplog.text
+    assert "private-token" not in caplog.text
+
+
+def test_real_client_credit_retry_is_bounded_and_sanitized(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "based_inventory.shiphero.requests.post", lambda *_a, **_kw: _credit_error()
+    )
+    waits = []
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _: None)
+    monkeypatch.setattr(dsv, "_DAY_FETCH_MAX_CREDIT_RETRIES", 1)
+
+    with pytest.raises(RuntimeError, match="credit pool unavailable after 1 retries") as caught:
+        dsv._fetch_orders_resilient(
+            ShipHeroClient(token="private-token"), "2026-11-01", "since", "until", 100
+        )
+
+    assert waits == [18] * 6 + [30] + [18] * 6
+    assert str(caught.value.__cause__) == "ShipHero GraphQL not enough credits"
+    assert "private-provider-detail" not in str(caught.value) + caplog.text
+    assert "private-token" not in str(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "operation requires too many credits",
+        "operation requires too many credits; not enough credits",
+    ],
+)
+def test_real_client_oversized_query_does_not_get_refill_retries(monkeypatch, message):
+    monkeypatch.setattr(
+        "based_inventory.shiphero.requests.post", lambda *_a, **_kw: _credit_error(message)
+    )
+    waits = []
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="^ShipHero GraphQL credits limit$"):
+        dsv._fetch_orders_resilient(
+            ShipHeroClient(token="private-token"), "2026-11-01", "since", "until", 100
+        )
+    assert waits == [18] * 6
 
 
 def test_fetch_orders_resilient_recovers_credit_shortages_without_changing_window(monkeypatch):
