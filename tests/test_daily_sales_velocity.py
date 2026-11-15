@@ -403,9 +403,11 @@ def test_build_about_lines_describes_complete_and_partial_utc_days() -> None:
 def test_build_about_lines_exposes_checked_order_count_only_when_known() -> None:
     known = "\n".join(_about_lines(source_order_count=203))
     unknown = "\n".join(_about_lines())
+    multi_day = "\n".join(_about_lines(n_days=2, source_order_count=406))
     assert "all order and line-item cursors exhausted" in known
     assert "matched ShipHero's count before and after the pull: 203" in known
     assert "Order coverage:" not in unknown
+    assert "Order coverage:" not in multi_day
 
 
 def test_build_about_lines_amazon_note_only_when_amazon_present() -> None:
@@ -582,6 +584,10 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     # XLSX: BUNDLE SALES tab present with the as-sold row.
     wb = load_workbook(tmp_path / f"{slug}.xlsx")
     assert "BUNDLE SALES" in wb.sheetnames
+    assert any(
+        "matched ShipHero's count before and after the pull: 2" in str(row[0].value)
+        for row in wb["ABOUT"].iter_rows(min_col=1, max_col=1)
+    )
     ws = wb["BUNDLE SALES"]
     data = [[c.value for c in row] for row in ws.iter_rows(min_row=2)]
     assert ["2026-03-01", "Curly Kit", "TIKTOK", 2, "KIT1"] in data

@@ -513,7 +513,9 @@ def build_about_lines(
             else "The most recent UTC day may be partial."
         ),
     ]
-    if source_order_count is not None:
+    # A multi-day sum could count a midnight boundary order twice if the API's
+    # upper date bound is inclusive. Only a single-day report gets this control.
+    if source_order_count is not None and n_days == 1:
         lines.append(
             "Order coverage: all order and line-item cursors exhausted; unique order IDs "
             f"matched ShipHero's count before and after the pull: {source_order_count}."
@@ -964,11 +966,10 @@ def run(args: argparse.Namespace) -> int:
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),  # noqa: UP017 - Render uses Python 3.10
         end_day_complete=end_date < _utc_today() and not partial_days,
         source_order_count=(
-            sum(source_order_counts[day] for day in day_strs)
-            if all(
-                type(source_order_counts.get(day)) is int and source_order_counts[day] >= 0
-                for day in day_strs
-            )
+            source_order_counts[day_strs[0]]
+            if len(day_strs) == 1
+            and type(source_order_counts.get(day_strs[0])) is int
+            and source_order_counts[day_strs[0]] >= 0
             else None
         ),
     )
