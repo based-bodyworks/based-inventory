@@ -648,11 +648,13 @@ def test_partial_utc_day_is_refetched_after_midnight(tmp_path, monkeypatch) -> N
 
     assert dsv.run(args) == 0
     assert client.calls == 2
+    assert "Order coverage at extraction:" in readme_path.read_text()
     assert json.loads(ckpt_path.read_text())["schema"] == 5
     assert "All UTC days in this window are complete." in readme_path.read_text()
 
     assert dsv.run(args) == 0
     assert client.calls == 2
+    assert "Order coverage at extraction:" not in readme_path.read_text()
 
 
 # --- never repeat a completed day's pages after a failed request ------------

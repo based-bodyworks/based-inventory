@@ -517,7 +517,8 @@ def build_about_lines(
     # upper date bound is inclusive. Only a single-day report gets this control.
     if source_order_count is not None and n_days == 1:
         lines.append(
-            "Order coverage: all order and line-item cursors exhausted; unique order IDs "
+            "Order coverage at extraction: all order and line-item cursors exhausted; "
+            "unique IDs in the raw Merchdrop order query (including excluded shops) "
             f"matched ShipHero's count before and after the pull: {source_order_count}."
         )
     lines += [
@@ -968,6 +969,7 @@ def run(args: argparse.Namespace) -> int:
         source_order_count=(
             source_order_counts[day_strs[0]]
             if len(day_strs) == 1
+            and day_strs[0] in todo
             and type(source_order_counts.get(day_strs[0])) is int
             and source_order_counts[day_strs[0]] >= 0
             else None
