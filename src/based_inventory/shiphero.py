@@ -16,14 +16,18 @@ Capability quirks captured in `~/Obsidian/Based/wiki/concepts/shiphero-api.md`:
 
 from __future__ import annotations
 
+import logging
+import math
 import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import requests
+
+_log = logging.getLogger(__name__)
 
 
 def _midpoint_iso(from_iso: str, to_iso: str) -> str | None:
@@ -50,6 +54,30 @@ MERCHDROP_WAREHOUSE_ID = "V2FyZWhvdXNlOjExNzY2MQ=="
 # response omits the live quota.
 _DEFAULT_CREDIT_REFILL_RATE = 60.0
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _quota_number(value: Any) -> float | None:
+    """Read a non-negative number from ShipHero without trusting raw error text."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _credit_wait_hint(value: Any) -> float | None:
+    """Parse ShipHero's `17 seconds` refill hint, including minute units."""
+    if not isinstance(value, str | int | float):
+        return None
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(seconds?|minutes?)?\s*", str(value), re.I)
+    if not match:
+        return None
+    seconds = _quota_number(match.group(1))
+    if seconds is None:
+        return None
+    return seconds * (60 if (match.group(2) or "").lower().startswith("minute") else 1)
 
 
 def _response_type(response: requests.Response) -> str:
@@ -147,21 +175,19 @@ class ShipHeroClient:
             status = r.status_code
             response_type = _response_type(r)
             if not 200 <= status < 300:
+                if status == 429 and response_type != "non-json" and r.content:
+                    try:
+                        throttle_payload = r.json()
+                    except ValueError:
+                        throttle_payload = None
+                    if isinstance(throttle_payload, dict):
+                        errors = throttle_payload.get("errors")
+                        first = errors[0] if isinstance(errors, list) and errors else None
+                        if isinstance(first, dict) and first.get("code") == 30:
+                            self._handle_credit_error(first, throttle_payload, attempt, retries)
+                            continue
                 if status in _RETRYABLE_HTTP_STATUSES and attempt < retries:
-                    wait = min(2**attempt * 2, 30)
-                    if status == 429 and response_type != "non-json" and r.content:
-                        try:
-                            throttle_payload = r.json()
-                        except ValueError:
-                            throttle_payload = None
-                        if isinstance(throttle_payload, dict):
-                            errors = throttle_payload.get("errors")
-                            first = errors[0] if isinstance(errors, list) and errors else None
-                            if isinstance(first, dict) and first.get("code") == 30:
-                                raw = str(first.get("time_remaining") or "60")[:32]
-                                digits = "".join(c for c in raw if c.isdigit()) or "60"
-                                wait = min(int(digits) + 1, 90)
-                    time.sleep(wait)
+                    time.sleep(min(2**attempt * 2, 30))
                     continue
                 raise RuntimeError(
                     f"ShipHero HTTP {status} ({response_type} response) after {attempt} retries"
@@ -195,10 +221,8 @@ class ShipHeroClient:
                 err = errors[0] if isinstance(errors, list) and errors else {}
                 if not isinstance(err, dict):
                     err = {}
-                if err.get("code") == 30 and attempt < retries:
-                    raw = str(err.get("time_remaining") or "60")[:32]
-                    digits = "".join(c for c in raw if c.isdigit()) or "60"
-                    time.sleep(min(int(digits) + 1, 90))
+                if err.get("code") == 30:
+                    self._handle_credit_error(err, payload, attempt, retries)
                     continue
                 # Preserve the callers' distinct refill and window-splitting
                 # signals without echoing any provider error details.
@@ -221,6 +245,47 @@ class ShipHeroClient:
             self._pace_from_quota(payload)
             return payload
         raise RuntimeError("ShipHero retries exhausted")
+
+    def _handle_credit_error(
+        self, error: dict[str, Any], payload: dict[str, Any], attempt: int, retries: int
+    ) -> None:
+        """Wait for a refill on this request, or fail fast if it cannot fit."""
+        quota = ((payload.get("extensions") or {}).get("throttling") or {}).get("user_quota") or {}
+        required = _quota_number(error.get("required_credits"))
+        remaining = _quota_number(error.get("remaining_credits"))
+        maximum = _quota_number(quota.get("max_available"))
+        if maximum is None:
+            maximum = _quota_number(error.get("max_available"))
+        message = error.get("message")
+        message_says_oversized = (
+            isinstance(message, str) and "requires too many credits" in message[:512].lower()
+        )
+        exceeds_quota = required is not None and maximum is not None and required > maximum
+        if message_says_oversized or exceeds_quota:
+            _log.warning(
+                "ShipHero query exceeds credit cap: required=%s max=%s",
+                f"{required:g}" if required is not None else "unknown",
+                f"{maximum:g}" if maximum is not None else "unknown",
+            )
+            raise RuntimeError("ShipHero GraphQL credits limit")
+        if attempt >= retries:
+            raise RuntimeError("ShipHero GraphQL not enough credits")
+
+        hint = _credit_wait_hint(error.get("time_remaining"))
+        if hint is None and required is not None and remaining is not None:
+            rate = _quota_number(quota.get("increment_rate")) or _DEFAULT_CREDIT_REFILL_RATE
+            hint = max(required - remaining, 0) / rate
+        wait = min(math.ceil(hint if hint is not None else 60) + 1, 90)
+        _log.warning(
+            "ShipHero credit refill: required=%s remaining=%s max=%s wait=%ss attempt=%d/%d",
+            f"{required:g}" if required is not None else "unknown",
+            f"{remaining:g}" if remaining is not None else "unknown",
+            f"{maximum:g}" if maximum is not None else "unknown",
+            wait,
+            attempt + 1,
+            retries,
+        )
+        time.sleep(wait)
 
     def _pace_from_quota(self, payload: dict[str, Any]) -> None:
         """Proactively wait so the credit pool stays above min_credits_floor.
@@ -631,7 +696,7 @@ class ShipHeroClient:
             )
         except ValueError:
             req_start = None
-        now_dt = datetime.utcnow()
+        now_dt = datetime.now(UTC).replace(tzinfo=None)
         requested_window_days = (
             max((now_dt - req_start).total_seconds() / 86400.0, 0.0) if req_start else 7.0
         )
@@ -688,7 +753,7 @@ class ShipHeroClient:
 
         from datetime import datetime as _dt
 
-        now_iso = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        now_iso = _dt.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         counts: dict[str, int] = {}
         seen_orders: set[str] = set()
         call_budget = [32]
@@ -739,79 +804,15 @@ class ShipHeroClient:
     ) -> list[dict[str, Any]]:
         """Fetch all orders for a single calendar day with line_items.
 
-        Returns a list of order nodes, each with a `line_items.edges` list.
-        Pagination via `order_date_from` advance + dedupe by order_number.
-
-        day_iso_date format: 'YYYY-MM-DD'. The day window is
-        [day 00:00:00, day+1 00:00:00).
-
-        Note: each `line_items` connection nested in an orders query
-        multiplies query complexity. Per-day scoping keeps the per-call
-        cost under the 4004 credit cap.
+        Uses the same complete cursor pagination as fetch_orders_window.
+        The day window is [day 00:00:00, day+1 00:00:00) in UTC.
         """
-        from datetime import datetime, timedelta
-
         d = datetime.strptime(day_iso_date, "%Y-%m-%d")
         day_start = d.strftime("%Y-%m-%dT00:00:00")
         day_end = (d + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
-
-        query = """
-        query($since: ISODateTime!, $until: ISODateTime!, $warehouse_id: String!) {
-          orders(
-            order_date_from: $since
-            order_date_to: $until
-            warehouse_id: $warehouse_id
-          ) {
-            data {
-              edges {
-                node {
-                  order_number
-                  shop_name
-                  order_date
-                  line_items {
-                    edges { node { sku quantity } }
-                  }
-                }
-              }
-              pageInfo { hasNextPage }
-            }
-          }
-        }
-        """
-        all_orders: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        cur_since = day_start
-        for _ in range(max_pages):
-            payload = self._execute(
-                query,
-                {"since": cur_since, "until": day_end, "warehouse_id": warehouse_id},
-            )
-            edges = payload["data"]["orders"]["data"]["edges"]
-            if not edges:
-                break
-            page_max_date = cur_since
-            new = 0
-            for edge in edges:
-                n = edge["node"]
-                key = n.get("order_number") or ""
-                if key and key in seen:
-                    continue
-                if key:
-                    seen.add(key)
-                new += 1
-                od = n.get("order_date") or page_max_date
-                if od > page_max_date:
-                    page_max_date = od
-                all_orders.append(n)
-            if new == 0:
-                break
-            if not payload["data"]["orders"]["data"]["pageInfo"]["hasNextPage"]:
-                break
-            if page_max_date == cur_since:
-                break
-            cur_since = page_max_date
-            time.sleep(0.2)
-        return all_orders
+        return self.fetch_orders_window(
+            day_start, warehouse_id=warehouse_id, max_pages=max_pages, until_iso=day_end
+        )
 
     def fetch_inbound_outstanding_by_sku(
         self,
@@ -935,7 +936,7 @@ class ShipHeroClient:
 
         from datetime import datetime as _dt
 
-        now_iso = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        now_iso = _dt.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         visit(po_date_from_iso, now_iso)
         return out
 
@@ -967,27 +968,26 @@ class ShipHeroClient:
         payload = self._execute(query, {"since": po_date_from_iso})
         return [e["node"] for e in payload["data"]["purchase_orders"]["data"]["edges"]]
 
+    _ORDERS_PAGE_SIZE = 25
     _ORDERS_LINE_ITEMS_CAP = 15
+    _ORDERS_LINE_ITEMS_MAX_PAGES = 20
 
     def fetch_orders_window(
         self,
         since_iso: str,
         warehouse_id: str = MERCHDROP_WAREHOUSE_ID,
-        max_pages: int = 80,
+        max_pages: int = 500,
         until_iso: str | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch orders whose order_date is in [since_iso, until_iso], with line_items.
 
-        Pagination is on the ORDERS side, by advancing order_date_from to the
-        latest order_date seen (ShipHero's data connection has no cursor),
-        deduped by order_number. The nested line_items connection is capped via
-        first:N to stay under the per-operation credit cap (see
-        _ORDERS_LINE_ITEMS_CAP); time-bisection does NOT help here because the
-        cost is fixed by query structure, not by the window.
+        Orders are paginated with ShipHero's cursor, since order_date is not
+        necessarily sorted within a page. Both connection page sizes are
+        explicit to keep estimated GraphQL credit cost below the account cap.
 
         High-volume caveat: a wide window (e.g. 48h) at Based's order rate spans
-        many 100-order pages, so this issues many sequential calls and can burn
-        a meaningful slice of the credit pool per run.
+        many pages, so this issues sequential calls and can burn a meaningful
+        slice of the credit pool per run.
 
         since_iso format: 'YYYY-MM-DDTHH:MM:SS' (UTC). When until_iso is None the
         upper bound defaults to now (UTC); pass an explicit until_iso to bound a
@@ -996,18 +996,22 @@ class ShipHeroClient:
         """
         from datetime import datetime as _dt
 
-        now_iso = until_iso or _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        now_iso = until_iso or _dt.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         query = (
             """
-        query($since: ISODateTime!, $until: ISODateTime!, $warehouse_id: String!) {
+        query($since: ISODateTime!, $until: ISODateTime!, $warehouse_id: String!, $after: String) {
           orders(
             order_date_from: $since
             order_date_to: $until
             warehouse_id: $warehouse_id
           ) {
-            data {
+            data(first: """
+            + str(self._ORDERS_PAGE_SIZE)
+            + """, after: $after) {
+              total_count
               edges {
                 node {
+                  id
                   order_number
                   order_date
                   shop_name
@@ -1015,10 +1019,11 @@ class ShipHeroClient:
             + str(self._ORDERS_LINE_ITEMS_CAP)
             + """) {
                     edges { node { sku quantity } }
+                    pageInfo { hasNextPage endCursor }
                   }
                 }
               }
-              pageInfo { hasNextPage }
+              pageInfo { hasNextPage endCursor }
             }
           }
         }
@@ -1027,37 +1032,109 @@ class ShipHeroClient:
 
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        cur_since = since_iso
+        cursor: str | None = None
+        expected_count: int | None = None
         for _ in range(max_pages):
             payload = self._execute(
-                query, {"since": cur_since, "until": now_iso, "warehouse_id": warehouse_id}
+                query,
+                {
+                    "since": since_iso,
+                    "until": now_iso,
+                    "warehouse_id": warehouse_id,
+                    "after": cursor,
+                },
             )
-            edges = payload["data"]["orders"]["data"]["edges"]
+            connection = payload["data"]["orders"]["data"]
+            edges = connection["edges"]
+            page_info = connection["pageInfo"]
+            reported_count = connection.get("total_count")
+            if type(reported_count) is not int or reported_count < 0:
+                raise RuntimeError("ShipHero orders invalid total_count")
+            if expected_count is None:
+                expected_count = reported_count
+            elif reported_count != expected_count:
+                raise RuntimeError("ShipHero orders total_count changed during pagination")
             if not edges:
+                if page_info["hasNextPage"]:
+                    raise RuntimeError(
+                        "ShipHero orders pagination returned empty page with more data"
+                    )
                 break
-            page_max_date = cur_since
-            new = 0
             for e in edges:
                 n = e["node"]
-                num = n.get("order_number") or ""
-                if num and num in seen:
-                    continue
-                if num:
-                    seen.add(num)
-                new += 1
-                od = n.get("order_date") or page_max_date
-                if od > page_max_date:
-                    page_max_date = od
+                order_id = n.get("id")
+                if not isinstance(order_id, str) or not order_id:
+                    raise RuntimeError("ShipHero orders pagination order id missing")
+                if order_id in seen:
+                    raise RuntimeError("ShipHero orders pagination repeated order id")
+                seen.add(order_id)
+                self._finish_order_lines(n)
                 out.append(n)
-            if new == 0:
+            if not page_info["hasNextPage"]:
                 break
-            if not payload["data"]["orders"]["data"]["pageInfo"]["hasNextPage"]:
-                break
-            if page_max_date == cur_since:
-                break
-            cur_since = page_max_date
+            next_cursor = page_info.get("endCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise RuntimeError("ShipHero orders pagination cursor missing")
+            if next_cursor == cursor:
+                raise RuntimeError("ShipHero orders pagination cursor did not advance")
+            cursor = next_cursor
             time.sleep(0.2)
+        else:
+            raise RuntimeError(f"ShipHero orders pagination exceeded {max_pages} pages")
+        if len(out) != expected_count:
+            raise RuntimeError(
+                f"ShipHero orders total_count mismatch: fetched {len(out)}, expected {expected_count}"
+            )
         return out
+
+    def _finish_order_lines(self, order: dict[str, Any]) -> None:
+        """Append line-item pages for an order whose first page is truncated."""
+        lines = order["line_items"]
+        page_info = lines["pageInfo"]
+        if not page_info["hasNextPage"]:
+            return
+        query = (
+            """
+        query($order_id: String!, $line_after: String) {
+          order(id: $order_id) {
+            data {
+              id
+              line_items(first: """
+            + str(self._ORDERS_LINE_ITEMS_CAP)
+            + """, after: $line_after) {
+                edges { node { sku quantity } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+        """
+        )
+        cursor = page_info.get("endCursor")
+        for _ in range(self._ORDERS_LINE_ITEMS_MAX_PAGES - 1):
+            if not isinstance(cursor, str) or not cursor:
+                raise RuntimeError(f"ShipHero line items cursor missing for order {order['id']}")
+            payload = self._execute(query, {"order_id": order["id"], "line_after": cursor})
+            order_data = payload["data"]["order"]["data"]
+            if order_data["id"] != order["id"]:
+                raise RuntimeError(f"ShipHero line items order id changed for order {order['id']}")
+            lines_page = order_data["line_items"]
+            if not lines_page["edges"]:
+                raise RuntimeError(f"ShipHero line items empty page for order {order['id']}")
+            lines["edges"].extend(lines_page["edges"])
+            page_info = lines_page["pageInfo"]
+            if not page_info["hasNextPage"]:
+                return
+            next_cursor = page_info.get("endCursor")
+            if next_cursor == cursor:
+                raise RuntimeError(
+                    f"ShipHero line items cursor did not advance for order {order['id']}"
+                )
+            cursor = next_cursor
+        raise RuntimeError(
+            f"ShipHero line items exceeded {self._ORDERS_LINE_ITEMS_MAX_PAGES} pages "
+            f"for order {order['id']}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -119,6 +119,68 @@ def test_429_throttle_hint_remains_bounded(monkeypatch) -> None:
     assert waits == [3]
 
 
+def test_credit_refill_waits_and_retries_only_the_current_request(monkeypatch, caplog) -> None:
+    shortage = {
+        "errors": [
+            {
+                "message": "There are not enough credits: private-provider-detail",
+                "code": 30,
+                "required_credits": 1601,
+                "remaining_credits": 594,
+                "time_remaining": "17 seconds",
+            }
+        ],
+        "extensions": {"throttling": {"user_quota": {"max_available": 4004}}},
+    }
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(shortage)), _response(200, '{"data":{"ok":true}}')],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=1)["data"] == {"ok": True}
+    assert len(calls) == 2
+    assert waits == [18]
+    assert "required=1601" in caplog.text
+    assert "remaining=594" in caplog.text
+    assert "private-provider-detail" not in caplog.text
+    assert "secret" not in caplog.text
+
+
+def test_credit_request_above_account_cap_fails_without_wait(monkeypatch) -> None:
+    oversized = {
+        "errors": [
+            {
+                "message": "There are not enough credits: private-provider-detail",
+                "code": 30,
+                "required_credits": 5000,
+                "remaining_credits": 594,
+                "time_remaining": "17 seconds",
+            }
+        ],
+        "extensions": {"throttling": {"user_quota": {"max_available": 4004}}},
+    }
+    calls = _scripted_post(monkeypatch, [_response(200, json.dumps(oversized))])
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    with pytest.raises(RuntimeError, match="^ShipHero GraphQL credits limit$"):
+        ShipHeroClient(token="secret")._execute("query")
+    assert len(calls) == 1
+    assert waits == []
+
+
+def test_429_credit_error_at_retry_limit_keeps_credit_signal(monkeypatch) -> None:
+    body = json.dumps(
+        {"errors": [{"code": 30, "message": "not enough credits", "time_remaining": "2 seconds"}]}
+    )
+    _scripted_post(monkeypatch, [_response(429, body)])
+
+    with pytest.raises(RuntimeError, match="^ShipHero GraphQL not enough credits$"):
+        ShipHeroClient(token="secret")._execute("query", retries=0)
+
+
 def test_graphql_error_does_not_reveal_provider_message(monkeypatch) -> None:
     body = json.dumps({"errors": [{"message": "private query and token secret"}]})
     _scripted_post(monkeypatch, [_response(200, body)])
@@ -219,3 +281,235 @@ def test_quantity_depletion_observed_zero_remains_zero() -> None:
     assert _fetch_candidate_depletion(
         ZeroClient(), [SimpleNamespace(sku="SKU1")], "2026-10-16"
     ) == ({"SKU1": 0}, {"SKU1": 7.0})
+
+
+def _line_page(items=(), *, more=False, cursor=None):
+    return {
+        "edges": [{"node": {"sku": sku, "quantity": quantity}} for sku, quantity in items],
+        "pageInfo": {"hasNextPage": more, "endCursor": cursor},
+    }
+
+
+def _order_node(order_id, *, date="2026-11-11T00:40:00", number=None, lines=None):
+    return {
+        "id": order_id,
+        "order_number": number or order_id,
+        "order_date": date,
+        "shop_name": "BASED",
+        "line_items": lines if lines is not None else _line_page(),
+    }
+
+
+def _orders_page(nodes, *, more=False, cursor=None, count=None):
+    return {
+        "data": {
+            "orders": {
+                "data": {
+                    "edges": [{"node": node} for node in nodes],
+                    "total_count": len(nodes) if count is None else count,
+                    "pageInfo": {"hasNextPage": more, "endCursor": cursor},
+                }
+            }
+        }
+    }
+
+
+def _order_lines_page(order_id, lines):
+    return {"data": {"order": {"data": {"id": order_id, "line_items": lines}}}}
+
+
+def _script_client_pages(monkeypatch, client, pages):
+    calls = []
+    answers = iter(pages)
+
+    def execute(query, variables=None, retries=6):
+        calls.append((query, variables))
+        return next(answers)
+
+    monkeypatch.setattr(client, "_execute", execute)
+    return calls
+
+
+def test_fetch_orders_for_day_uses_complete_cursor_fetch(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    arguments = []
+
+    def fetch_orders_window(*args, **kwargs):
+        arguments.append((args, kwargs))
+        return [_order_node("A")]
+
+    monkeypatch.setattr(client, "fetch_orders_window", fetch_orders_window)
+
+    assert [order["id"] for order in client.fetch_orders_for_day("2026-11-11", max_pages=20)] == [
+        "A"
+    ]
+    assert arguments == [
+        (
+            ("2026-11-11T00:00:00",),
+            {
+                "until_iso": "2026-11-12T00:00:00",
+                "warehouse_id": "V2FyZWhvdXNlOjExNzY2MQ==",
+                "max_pages": 20,
+            },
+        )
+    ]
+
+
+def test_order_cursor_paging_keeps_orders_with_earlier_and_equal_order_dates(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    calls = _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page([("COMB", 1)]))],
+                more=True,
+                cursor="a",
+                count=3,
+            ),
+            _orders_page(
+                [
+                    _order_node("B", date="2026-11-11T00:00:00", lines=_line_page([("COMB", 2)])),
+                    _order_node("C", lines=_line_page([("COMB", 3)])),
+                ],
+                count=3,
+            ),
+        ],
+    )
+
+    result = client.fetch_orders_window("2026-11-11T00:00:00", until_iso="2026-11-12T00:00:00")
+
+    assert [order["id"] for order in result] == ["A", "B", "C"]
+    assert [call[1]["after"] for call in calls] == [None, "a"]
+    assert [call[1]["since"] for call in calls] == ["2026-11-11T00:00:00"] * 2
+    assert [call[1]["until"] for call in calls] == ["2026-11-12T00:00:00"] * 2
+    assert "data(first: 25, after: $after)" in calls[0][0]
+
+
+@pytest.mark.parametrize(
+    ("pages", "limit", "error"),
+    [
+        ([_orders_page([_order_node("A")], more=True)], 2, "cursor missing"),
+        (
+            [
+                _orders_page([_order_node("A")], more=True, cursor="same"),
+                _orders_page([_order_node("B")], more=True, cursor="same"),
+            ],
+            3,
+            "cursor did not advance",
+        ),
+        ([_orders_page([_order_node("A")], more=True, cursor="next")], 1, "exceeded 1 pages"),
+        ([_orders_page([], more=True, cursor="next")], 1, "empty page"),
+        (
+            [
+                _orders_page([_order_node("A")], more=True, cursor="next"),
+                _orders_page([_order_node("A")]),
+            ],
+            2,
+            "repeated order id",
+        ),
+        (
+            [
+                _orders_page([_order_node("A")], more=True, cursor="next", count=2),
+                _orders_page([_order_node("B")], count=3),
+            ],
+            2,
+            "total_count changed",
+        ),
+        ([_orders_page([{"order_number": "A"}])], 1, "order id missing"),
+    ],
+)
+def test_order_pagination_failures_never_return_partial_day(
+    monkeypatch, pages, limit, error
+) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(monkeypatch, client, pages)
+
+    with pytest.raises(RuntimeError, match=error):
+        client.fetch_orders_window("2026-11-11T00:00:00", max_pages=limit)
+
+
+def test_orders_with_same_store_number_but_distinct_ids_are_not_dropped(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [_orders_page([_order_node("tiktok", number="123"), _order_node("shopify", number="123")])],
+    )
+
+    assert [order["id"] for order in client.fetch_orders_window("2026-11-11T00:00:00")] == [
+        "tiktok",
+        "shopify",
+    ]
+
+
+def test_orders_total_count_mismatch_never_returns_partial_day(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    calls = _script_client_pages(monkeypatch, client, [_orders_page([_order_node("A")], count=2)])
+
+    with pytest.raises(RuntimeError, match="orders total_count mismatch"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+    assert "total_count" in calls[0][0]
+
+
+def test_long_order_fetches_remaining_line_items_by_order_cursor(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    calls = _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page([("COMB", 1)], more=True, cursor="line-1"))]
+            ),
+            _order_lines_page("A", _line_page([("GEL", 2)], cursor="line-2")),
+        ],
+    )
+
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [edge["node"]["sku"] for edge in result[0]["line_items"]["edges"]] == ["COMB", "GEL"]
+    assert len(calls) == 2
+    assert calls[1][1] == {"order_id": "A", "line_after": "line-1"}
+    assert "line_items(first: 15, after: $line_after)" in calls[1][0]
+
+
+@pytest.mark.parametrize(
+    ("first_cursor", "followup_id", "followup_lines", "line_page_limit", "error"),
+    [
+        (None, "A", _line_page([("GEL", 1)]), 20, "cursor missing"),
+        (
+            "line-1",
+            "A",
+            _line_page([("GEL", 1)], more=True, cursor="line-1"),
+            20,
+            "cursor did not advance",
+        ),
+        (
+            "line-1",
+            "A",
+            _line_page([("GEL", 1)], more=True, cursor="line-2"),
+            2,
+            "exceeded 2 pages",
+        ),
+        ("line-1", "B", _line_page([("GEL", 1)]), 20, "order id changed"),
+        ("line-1", "A", _line_page(), 20, "empty page"),
+    ],
+)
+def test_long_order_pagination_failures_never_return_partial_lines(
+    monkeypatch, first_cursor, followup_id, followup_lines, line_page_limit, error
+) -> None:
+    client = ShipHeroClient(token="secret")
+    monkeypatch.setattr(client, "_ORDERS_LINE_ITEMS_MAX_PAGES", line_page_limit)
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page([("COMB", 1)], more=True, cursor=first_cursor))]
+            ),
+            _order_lines_page(followup_id, followup_lines),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        client.fetch_orders_window("2026-11-11T00:00:00")
