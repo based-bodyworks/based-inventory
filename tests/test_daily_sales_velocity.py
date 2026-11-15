@@ -593,7 +593,8 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     assert ["2026-03-01", "Curly Kit", "TIKTOK", 2, "KIT1"] in data
     # The old cached day was discarded; the new checkpoint has bundle_days.
     ckpt = json.loads((tmp_path / f"{slug}.checkpoint.json").read_text())
-    assert ckpt["schema"] == 5
+    assert ckpt["schema"] == 6
+    assert ckpt["catalog_fingerprint"] == dsv.catalog_fingerprint(stock, _registry())
     assert ckpt["source_order_counts"] == {"2026-03-01": 2}
     assert ckpt["bundle_days"]["2026-03-01"]["BASED"] == {"KIT1": 2}
     # Coverage guard fired for the unregistered kit, INSIDE the README body
@@ -649,12 +650,80 @@ def test_partial_utc_day_is_refetched_after_midnight(tmp_path, monkeypatch) -> N
     assert dsv.run(args) == 0
     assert client.calls == 2
     assert "Order coverage at extraction:" in readme_path.read_text()
-    assert json.loads(ckpt_path.read_text())["schema"] == 5
+    assert json.loads(ckpt_path.read_text())["schema"] == 6
     assert "All UTC days in this window are complete." in readme_path.read_text()
 
     assert dsv.run(args) == 0
     assert client.calls == 2
     assert "Order coverage at extraction:" not in readme_path.read_text()
+
+
+def test_changed_bundle_recipe_refetches_cached_day(tmp_path, monkeypatch) -> None:
+    """Never mix already-exploded days from two live kit definitions."""
+    original = _registry()
+    changed_kit = BundleEntry(
+        bundle_sku="KIT1",
+        bundle_name="Curly Kit",
+        source="shiphero",
+        components_resolved=(("BB-CC", "Curl Cream", 3), ("BB-SHMP", "Shampoo", 2)),
+        partially_resolved=False,
+    )
+    changed = BundleRegistry(
+        bundles=(changed_kit,),
+        bundle_skus=frozenset({"KIT1"}),
+        by_bundle_sku={"KIT1": changed_kit},
+    )
+    current_registry = {"value": original}
+    current_stock = {"value": [_stock("BB-CC", "Curl Cream"), _stock("BB-SHMP", "Shampoo")]}
+
+    class FakeClient:
+        calls = 0
+
+        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+            self.calls += 1
+            return [
+                {
+                    "order_number": "one-kit",
+                    "shop_name": "BASED",
+                    "order_date": "2026-03-01T01:00:00",
+                    "line_items": {"edges": [{"node": {"sku": "KIT1", "quantity": 1}}]},
+                }
+            ]
+
+    client = FakeClient()
+    monkeypatch.setattr(dsv, "_build_client", lambda _floor: client)
+    monkeypatch.setattr(
+        dsv,
+        "_load_catalog",
+        lambda _client: (current_stock["value"], current_registry["value"]),
+    )
+    args = dsv.build_arg_parser().parse_args(
+        ["--start-date", "2026-03-01", "--end-date", "2026-03-01", "--out-dir", str(tmp_path)]
+    )
+    ckpt_path = tmp_path / "daily-sales-velocity_2026-03-01_2026-03-01.checkpoint.json"
+
+    assert dsv.run(args) == 0
+    assert client.calls == 1
+    assert json.loads(ckpt_path.read_text())["days"]["2026-03-01"]["BASED"]["BB-CC"] == 1
+
+    current_registry["value"] = changed
+    assert dsv.run(args) == 0
+    assert client.calls == 2
+    new_checkpoint = json.loads(ckpt_path.read_text())
+    assert new_checkpoint["days"]["2026-03-01"]["BASED"]["BB-CC"] == 3
+    assert new_checkpoint["catalog_fingerprint"] == dsv.catalog_fingerprint(
+        current_stock["value"], changed
+    )
+
+    assert dsv.run(args) == 0
+    assert client.calls == 2
+
+    current_stock["value"] = [
+        _stock("BB-CC", "Curl Cream", is_kit=True),
+        _stock("BB-SHMP", "Shampoo"),
+    ]
+    assert dsv.run(args) == 0
+    assert client.calls == 3
 
 
 # --- never repeat a completed day's pages after a failed request ------------

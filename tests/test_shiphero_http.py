@@ -168,6 +168,28 @@ def test_credit_wait_uses_deficit_when_provider_hint_is_too_short(monkeypatch) -
     assert waits == [27]
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [requests.exceptions.ChunkedEncodingError, requests.exceptions.ContentDecodingError],
+)
+def test_truncated_response_retries_same_read(monkeypatch, error_type) -> None:
+    calls = []
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise error_type("private response detail")
+        return _response(200, '{"data":{"ok":true}}')
+
+    monkeypatch.setattr("based_inventory.shiphero.requests.post", post)
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=1) == {"data": {"ok": True}}
+    assert len(calls) == 2
+    assert waits == [2]
+
+
 def test_credit_refill_waits_and_retries_only_the_current_request(monkeypatch, caplog) -> None:
     shortage = {
         "errors": [

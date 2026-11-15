@@ -87,6 +87,7 @@ The refresh token is never printed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -159,7 +160,7 @@ CHANNEL_ORDER = (
 
 # v5 also invalidates checkpoints that may contain a day fetched before it ended.
 # A cached day must be complete before it can ever be reused as complete.
-CHECKPOINT_SCHEMA = 5
+CHECKPOINT_SCHEMA = 6
 
 
 def _utc_today() -> date:
@@ -623,6 +624,27 @@ def write_xlsx(
 # ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------
+def catalog_fingerprint(stock: list[WarehouseStock], registry: BundleRegistry) -> str:
+    """Identify the catalog rules that determine cached physical SKU units."""
+    effective_bundles = [
+        {
+            "sku": sku,
+            "name": entry.bundle_name,
+            "source": entry.source,
+            "components": entry.components_resolved,
+            "partially_resolved": entry.partially_resolved,
+        }
+        for sku, entry in sorted(registry.by_bundle_sku.items())
+    ]
+    definition = {
+        "bundle_skus": sorted(registry.bundle_skus),
+        "effective_bundles": effective_bundles,
+        "warehouse_kit_skus": sorted({item.sku for item in stock if item.is_kit}),
+    }
+    encoded = json.dumps(definition, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def load_checkpoint(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -782,6 +804,7 @@ def run(args: argparse.Namespace) -> int:
 
     client = _build_client(args.credits_floor)
     stock, registry = _load_catalog(client)
+    catalog_hash = catalog_fingerprint(stock, registry)
 
     # --- checkpoint state ---
     # The cached per-day, per-channel maps are channel-filtered + bundle-
@@ -793,8 +816,11 @@ def run(args: argparse.Namespace) -> int:
         or state.get("definition") != DEFINITION
         or state.get("warehouse_id") != MERCHDROP_WAREHOUSE_ID
         or state.get("include_shops") != include_shops_key
+        or state.get("catalog_fingerprint") != catalog_hash
     ):
-        logger.warning("Checkpoint schema/definition/warehouse/channel mismatch; starting fresh.")
+        logger.warning(
+            "Checkpoint schema/definition/warehouse/channel/catalog mismatch; starting fresh."
+        )
         state = None
     if state is None:
         state = {
@@ -803,6 +829,7 @@ def run(args: argparse.Namespace) -> int:
             "warehouse_id": MERCHDROP_WAREHOUSE_ID,
             "line_items_cap": ShipHeroClient._ORDERS_LINE_ITEMS_CAP,
             "include_shops": include_shops_key,
+            "catalog_fingerprint": catalog_hash,
             "days": {},
             "bundle_days": {},
             "excluded_shops": {},

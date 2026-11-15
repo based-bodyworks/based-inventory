@@ -175,7 +175,12 @@ class ShipHeroClient:
                     headers=self.headers,
                     timeout=60,
                 )
-            except (requests.ConnectionError, requests.Timeout):
+            except (
+                requests.ConnectionError,
+                requests.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ContentDecodingError,
+            ):
                 if attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
                     continue
