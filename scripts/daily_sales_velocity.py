@@ -436,6 +436,7 @@ def build_about_lines(
     bundle_count: int,
     bundle_units: int,
     generated_at: str,
+    end_day_complete: bool,
 ) -> list[str]:
     """The ABOUT sheet / README methodology block (shared by both surfaces).
 
@@ -497,7 +498,12 @@ def build_about_lines(
         )
     lines += [
         f"Order lines start with first:{line_items_cap}; additional pages are fetched. Incomplete pages fail the report.",
-        f"Window: {start_date} .. {end_date} ({n_days} days, UTC). The most recent day may be partial.",
+        f"Window: {start_date} .. {end_date} ({n_days} days, UTC). "
+        + (
+            "All UTC days in this window are complete."
+            if end_day_complete
+            else "The most recent UTC day may be partial."
+        ),
         scope_line,
         f"SKUs (rows per tab): {sku_count}  |  Total units ordered (all channels): {total_units}",
         per_channel_line,
@@ -916,6 +922,7 @@ def run(args: argparse.Namespace) -> int:
         bundle_count=len(bundle_skus_seen),
         bundle_units=bundle_units_total,
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),  # noqa: UP017 - Render uses Python 3.10
+        end_day_complete=end_date < datetime.now(timezone.utc).date(),  # noqa: UP017
     )
     guard_lines: list[str] = []
     if missing_kits:

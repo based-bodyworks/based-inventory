@@ -375,6 +375,7 @@ def _about_lines(**overrides):
         bundle_count=2,
         bundle_units=5,
         generated_at="2026-03-02 00:00:00",
+        end_day_complete=True,
     )
     base.update(overrides)
     return dsv.build_about_lines(**base)
@@ -385,6 +386,14 @@ def test_build_about_lines_states_bundles_have_no_rows_and_names_the_tab() -> No
     assert "NO row of their own" in text
     assert "BUNDLE SALES" in text  # points readers at the as-sold view
     assert "do not add" in text.lower()  # warns against double-counting
+
+
+def test_build_about_lines_describes_complete_and_partial_utc_days() -> None:
+    assert any("All UTC days in this window are complete." in line for line in _about_lines())
+    assert any(
+        "The most recent UTC day may be partial." in line
+        for line in _about_lines(end_day_complete=False)
+    )
 
 
 def test_build_about_lines_amazon_note_only_when_amazon_present() -> None:
