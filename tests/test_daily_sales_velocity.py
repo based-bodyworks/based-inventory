@@ -575,7 +575,7 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     assert ["2026-03-01", "Curly Kit", "TIKTOK", 2, "KIT1"] in data
     # The old cached day was discarded; the new checkpoint has bundle_days.
     ckpt = json.loads((tmp_path / f"{slug}.checkpoint.json").read_text())
-    assert ckpt["schema"] == 4
+    assert ckpt["schema"] == 5
     assert ckpt["bundle_days"]["2026-03-01"]["BASED"] == {"KIT1": 2}
     # Coverage guard fired for the unregistered kit, INSIDE the README body
     # (before the Generated footer), not as trailing debris after it.
@@ -583,6 +583,56 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     warn_i = next(i for i, line in enumerate(readme) if "NEWKIT" in line and "WARNING" in line)
     gen_i = next(i for i, line in enumerate(readme) if line.startswith("Generated:"))
     assert warn_i < gen_i
+
+
+def test_partial_utc_day_is_refetched_after_midnight(tmp_path, monkeypatch) -> None:
+    """A day started before midnight must never be reused as a complete day."""
+    import json
+
+    order = {
+        "order_number": "1",
+        "shop_name": "BASED",
+        "order_date": "2026-11-14T12:00:00",
+        "line_items": {"edges": [{"node": {"sku": "BB-CC", "quantity": 2}}]},
+    }
+
+    class FakeClient:
+        calls = 0
+
+        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+            self.calls += 1
+            return [order]
+
+    client = FakeClient()
+    monkeypatch.setattr(dsv, "_build_client", lambda _floor: client)
+    monkeypatch.setattr(
+        dsv, "_load_catalog", lambda _client: ([_stock("BB-CC", "Curl Cream")], _registry())
+    )
+    clock_dates = [dsv.date(2026, 11, 14), dsv.date(2026, 11, 15)]
+    monkeypatch.setattr(
+        dsv,
+        "_utc_today",
+        lambda: clock_dates.pop(0) if clock_dates else dsv.date(2026, 11, 15),
+    )
+    args = dsv.build_arg_parser().parse_args(
+        ["--start-date", "2026-11-14", "--end-date", "2026-11-14", "--out-dir", str(tmp_path)]
+    )
+    slug = "daily-sales-velocity_2026-11-14_2026-11-14"
+    ckpt_path = tmp_path / f"{slug}.checkpoint.json"
+    readme_path = tmp_path / f"{slug}.README.txt"
+
+    assert dsv.run(args) == 0
+    assert client.calls == 1
+    assert not ckpt_path.exists()
+    assert "The most recent UTC day may be partial." in readme_path.read_text()
+
+    assert dsv.run(args) == 0
+    assert client.calls == 2
+    assert json.loads(ckpt_path.read_text())["schema"] == 5
+    assert "All UTC days in this window are complete." in readme_path.read_text()
+
+    assert dsv.run(args) == 0
+    assert client.calls == 2
 
 
 # --- never repeat a completed day's pages after a failed request ------------

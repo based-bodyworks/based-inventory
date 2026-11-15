@@ -68,7 +68,9 @@ RUNTIME / RESUMABILITY
 A 90-day pull is a long batch (ShipHero's ~60 credits/sec refill paces the
 orders calls; expect well over an hour). Progress is checkpointed to disk
 per day, so a throttle or crash never loses completed days -- just re-run
-the same command and it resumes from the first un-fetched day.
+the same command and it resumes from the first un-fetched day. A day fetched
+before it ends in UTC appears in that run's output but is not checkpointed;
+running the same window later fetches that day again.
 
 USAGE
 -----
@@ -154,9 +156,13 @@ CHANNEL_ORDER = (
     "BASED",
 )
 
-# Checkpoint schema. v4 invalidates days fetched with date-based order paging,
-# which could skip orders. Older checkpoints must be rebuilt with cursor paging.
-CHECKPOINT_SCHEMA = 4
+# v5 also invalidates checkpoints that may contain a day fetched before it ended.
+# A cached day must be complete before it can ever be reused as complete.
+CHECKPOINT_SCHEMA = 5
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()  # noqa: UP017 - Render uses Python 3.10
 
 
 # ---------------------------------------------------------------------------
@@ -790,9 +796,13 @@ def run(args: argparse.Namespace) -> int:
         len(day_strs),
         len(todo),
     )
+    partial_days: set[str] = set()
     for idx, day in enumerate(todo, start=1):
         t0 = time.time()
         since, until = day_bounds(day)
+        # Decide before fetching: a pull begun before this UTC day ends cannot
+        # become a reusable complete-day checkpoint, even if midnight passes.
+        day_complete_before_fetch = date.fromisoformat(day) < _utc_today()
         orders = _fetch_orders_resilient(client, day, since, until, args.max_pages)
         sales_orders, excluded = select_sales_orders(orders, include_shops)
         for shop, n in excluded.items():
@@ -807,7 +817,12 @@ def run(args: argparse.Namespace) -> int:
         channel_maps = units_ordered_by_channel(sales_orders, registry, day, day_channels)
         days_done[day] = channel_maps
         bundle_days[day] = bundle_units_by_channel(sales_orders, registry, day, day_channels)
-        save_checkpoint(ckpt_path, state)
+        if not day_complete_before_fetch:
+            partial_days.add(day)
+        # Keep the in-memory partial day in this run's output, but never save
+        # it or a later day to the reusable checkpoint.
+        if not partial_days:
+            save_checkpoint(ckpt_path, state)
         per_ch = ", ".join(
             f"{channel_label(s)}:{sum(channel_maps[s].values())}"
             for s in ordered_channels(set(channel_maps))
@@ -922,7 +937,7 @@ def run(args: argparse.Namespace) -> int:
         bundle_count=len(bundle_skus_seen),
         bundle_units=bundle_units_total,
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),  # noqa: UP017 - Render uses Python 3.10
-        end_day_complete=end_date < datetime.now(timezone.utc).date(),  # noqa: UP017
+        end_day_complete=end_date < _utc_today() and not partial_days,
     )
     guard_lines: list[str] = []
     if missing_kits:
