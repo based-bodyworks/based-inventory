@@ -444,6 +444,7 @@ def build_about_lines(
     bundle_units: int,
     generated_at: str,
     end_day_complete: bool,
+    source_order_count: int | None = None,
 ) -> list[str]:
     """The ABOUT sheet / README methodology block (shared by both surfaces).
 
@@ -511,6 +512,13 @@ def build_about_lines(
             if end_day_complete
             else "The most recent UTC day may be partial."
         ),
+    ]
+    if source_order_count is not None:
+        lines.append(
+            "Order coverage: all order and line-item cursors exhausted; unique order IDs "
+            f"matched ShipHero's count before and after the pull: {source_order_count}."
+        )
+    lines += [
         scope_line,
         f"SKUs (rows per tab): {sku_count}  |  Total units ordered (all channels): {total_units}",
         per_channel_line,
@@ -795,12 +803,14 @@ def run(args: argparse.Namespace) -> int:
             "days": {},
             "bundle_days": {},
             "excluded_shops": {},
+            "source_order_counts": {},
         }
     # days_done[day] = {shop_name: {sku: units}}  (per-channel, exploded)
     days_done: dict[str, dict[str, dict[str, int]]] = state["days"]
     # bundle_days[day] = {shop_name: {bundle_sku: units}}  (AS-SOLD, un-exploded)
     bundle_days: dict[str, dict[str, dict[str, int]]] = state.setdefault("bundle_days", {})
     excluded_shops: dict[str, int] = state.setdefault("excluded_shops", {})
+    source_order_counts: dict[str, int] = state.setdefault("source_order_counts", {})
 
     # --- fetch each day not already checkpointed ---
     todo = [d for d in day_strs if d not in days_done]
@@ -831,6 +841,7 @@ def run(args: argparse.Namespace) -> int:
         channel_maps = units_ordered_by_channel(sales_orders, registry, day, day_channels)
         days_done[day] = channel_maps
         bundle_days[day] = bundle_units_by_channel(sales_orders, registry, day, day_channels)
+        source_order_counts[day] = len(orders)
         if not day_complete_before_fetch:
             partial_days.add(day)
         # Keep the in-memory partial day in this run's output, but never save
@@ -952,6 +963,14 @@ def run(args: argparse.Namespace) -> int:
         bundle_units=bundle_units_total,
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),  # noqa: UP017 - Render uses Python 3.10
         end_day_complete=end_date < _utc_today() and not partial_days,
+        source_order_count=(
+            sum(source_order_counts[day] for day in day_strs)
+            if all(
+                type(source_order_counts.get(day)) is int and source_order_counts[day] >= 0
+                for day in day_strs
+            )
+            else None
+        ),
     )
     guard_lines: list[str] = []
     if missing_kits:

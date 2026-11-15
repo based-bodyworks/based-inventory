@@ -400,6 +400,14 @@ def test_build_about_lines_describes_complete_and_partial_utc_days() -> None:
     )
 
 
+def test_build_about_lines_exposes_checked_order_count_only_when_known() -> None:
+    known = "\n".join(_about_lines(source_order_count=203))
+    unknown = "\n".join(_about_lines())
+    assert "all order and line-item cursors exhausted" in known
+    assert "matched ShipHero's count before and after the pull: 203" in known
+    assert "Order coverage:" not in unknown
+
+
 def test_build_about_lines_amazon_note_only_when_amazon_present() -> None:
     with_amazon = _about_lines(amazon_present=True)
     without = _about_lines(amazon_present=False)
@@ -580,10 +588,12 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     # The old cached day was discarded; the new checkpoint has bundle_days.
     ckpt = json.loads((tmp_path / f"{slug}.checkpoint.json").read_text())
     assert ckpt["schema"] == 5
+    assert ckpt["source_order_counts"] == {"2026-03-01": 2}
     assert ckpt["bundle_days"]["2026-03-01"]["BASED"] == {"KIT1": 2}
     # Coverage guard fired for the unregistered kit, INSIDE the README body
     # (before the Generated footer), not as trailing debris after it.
     readme = (tmp_path / f"{slug}.README.txt").read_text().splitlines()
+    assert any("matched ShipHero's count before and after the pull: 2" in line for line in readme)
     warn_i = next(i for i, line in enumerate(readme) if "NEWKIT" in line and "WARNING" in line)
     gen_i = next(i for i, line in enumerate(readme) if line.startswith("Generated:"))
     assert warn_i < gen_i
