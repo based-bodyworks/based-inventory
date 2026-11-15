@@ -160,9 +160,9 @@ services:
         value: INFO
 
   # Daily sales velocity: ShipHero orders -> per-channel demand workbook, posted
-  # to #alerts-inventory. Heaviest ShipHero job (~15min, all of the day's
-  # orders), so it runs at 11:00 UTC -- a quiet window before the inventory
-  # cluster -- to avoid contending for the credit pool. Time is adjustable.
+  # to #alerts-inventory. This pulls all of the previous day's orders and can
+  # run much longer as order volume grows. It starts at 11:00 UTC to reduce
+  # contention with other ShipHero jobs; timing is adjustable.
   # Runs the shell wrapper (generate -> rename -> post); PYBIN=python (no venv).
   - type: cron
     name: based-inventory-velocity

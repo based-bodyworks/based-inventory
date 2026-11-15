@@ -484,7 +484,8 @@ def test_sheet_title_is_excel_safe() -> None:
 # --- end-to-end run() wiring (faked client; no network) ----------------------
 def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -> None:
     """One synthetic day through run(): channel grids stay exploded-only, the
-    bundle view lands in .bundles.csv + the BUNDLE SALES tab, checkpoint is v3."""
+    bundle view lands in .bundles.csv + the BUNDLE SALES tab, and a legacy
+    checkpoint is rebuilt with the corrected order pagination."""
     import csv
     import json
 
@@ -528,9 +529,22 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     args = dsv.build_arg_parser().parse_args(
         ["--start-date", "2026-03-01", "--end-date", "2026-03-01", "--out-dir", str(tmp_path)]
     )
+    slug = "daily-sales-velocity_2026-03-01_2026-03-01"
+    (tmp_path / f"{slug}.checkpoint.json").write_text(
+        json.dumps(
+            {
+                "schema": 3,
+                "definition": dsv.DEFINITION,
+                "warehouse_id": dsv.MERCHDROP_WAREHOUSE_ID,
+                "include_shops": sorted(dsv.DEFAULT_SALES_CHANNELS),
+                "days": {"2026-03-01": {"BASED": {"BB-CC": 999}}},
+                "bundle_days": {},
+                "excluded_shops": {},
+            }
+        )
+    )
     assert dsv.run(args) == 0
 
-    slug = "daily-sales-velocity_2026-03-01_2026-03-01"
     # Channel CSV: exploded components only, Manual Order excluded, no KIT1 row.
     with open(tmp_path / f"{slug}.csv") as f:
         main_rows = list(csv.DictReader(f))
@@ -550,9 +564,9 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     ws = wb["BUNDLE SALES"]
     data = [[c.value for c in row] for row in ws.iter_rows(min_row=2)]
     assert ["2026-03-01", "Curly Kit", "TIKTOK", 2, "KIT1"] in data
-    # Checkpoint carries the v3 schema + the sibling bundle_days map.
+    # The old cached day was discarded; the new checkpoint has bundle_days.
     ckpt = json.loads((tmp_path / f"{slug}.checkpoint.json").read_text())
-    assert ckpt["schema"] == 3
+    assert ckpt["schema"] == 4
     assert ckpt["bundle_days"]["2026-03-01"]["BASED"] == {"KIT1": 2}
     # Coverage guard fired for the unregistered kit, INSIDE the README body
     # (before the Generated footer), not as trailing debris after it.
@@ -562,46 +576,45 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     assert warn_i < gen_i
 
 
-# --- network resilience for the long unattended pull ------------------------
-def test_is_retryable_network_error_classification() -> None:
-    import requests
-
-    assert dsv._is_retryable_network_error(requests.ConnectionError("boom")) is True
-    assert (
-        dsv._is_retryable_network_error(
-            RuntimeError("ShipHero network error after 6 retries: Failed to resolve host")
-        )
-        is True
-    )
-    # A real GraphQL error is NOT a transient network blip; must not retry forever.
-    assert (
-        dsv._is_retryable_network_error(
-            RuntimeError("ShipHero GraphQL errors: [{'message': 'bad field'}]")
-        )
-        is False
-    )
-
-
-def test_fetch_orders_resilient_retries_then_succeeds(monkeypatch) -> None:
-    monkeypatch.setattr(dsv.time, "sleep", lambda _s: None)  # no real waiting
+# --- never repeat a completed day's pages after a failed request ------------
+def test_fetch_orders_resilient_does_not_restart_after_network_exhaustion(monkeypatch) -> None:
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "previous")
+    monkeypatch.setattr(dsv.time, "sleep", lambda _s: None)
+    cleared = []
+    monkeypatch.setattr(dsv, "_clear_watchdog", cleared.append)
     calls = {"n": 0}
 
     class FlakyClient:
         def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
             calls["n"] += 1
-            if calls["n"] < 3:
-                raise RuntimeError("ShipHero network error after 6 retries: Max retries exceeded")
-            return [{"order_number": "1"}]
+            raise RuntimeError("ShipHero network error after 6 retries")
 
-    out = dsv._fetch_orders_resilient(FlakyClient(), "2026-03-01", "s", "u", 10)
-    assert out == [{"order_number": "1"}]
-    assert calls["n"] == 3  # failed twice, succeeded on the third
+    with pytest.raises(RuntimeError, match="network error"):
+        dsv._fetch_orders_resilient(FlakyClient(), "2026-03-01", "s", "u", 10)
+    assert calls["n"] == 1
+    assert cleared == ["previous"]
 
 
-_OBSERVED_CREDIT_SHORTAGE = (
-    "ShipHero GraphQL errors: [{'message': 'There are not enough credits to perform the operation', "
-    "'required_credits': 1601, 'remaining_credits': 594, 'time_remaining': '17 seconds', 'code': 30}]"
-)
+def test_fetch_orders_resilient_does_not_restart_a_day_after_credit_exhaustion(monkeypatch):
+    """A failed page must not cause every completed page of the day to be fetched again."""
+    calls = []
+    waits = []
+    cleared = []
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _seconds: "previous")
+    monkeypatch.setattr(dsv, "_clear_watchdog", cleared.append)
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+
+    class CreditExhaustedClient:
+        def fetch_orders_window(self, **kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("ShipHero GraphQL not enough credits")
+
+    with pytest.raises(RuntimeError, match="^ShipHero GraphQL not enough credits$"):
+        dsv._fetch_orders_resilient(CreditExhaustedClient(), "2026-11-01", "since", "until", 100)
+
+    assert len(calls) == 1
+    assert waits == []
+    assert cleared == ["previous"]
 
 
 def _graphql_response(payload):
@@ -626,53 +639,6 @@ def _credit_error(message="There are not enough credits to perform the operation
     )
 
 
-def _orders_response(orders, has_next_page=False):
-    return _graphql_response(
-        {
-            "data": {
-                "orders": {
-                    "data": {
-                        "edges": [{"node": order} for order in orders],
-                        "pageInfo": {"hasNextPage": has_next_page},
-                    }
-                }
-            }
-        }
-    )
-
-
-def test_real_client_credit_retry_restarts_complete_day(monkeypatch, caplog):
-    since, until = "2026-11-01T00:00:00", "2026-11-02T00:00:00"
-    first = {"order_number": "first", "order_date": "2026-11-01T09:00:00"}
-    last = {"order_number": "last", "order_date": "2026-11-01T23:00:00"}
-    responses = iter(
-        [_orders_response([first], True)]
-        + [_credit_error() for _ in range(7)]
-        + [_orders_response([first, last])]
-    )
-    windows, waits = [], []
-
-    def post(*_args, **kwargs):
-        windows.append(kwargs["json"]["variables"].copy())
-        return next(responses)
-
-    monkeypatch.setattr("based_inventory.shiphero.requests.post", post)
-    monkeypatch.setattr(dsv.time, "sleep", waits.append)
-    monkeypatch.setattr(dsv, "_set_watchdog", lambda _: None)
-    result = dsv._fetch_orders_resilient(
-        ShipHeroClient(token="private-token"), "2026-11-01", since, until, 100
-    )
-
-    assert result == [first, last]
-    assert len(windows) == 9
-    assert windows[0] == windows[-1]
-    assert all(window["since"] == first["order_date"] for window in windows[1:-1])
-    assert all(window["until"] == until for window in windows)
-    assert waits == [0.2] + [18] * 6 + [30]
-    assert "private-provider-detail" not in caplog.text
-    assert "private-token" not in caplog.text
-
-
 def test_real_client_credit_retry_is_bounded_and_sanitized(monkeypatch, caplog):
     monkeypatch.setattr(
         "based_inventory.shiphero.requests.post", lambda *_a, **_kw: _credit_error()
@@ -680,15 +646,13 @@ def test_real_client_credit_retry_is_bounded_and_sanitized(monkeypatch, caplog):
     waits = []
     monkeypatch.setattr(dsv.time, "sleep", waits.append)
     monkeypatch.setattr(dsv, "_set_watchdog", lambda _: None)
-    monkeypatch.setattr(dsv, "_DAY_FETCH_MAX_CREDIT_RETRIES", 1)
 
-    with pytest.raises(RuntimeError, match="credit pool unavailable after 1 retries") as caught:
+    with pytest.raises(RuntimeError, match="^ShipHero GraphQL not enough credits$") as caught:
         dsv._fetch_orders_resilient(
             ShipHeroClient(token="private-token"), "2026-11-01", "since", "until", 100
         )
 
-    assert waits == [18] * 6 + [30] + [18] * 6
-    assert str(caught.value.__cause__) == "ShipHero GraphQL not enough credits"
+    assert waits == [18] * 6
     assert "private-provider-detail" not in str(caught.value) + caplog.text
     assert "private-token" not in str(caught.value) + caplog.text
 
@@ -712,70 +676,7 @@ def test_real_client_oversized_query_does_not_get_refill_retries(monkeypatch, me
         dsv._fetch_orders_resilient(
             ShipHeroClient(token="private-token"), "2026-11-01", "since", "until", 100
         )
-    assert waits == [18] * 6
-
-
-def test_fetch_orders_resilient_recovers_credit_shortages_without_changing_window(monkeypatch):
-    events = []
-    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "prior-handler")
-    monkeypatch.setattr(dsv, "_clear_watchdog", lambda previous: events.append(("clear", previous)))
-    monkeypatch.setattr(dsv.time, "sleep", lambda wait: events.append(("sleep", wait)))
-    requests = []
-    complete_day = [{"order_number": "first"}, {"order_number": "last"}]
-
-    class CreditLimitedClient:
-        def fetch_orders_window(self, **kwargs):
-            requests.append(kwargs)
-            if len(requests) < 3:
-                raise RuntimeError(_OBSERVED_CREDIT_SHORTAGE)
-            return complete_day
-
-    result = dsv._fetch_orders_resilient(
-        CreditLimitedClient(), "2026-11-01", "2026-11-01T00:00:00", "2026-11-02T00:00:00", 100
-    )
-
-    assert result == [{"order_number": "first"}, {"order_number": "last"}]
-    assert (
-        requests
-        == [
-            {
-                "since_iso": "2026-11-01T00:00:00",
-                "until_iso": "2026-11-02T00:00:00",
-                "warehouse_id": "V2FyZWhvdXNlOjExNzY2MQ==",
-                "max_pages": 100,
-            }
-        ]
-        * 3
-    )
-    assert events == [
-        ("clear", "prior-handler"),
-        ("sleep", 30),
-        ("clear", "prior-handler"),
-        ("sleep", 30),
-        ("clear", "prior-handler"),
-    ]
-
-
-def test_fetch_orders_resilient_credit_retries_stop_without_partial_result(monkeypatch):
-    monkeypatch.setattr(dsv, "_DAY_FETCH_MAX_CREDIT_RETRIES", 2, raising=False)
-    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "prior-handler")
-    cleared = []
-    waits = []
-    monkeypatch.setattr(dsv, "_clear_watchdog", cleared.append)
-    monkeypatch.setattr(dsv.time, "sleep", waits.append)
-    calls = []
-
-    class ExhaustedClient:
-        def fetch_orders_window(self, **kwargs):
-            calls.append(kwargs)
-            raise RuntimeError(_OBSERVED_CREDIT_SHORTAGE)
-
-    with pytest.raises(RuntimeError, match="credit pool unavailable after 2 retries on 2026-11-01"):
-        dsv._fetch_orders_resilient(ExhaustedClient(), "2026-11-01", "since", "until", 100)
-
-    assert len(calls) == 3
-    assert waits == [30, 30]
-    assert cleared == ["prior-handler"] * 3
+    assert waits == []
 
 
 @pytest.mark.parametrize(
@@ -805,49 +706,20 @@ def test_fetch_orders_resilient_does_not_retry_permanent_graphql_errors(monkeypa
     assert cleared == ["prior-handler"]
 
 
-def test_fetch_orders_resilient_network_backoff_is_separate_from_credit_backoff(monkeypatch):
-    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: None)
-    monkeypatch.setattr(dsv, "_clear_watchdog", lambda _p: None)
-    waits = []
-    monkeypatch.setattr(dsv.time, "sleep", waits.append)
-    failures = [
-        "ShipHero network error after 6 retries: Max retries exceeded",
-        _OBSERVED_CREDIT_SHORTAGE,
-        "ShipHero network error after 6 retries: Max retries exceeded",
-    ]
-
-    class MixedFailureClient:
-        def fetch_orders_window(self, **kwargs):
-            if failures:
-                raise RuntimeError(failures.pop(0))
-            return [{"order_number": "complete"}]
-
-    assert dsv._fetch_orders_resilient(
-        MixedFailureClient(), "2026-11-01", "since", "until", 100
-    ) == [{"order_number": "complete"}]
-    assert waits == [30, 30, 60]
-
-
-def test_fetch_timeout_is_retryable() -> None:
-    assert dsv._is_retryable_network_error(dsv._FetchTimeoutError("hang")) is True
-
-
-def test_fetch_orders_resilient_retries_on_watchdog_timeout(monkeypatch) -> None:
-    # A hung day (watchdog fires -> _FetchTimeoutError) must be retried, not fatal.
-    monkeypatch.setattr(dsv.time, "sleep", lambda _s: None)
+def test_fetch_orders_resilient_does_not_restart_after_watchdog_timeout(monkeypatch) -> None:
     monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: None)  # don't arm a real SIGALRM in tests
     monkeypatch.setattr(dsv, "_clear_watchdog", lambda _p: None)
+    monkeypatch.setattr(dsv.time, "sleep", lambda _s: None)
     calls = {"n": 0}
 
     class HangingClient:
         def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
             calls["n"] += 1
-            if calls["n"] == 1:
-                raise dsv._FetchTimeoutError("per-day fetch watchdog fired")
-            return [{"order_number": "ok"}]
+            raise dsv._FetchTimeoutError("per-day fetch watchdog fired")
 
-    out = dsv._fetch_orders_resilient(HangingClient(), "2026-03-01", "s", "u", 10)
-    assert out == [{"order_number": "ok"}] and calls["n"] == 2
+    with pytest.raises(dsv._FetchTimeoutError, match="watchdog"):
+        dsv._fetch_orders_resilient(HangingClient(), "2026-03-01", "s", "u", 10)
+    assert calls["n"] == 1
 
 
 def test_fetch_orders_resilient_propagates_non_network_error(monkeypatch) -> None:
@@ -873,7 +745,13 @@ def test_fetch_orders_window_until_iso_is_upper_bound(monkeypatch) -> None:
 
     def fake_execute(query, variables=None, retries=6):
         captured.update(variables or {})
-        return {"data": {"orders": {"data": {"edges": [], "pageInfo": {"hasNextPage": False}}}}}
+        return {
+            "data": {
+                "orders": {
+                    "data": {"total_count": 0, "edges": [], "pageInfo": {"hasNextPage": False}}
+                }
+            }
+        }
 
     monkeypatch.setattr(client, "_execute", fake_execute)
     client.fetch_orders_window(since_iso="2026-03-01T00:00:00", until_iso="2026-03-02T00:00:00")
@@ -887,7 +765,13 @@ def test_fetch_orders_window_defaults_until_to_now(monkeypatch) -> None:
 
     def fake_execute(query, variables=None, retries=6):
         captured.update(variables or {})
-        return {"data": {"orders": {"data": {"edges": [], "pageInfo": {"hasNextPage": False}}}}}
+        return {
+            "data": {
+                "orders": {
+                    "data": {"total_count": 0, "edges": [], "pageInfo": {"hasNextPage": False}}
+                }
+            }
+        }
 
     monkeypatch.setattr(client, "_execute", fake_execute)
     client.fetch_orders_window(since_iso="2026-03-01T00:00:00")

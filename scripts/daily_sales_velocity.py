@@ -58,7 +58,7 @@ override the allowlist with --include-shop / --include-all-shops.
 
 REUSE
 -----
-Auth, the credit-aware client, orders+line_items(first:15) pagination, the
+Auth, the credit-aware client, cursor-paged orders and line items, the
 kit/registry builder and the bundle-explosion aggregator all come from the
 existing based_inventory package. The only new logic here is bucketing by
 day and emitting the dense 0-filled grid (both unit-tested).
@@ -91,10 +91,8 @@ import os
 import signal
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-
-import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -121,9 +119,9 @@ DEFAULT_OUTPUT_DIR = DATA_DIR / "sales-velocity"
 # refill wait between calls stays closer to the cost of a single call.
 DEFAULT_CREDITS_FLOOR = 2000
 
-# Generous per-day page budget: a single day paginates 100 orders/page, so
-# 500 pages covers up to ~50k orders/day -- well beyond any real Based day.
-DEFAULT_MAX_PAGES_PER_DAY = 500
+# Preserve the prior ~50k-orders-per-day ceiling with 25-order cursor pages.
+# Reaching this limit fails closed instead of publishing a partial day.
+DEFAULT_MAX_PAGES_PER_DAY = 2000
 
 DEFINITION = "ordered"  # see module docstring; "shipped" is the unused alternative
 
@@ -156,11 +154,9 @@ CHANNEL_ORDER = (
     "BASED",
 )
 
-# Checkpoint schema. v1 stored a single combined {sku: units} per day; v2 stores
-# per-channel {shop_name: {sku: units}}; v3 adds the sibling bundle_days map
-# (per-day AS-SOLD bundle units). Older checkpoints are discarded on load --
-# resuming a v2 file would skip cached days and leave bundle_days empty.
-CHECKPOINT_SCHEMA = 3
+# Checkpoint schema. v4 invalidates days fetched with date-based order paging,
+# which could skip orders. Older checkpoints must be rebuilt with cursor paging.
+CHECKPOINT_SCHEMA = 4
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +490,7 @@ def build_about_lines(
             "re-run with --include-shop '<name>'."
         )
     lines += [
-        f"Nested line_items capped at first:{line_items_cap} per order (rare >15-line orders truncate their tail).",
+        f"Order lines start with first:{line_items_cap}; additional pages are fetched. Incomplete pages fail the report.",
         f"Window: {start_date} .. {end_date} ({n_days} days, UTC). The most recent day may be partial.",
         scope_line,
         f"SKUs (rows per tab): {sku_count}  |  Total units ordered (all channels): {total_units}",
@@ -656,34 +652,11 @@ def _load_catalog(client: ShipHeroClient) -> tuple[list[WarehouseStock], BundleR
     return stock, registry
 
 
-# Network errors that should pause-and-retry the day rather than kill the run.
-_RETRYABLE_NETWORK_HINTS = (
-    "network error",
-    "failed to resolve",
-    "max retries exceeded",
-    "connection",
-    "timed out",
-    "timeout",
-    "name resolution",
-    "temporarily",
-    "bad gateway",
-    "gateway time",
-    "503",
-    "502",
-)
-# Generous cap so a long outage (overnight sleep without caffeinate, ISP drop)
-# is ridden through; progress is checkpointed per day regardless.
-_DAY_FETCH_MAX_NETWORK_RETRIES = 240
-# The shared client already retries individual credit-limited requests. If
-# its retry budget runs out, allow a bounded refill pause before restarting
-# the whole day. Keep this separate from the much longer network budget.
-_DAY_FETCH_MAX_CREDIT_RETRIES = 12
-
-# Hard wall-clock cap on a SINGLE day's fetch. A healthy day finishes in well
-# under this even at peak volume (~8-16 min); anything past it is a wedged
-# socket (a reset connection that never times out on read), so we abort and
-# retry the day. Without this, a hung read can stall the whole run silently.
-_DAY_FETCH_WATCHDOG_SECS = 1500
+# Hard wall-clock cap on a SINGLE day's fetch. Current volume can exceed 11k
+# orders/day, so cursor paging needs substantially more than the old 25-minute
+# limit. Keep a bound for genuinely wedged reads without interrupting a healthy
+# full-day pull and restarting its completed pages.
+_DAY_FETCH_WATCHDOG_SECS = 7200
 
 
 class _FetchTimeoutError(Exception):
@@ -714,86 +687,25 @@ def _clear_watchdog(previous) -> None:
         pass
 
 
-def _is_retryable_network_error(exc: Exception) -> bool:
-    """True for transient connectivity failures (drops, DNS, 5xx, hangs) worth retrying."""
-    if isinstance(exc, requests.RequestException):
-        return True
-    if isinstance(exc, _FetchTimeoutError):
-        return True
-    if isinstance(exc, RuntimeError):
-        msg = str(exc).lower()
-        return any(h in msg for h in _RETRYABLE_NETWORK_HINTS)
-    return False
-
-
 def _fetch_orders_resilient(
     client: ShipHeroClient, day: str, since: str, until: str, max_pages: int
 ) -> list[dict]:
-    """fetch_orders_window that PAUSES and retries through network drops / sleep / hangs.
+    """Fetch one complete day, without restarting completed pages on failure.
 
-    A transient connectivity failure (wifi blip, DNS failure, sleep/wake, a
-    ShipHero 5xx) OR a wedged socket that hangs past the per-day watchdog waits
-    with escalating backoff and retries the SAME day instead of crashing or
-    stalling the whole run. A depleted ShipHero credit pool gets a separate,
-    shorter retry budget with fixed refill pauses. Other errors propagate.
-    Each retry starts the same complete day again and can repeat fetched
-    pages. A failed attempt returns no partial day. Completed days remain checkpointed.
+    The ShipHero client retries a failed request in place. If those retries or
+    the watchdog are exhausted, the day fails closed. Earlier completed days
+    remain checkpointed so a later run can resume without duplicating them.
     """
-    attempt = 0
-    credit_retries = 0
-    while True:
-        previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
-        try:
-            orders = client.fetch_orders_window(
-                since_iso=since,
-                warehouse_id=MERCHDROP_WAREHOUSE_ID,
-                max_pages=max_pages,
-                until_iso=until,
-            )
-        except (RuntimeError, requests.RequestException, _FetchTimeoutError) as e:
-            _clear_watchdog(previous)  # disarm BEFORE the backoff sleep
-            message = str(e).lower()
-            if (
-                isinstance(e, RuntimeError)
-                and "not enough credits" in message
-                and "requires too many credits" not in message
-            ):
-                if credit_retries >= _DAY_FETCH_MAX_CREDIT_RETRIES:
-                    raise RuntimeError(
-                        f"ShipHero credit pool unavailable after {credit_retries} retries on {day}; "
-                        "no partial day accepted. Completed days are checkpointed; "
-                        "re-run the same command to resume."
-                    ) from e
-                credit_retries += 1
-                logger.warning(
-                    "ShipHero credit shortage on %s (retry %d/%d); waiting 30s "
-                    "then restarting the same complete day.",
-                    day,
-                    credit_retries,
-                    _DAY_FETCH_MAX_CREDIT_RETRIES,
-                )
-                time.sleep(30)
-                continue
-            if not _is_retryable_network_error(e):
-                raise
-            attempt += 1
-            if attempt > _DAY_FETCH_MAX_NETWORK_RETRIES:
-                raise RuntimeError(
-                    f"Network unavailable after {attempt} retries on {day}; progress is "
-                    "checkpointed -- re-run the same command to resume."
-                ) from e
-            wait = min(30 * (2 ** min(attempt - 1, 4)), 300)  # 30,60,120,240,300,...
-            logger.warning(
-                "Network issue on %s (retry %d): %s -- waiting %ds then retrying.",
-                day,
-                attempt,
-                str(e)[:120],
-                wait,
-            )
-            time.sleep(wait)
-        else:
-            _clear_watchdog(previous)  # disarm on success before returning to caller
-            return orders
+    previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
+    try:
+        return client.fetch_orders_window(
+            since_iso=since,
+            warehouse_id=MERCHDROP_WAREHOUSE_ID,
+            max_pages=max_pages,
+            until_iso=until,
+        )
+    finally:
+        _clear_watchdog(previous)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -803,7 +715,7 @@ def run(args: argparse.Namespace) -> int:
     end_date = (
         datetime.strptime(args.end_date, "%Y-%m-%d").date()
         if args.end_date
-        else datetime.utcnow().date()
+        else datetime.now(timezone.utc).date()  # noqa: UP017 - Render uses Python 3.10
     )
     start_date = resolve_start_date(end_date, args.days, args.start_date)
     day_strs = [d.strftime("%Y-%m-%d") for d in date_range(start_date, end_date)]
@@ -997,7 +909,7 @@ def run(args: argparse.Namespace) -> int:
         amazon_present=AMAZON_SHOP in emit_channels,
         bundle_count=len(bundle_skus_seen),
         bundle_units=bundle_units_total,
-        generated_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),  # noqa: UP017 - Render uses Python 3.10
     )
     guard_lines: list[str] = []
     if missing_kits:

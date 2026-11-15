@@ -33,3 +33,5 @@ jobs:
       - run: pytest
       - name: Build production image
         run: docker build -t based-inventory-ci .
+      - name: Check velocity entrypoint in production image
+        run: docker run --rm based-inventory-ci python scripts/daily_sales_velocity.py --help
