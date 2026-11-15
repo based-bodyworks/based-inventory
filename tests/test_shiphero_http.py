@@ -116,7 +116,56 @@ def test_429_throttle_hint_remains_bounded(monkeypatch) -> None:
     monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
 
     assert ShipHeroClient(token="secret")._execute("query", retries=1) == {"data": {}}
-    assert waits == [3]
+    assert waits == [15]
+
+
+def test_repeated_credit_contention_can_recover_after_six_shortages(monkeypatch) -> None:
+    shortage = json.dumps(
+        {
+            "errors": [
+                {
+                    "code": 30,
+                    "required_credits": 401,
+                    "remaining_credits": 43,
+                    "time_remaining": "5 seconds",
+                }
+            ],
+            "extensions": {"throttling": {"user_quota": {"max_available": 4004}}},
+        }
+    )
+    responses = [_response(200, shortage) for _ in range(7)]
+    responses.append(_response(200, '{"data":{"ok":true}}'))
+    calls = _scripted_post(monkeypatch, responses)
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query")["data"] == {"ok": True}
+    assert len(calls) == 8
+    assert waits == [15] * 7
+
+
+def test_credit_wait_uses_deficit_when_provider_hint_is_too_short(monkeypatch) -> None:
+    shortage = json.dumps(
+        {
+            "errors": [
+                {
+                    "code": 30,
+                    "required_credits": 1601,
+                    "remaining_credits": 100,
+                    "time_remaining": "1 second",
+                }
+            ],
+            "extensions": {
+                "throttling": {"user_quota": {"max_available": 4004, "increment_rate": 60}}
+            },
+        }
+    )
+    _scripted_post(monkeypatch, [_response(200, shortage), _response(200, '{"data":{}}')])
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=1) == {"data": {}}
+    assert waits == [27]
 
 
 def test_credit_refill_waits_and_retries_only_the_current_request(monkeypatch, caplog) -> None:
@@ -549,7 +598,7 @@ def test_credit_refill_retries_same_order_cursor_page(monkeypatch) -> None:
     assert [order["id"] for order in result] == ["A", "B"]
     variables = [call[1]["json"]["variables"] for call in calls]
     assert [value.get("after") for value in variables] == [None, None, "cursor-a", "cursor-a", None]
-    assert waits == [0.2, 2]
+    assert waits == [0.2, 15]
 
 
 def test_long_order_fetches_remaining_line_items_by_order_cursor(monkeypatch) -> None:

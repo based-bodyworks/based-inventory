@@ -163,10 +163,10 @@ class ShipHeroClient:
         self.max_pacing_sleep = max_pacing_sleep
 
     def _execute(
-        self, query: str, variables: dict[str, Any] | None = None, retries: int = 6
+        self, query: str, variables: dict[str, Any] | None = None, retries: int = 12
     ) -> dict[str, Any]:
-        if type(retries) is not int or not 0 <= retries <= 6:
-            raise ValueError("ShipHero retries must be between 0 and 6")
+        if type(retries) is not int or not 0 <= retries <= 12:
+            raise ValueError("ShipHero retries must be between 0 and 12")
         for attempt in range(retries + 1):
             try:
                 r = requests.post(
@@ -281,10 +281,13 @@ class ShipHeroClient:
             raise RuntimeError("ShipHero GraphQL not enough credits")
 
         hint = _credit_wait_hint(error.get("time_remaining"))
-        if hint is None and required is not None and remaining is not None:
+        if required is not None and remaining is not None and maximum is not None:
             rate = _quota_number(quota.get("increment_rate")) or _DEFAULT_CREDIT_REFILL_RATE
-            hint = max(required - remaining, 0) / rate
-        wait = min(math.ceil(hint if hint is not None else 60) + 1, 90)
+            refill = max(required - remaining, 0) / rate
+            hint = max(hint or 0, refill)
+        # Other ShipHero consumers share this pool. A retry exactly at the
+        # provider's refill estimate can lose every time under contention.
+        wait = min(max(math.ceil(hint if hint is not None else 60) + 1, 15), 90)
         _log.warning(
             "ShipHero credit refill: required=%s remaining=%s max=%s wait=%ss attempt=%d/%d",
             f"{required:g}" if required is not None else "unknown",
