@@ -463,7 +463,7 @@ def build_about_lines(
         f"{label}: {t}" for label, t in channel_totals
     )
     lines = [
-        "Based BodyWorks - Daily Sales Velocity (ShipHero)",
+        "BASED - Daily Sales Velocity (ShipHero)",
         "QTY SOLD = units ORDERED per day (demand), from ShipHero `orders` by order_date.",
         "Kit/bundle demand is resolved to component SKUs: ShipHero pre-explodes kit components",
         "as their own lines, so those lines are counted and the kit line is a marker; a kit",
@@ -472,12 +472,18 @@ def build_about_lines(
         "Multipacks/bundles get NO row of their own in the channel tabs; their units roll into",
         "the component SKUs. The BUNDLE SALES tab (and the .bundles.csv) lists them AS-SOLD for",
         "visibility -- those units are already inside the channel tabs, so do not add them on top.",
+        "Gift-card lines may appear as ordered units; they are nonphysical and must be excluded",
+        "from inventory cover calculations.",
     ]
     if amazon_present:
         lines.append(
             "AMAZON = FBM ONLY (Merchdrop-fulfilled). Amazon FBA ships from Amazon's "
             "warehouses and is NOT in ShipHero, so Amazon undercounts any FBA-fulfilled SKU."
         )
+    lines.append(
+        "Target store sellthrough is not in ShipHero merchant orders; Target replenishment "
+        "outbound is not counted as a sales channel by default."
+    )
     lines += [
         "One tab per sales channel (TikTok / Shopify / Amazon); same SKU rows on each tab.",
         f"Warehouse: Merchdrop ({MERCHDROP_WAREHOUSE_ID}).",
