@@ -22,7 +22,11 @@ sys.path.insert(0, str(SCRIPTS))
 import daily_sales_velocity as dsv  # noqa: E402
 
 from based_inventory.registry import BundleEntry, BundleRegistry  # noqa: E402
-from based_inventory.shiphero import ShipHeroClient, WarehouseStock  # noqa: E402
+from based_inventory.shiphero import (  # noqa: E402
+    OrdersCountChangedError,
+    ShipHeroClient,
+    WarehouseStock,
+)
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -636,6 +640,45 @@ def test_partial_utc_day_is_refetched_after_midnight(tmp_path, monkeypatch) -> N
 
 
 # --- never repeat a completed day's pages after a failed request ------------
+def test_fetch_orders_retries_only_when_source_day_changes(monkeypatch) -> None:
+    waits = []
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: None)
+
+    class ChangingClient:
+        calls = 0
+
+        def fetch_orders_window(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise OrdersCountChangedError(100, 101)
+            return [{"id": "complete"}]
+
+    client = ChangingClient()
+    assert dsv._fetch_orders_resilient(client, "2026-11-14", "s", "u", 100) == [{"id": "complete"}]
+    assert client.calls == 2
+    assert waits == [30]
+
+
+def test_fetch_orders_stops_after_three_changed_day_scans(monkeypatch) -> None:
+    waits = []
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: None)
+
+    class AlwaysChangingClient:
+        calls = 0
+
+        def fetch_orders_window(self, **kwargs):
+            self.calls += 1
+            raise OrdersCountChangedError(100, 101)
+
+    client = AlwaysChangingClient()
+    with pytest.raises(OrdersCountChangedError, match="100 -> 101"):
+        dsv._fetch_orders_resilient(client, "2026-11-14", "s", "u", 100)
+    assert client.calls == 3
+    assert waits == [30, 30]
+
+
 def test_fetch_orders_resilient_does_not_restart_after_network_exhaustion(monkeypatch) -> None:
     monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "previous")
     monkeypatch.setattr(dsv.time, "sleep", lambda _s: None)

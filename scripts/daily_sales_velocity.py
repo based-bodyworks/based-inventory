@@ -105,6 +105,7 @@ from based_inventory.inventory import aggregate_orders_demand  # noqa: E402
 from based_inventory.registry import BundleRegistry, build_registry  # noqa: E402
 from based_inventory.shiphero import (  # noqa: E402
     MERCHDROP_WAREHOUSE_ID,
+    OrdersCountChangedError,
     ShipHeroClient,
     WarehouseStock,
 )
@@ -708,20 +709,33 @@ def _clear_watchdog(previous) -> None:
 def _fetch_orders_resilient(
     client: ShipHeroClient, day: str, since: str, until: str, max_pages: int
 ) -> list[dict]:
-    """Fetch one complete day, without restarting completed pages on failure.
+    """Fetch one complete day; retry only if the source day itself changes.
 
     The ShipHero client retries a failed request in place. If those retries or
-    the watchdog are exhausted, the day fails closed. Earlier completed days
-    remain checkpointed so a later run can resume without duplicating them.
+    the watchdog are exhausted, the day fails closed. An order count change
+    invalidates the whole cursor scan, so a bounded fresh scan is safe. Earlier
+    completed days remain checkpointed and are never fetched again.
     """
     previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
     try:
-        return client.fetch_orders_window(
-            since_iso=since,
-            warehouse_id=MERCHDROP_WAREHOUSE_ID,
-            max_pages=max_pages,
-            until_iso=until,
-        )
+        for attempt in range(3):
+            try:
+                return client.fetch_orders_window(
+                    since_iso=since,
+                    warehouse_id=MERCHDROP_WAREHOUSE_ID,
+                    max_pages=max_pages,
+                    until_iso=until,
+                )
+            except OrdersCountChangedError as exc:
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    "%s: %s; retrying this changed day (%d/2).",
+                    day,
+                    exc,
+                    attempt + 1,
+                )
+                time.sleep(30)
     finally:
         _clear_watchdog(previous)
 

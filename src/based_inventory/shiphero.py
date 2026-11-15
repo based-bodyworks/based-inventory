@@ -132,6 +132,15 @@ class KitDefinition:
     is_kit_build: bool
 
 
+class OrdersCountChangedError(RuntimeError):
+    """An order-date window changed while its pages were being read."""
+
+    def __init__(self, before: int, after: int) -> None:
+        super().__init__(
+            f"ShipHero orders total_count changed during pagination: {before} -> {after}"
+        )
+
+
 class ShipHeroClient:
     def __init__(
         self,
@@ -1084,8 +1093,9 @@ class ShipHeroClient:
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ShipHero orders pagination exceeded {max_pages} pages")
-        if count_orders() != expected_count:
-            raise RuntimeError("ShipHero orders total_count changed during pagination")
+        final_count = count_orders()
+        if final_count != expected_count:
+            raise OrdersCountChangedError(expected_count, final_count)
         if len(out) != expected_count:
             raise RuntimeError(
                 f"ShipHero orders total_count mismatch: fetched {len(out)}, expected {expected_count}"
