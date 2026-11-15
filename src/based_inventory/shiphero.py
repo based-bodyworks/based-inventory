@@ -22,7 +22,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -696,7 +696,7 @@ class ShipHeroClient:
             )
         except ValueError:
             req_start = None
-        now_dt = datetime.now(UTC).replace(tzinfo=None)
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)  # noqa: UP017
         requested_window_days = (
             max((now_dt - req_start).total_seconds() / 86400.0, 0.0) if req_start else 7.0
         )
@@ -753,7 +753,7 @@ class ShipHeroClient:
 
         from datetime import datetime as _dt
 
-        now_iso = _dt.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        now_iso = _dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")  # noqa: UP017
         counts: dict[str, int] = {}
         seen_orders: set[str] = set()
         call_budget = [32]
@@ -800,7 +800,7 @@ class ShipHeroClient:
         self,
         day_iso_date: str,
         warehouse_id: str = MERCHDROP_WAREHOUSE_ID,
-        max_pages: int = 50,
+        max_pages: int = 2000,
     ) -> list[dict[str, Any]]:
         """Fetch all orders for a single calendar day with line_items.
 
@@ -936,7 +936,7 @@ class ShipHeroClient:
 
         from datetime import datetime as _dt
 
-        now_iso = _dt.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        now_iso = _dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")  # noqa: UP017
         visit(po_date_from_iso, now_iso)
         return out
 
@@ -996,7 +996,23 @@ class ShipHeroClient:
         """
         from datetime import datetime as _dt
 
-        now_iso = until_iso or _dt.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        now_iso = until_iso or _dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")  # noqa: UP017
+        filters = {"since": since_iso, "until": now_iso, "warehouse_id": warehouse_id}
+        count_query = """
+        query($since: ISODateTime!, $until: ISODateTime!, $warehouse_id: String!) {
+          orders(order_date_from: $since, order_date_to: $until, warehouse_id: $warehouse_id) {
+            data(first: 1) { total_count }
+          }
+        }
+        """
+
+        def count_orders() -> int:
+            payload = self._execute(count_query, filters)
+            reported = payload["data"]["orders"]["data"].get("total_count")
+            if type(reported) is not int or reported < 0:
+                raise RuntimeError("ShipHero orders invalid total_count")
+            return reported
+
         query = (
             """
         query($since: ISODateTime!, $until: ISODateTime!, $warehouse_id: String!, $after: String) {
@@ -1008,7 +1024,6 @@ class ShipHeroClient:
             data(first: """
             + str(self._ORDERS_PAGE_SIZE)
             + """, after: $after) {
-              total_count
               edges {
                 node {
                   id
@@ -1018,7 +1033,7 @@ class ShipHeroClient:
                   line_items(first: """
             + str(self._ORDERS_LINE_ITEMS_CAP)
             + """) {
-                    edges { node { sku quantity } }
+                    edges { node { id sku quantity } }
                     pageInfo { hasNextPage endCursor }
                   }
                 }
@@ -1033,27 +1048,15 @@ class ShipHeroClient:
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         cursor: str | None = None
-        expected_count: int | None = None
+        expected_count = count_orders()
         for _ in range(max_pages):
             payload = self._execute(
                 query,
-                {
-                    "since": since_iso,
-                    "until": now_iso,
-                    "warehouse_id": warehouse_id,
-                    "after": cursor,
-                },
+                {**filters, "after": cursor},
             )
             connection = payload["data"]["orders"]["data"]
             edges = connection["edges"]
             page_info = connection["pageInfo"]
-            reported_count = connection.get("total_count")
-            if type(reported_count) is not int or reported_count < 0:
-                raise RuntimeError("ShipHero orders invalid total_count")
-            if expected_count is None:
-                expected_count = reported_count
-            elif reported_count != expected_count:
-                raise RuntimeError("ShipHero orders total_count changed during pagination")
             if not edges:
                 if page_info["hasNextPage"]:
                     raise RuntimeError(
@@ -1081,6 +1084,8 @@ class ShipHeroClient:
             time.sleep(0.2)
         else:
             raise RuntimeError(f"ShipHero orders pagination exceeded {max_pages} pages")
+        if count_orders() != expected_count:
+            raise RuntimeError("ShipHero orders total_count changed during pagination")
         if len(out) != expected_count:
             raise RuntimeError(
                 f"ShipHero orders total_count mismatch: fetched {len(out)}, expected {expected_count}"
@@ -1091,6 +1096,22 @@ class ShipHeroClient:
         """Append line-item pages for an order whose first page is truncated."""
         lines = order["line_items"]
         page_info = lines["pageInfo"]
+        seen_line_ids: set[str] = set()
+
+        def check_ids(edges: list[dict[str, Any]]) -> None:
+            for edge in edges:
+                line_id = edge["node"].get("id")
+                if not isinstance(line_id, str) or not line_id:
+                    raise RuntimeError(
+                        f"ShipHero line items missing line id for order {order['id']}"
+                    )
+                if line_id in seen_line_ids:
+                    raise RuntimeError(
+                        f"ShipHero line items repeated line id for order {order['id']}"
+                    )
+                seen_line_ids.add(line_id)
+
+        check_ids(lines["edges"])
         if not page_info["hasNextPage"]:
             return
         query = (
@@ -1102,7 +1123,7 @@ class ShipHeroClient:
               line_items(first: """
             + str(self._ORDERS_LINE_ITEMS_CAP)
             + """, after: $line_after) {
-                edges { node { sku quantity } }
+                edges { node { id sku quantity } }
                 pageInfo { hasNextPage endCursor }
               }
             }
@@ -1121,6 +1142,7 @@ class ShipHeroClient:
             lines_page = order_data["line_items"]
             if not lines_page["edges"]:
                 raise RuntimeError(f"ShipHero line items empty page for order {order['id']}")
+            check_ids(lines_page["edges"])
             lines["edges"].extend(lines_page["edges"])
             page_info = lines_page["pageInfo"]
             if not page_info["hasNextPage"]:

@@ -148,7 +148,8 @@ def test_credit_refill_waits_and_retries_only_the_current_request(monkeypatch, c
     assert "secret" not in caplog.text
 
 
-def test_credit_request_above_account_cap_fails_without_wait(monkeypatch) -> None:
+@pytest.mark.parametrize("include_quota", [True, False])
+def test_credit_request_above_account_cap_fails_without_wait(monkeypatch, include_quota) -> None:
     oversized = {
         "errors": [
             {
@@ -159,8 +160,11 @@ def test_credit_request_above_account_cap_fails_without_wait(monkeypatch) -> Non
                 "time_remaining": "17 seconds",
             }
         ],
-        "extensions": {"throttling": {"user_quota": {"max_available": 4004}}},
     }
+    if include_quota:
+        oversized["extensions"] = {"throttling": {"user_quota": {"max_available": 4004}}}
+    else:
+        oversized["errors"][0]["message"] = "operation requires too many credits"
     calls = _scripted_post(monkeypatch, [_response(200, json.dumps(oversized))])
     waits = []
     monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
@@ -169,6 +173,32 @@ def test_credit_request_above_account_cap_fails_without_wait(monkeypatch) -> Non
         ShipHeroClient(token="secret")._execute("query")
     assert len(calls) == 1
     assert waits == []
+
+
+def test_credit_error_without_live_cap_retries_when_provider_does_not_say_oversized(
+    monkeypatch,
+) -> None:
+    shortage = {
+        "errors": [
+            {
+                "message": "There are not enough credits",
+                "code": 30,
+                "required_credits": 5000,
+                "remaining_credits": 100,
+                "time_remaining": "17 seconds",
+            }
+        ]
+    }
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(shortage)), _response(200, '{"data":{"ok":true}}')],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=1)["data"] == {"ok": True}
+    assert len(calls) == 2
+    assert waits == [18]
 
 
 def test_429_credit_error_at_retry_limit_keeps_credit_signal(monkeypatch) -> None:
@@ -284,8 +314,16 @@ def test_quantity_depletion_observed_zero_remains_zero() -> None:
 
 
 def _line_page(items=(), *, more=False, cursor=None):
+    def line(item):
+        if len(item) == 2:
+            sku, quantity = item
+            line_id = sku
+        else:
+            line_id, sku, quantity = item
+        return {"node": {"id": line_id, "sku": sku, "quantity": quantity}}
+
     return {
-        "edges": [{"node": {"sku": sku, "quantity": quantity}} for sku, quantity in items],
+        "edges": [line(item) for item in items],
         "pageInfo": {"hasNextPage": more, "endCursor": cursor},
     }
 
@@ -318,12 +356,19 @@ def _order_lines_page(order_id, lines):
     return {"data": {"order": {"data": {"id": order_id, "line_items": lines}}}}
 
 
-def _script_client_pages(monkeypatch, client, pages):
+def _script_client_pages(monkeypatch, client, pages, *, final_count=None):
     calls = []
     answers = iter(pages)
+    initial_count = pages[0]["data"]["orders"]["data"]["total_count"]
+    count_calls = 0
 
     def execute(query, variables=None, retries=6):
+        nonlocal count_calls
         calls.append((query, variables))
+        if "total_count" in query:
+            count_calls += 1
+            count = initial_count if count_calls == 1 or final_count is None else final_count
+            return {"data": {"orders": {"data": {"total_count": count}}}}
         return next(answers)
 
     monkeypatch.setattr(client, "_execute", execute)
@@ -380,10 +425,11 @@ def test_order_cursor_paging_keeps_orders_with_earlier_and_equal_order_dates(mon
     result = client.fetch_orders_window("2026-11-11T00:00:00", until_iso="2026-11-12T00:00:00")
 
     assert [order["id"] for order in result] == ["A", "B", "C"]
-    assert [call[1]["after"] for call in calls] == [None, "a"]
-    assert [call[1]["since"] for call in calls] == ["2026-11-11T00:00:00"] * 2
-    assert [call[1]["until"] for call in calls] == ["2026-11-12T00:00:00"] * 2
-    assert "data(first: 25, after: $after)" in calls[0][0]
+    page_calls = [call for call in calls if "data(first: 25" in call[0]]
+    assert [call[1]["after"] for call in page_calls] == [None, "a"]
+    assert [call[1]["since"] for call in page_calls] == ["2026-11-11T00:00:00"] * 2
+    assert [call[1]["until"] for call in page_calls] == ["2026-11-12T00:00:00"] * 2
+    assert "data(first: 25, after: $after)" in page_calls[0][0]
 
 
 @pytest.mark.parametrize(
@@ -407,14 +453,6 @@ def test_order_cursor_paging_keeps_orders_with_earlier_and_equal_order_dates(mon
             ],
             2,
             "repeated order id",
-        ),
-        (
-            [
-                _orders_page([_order_node("A")], more=True, cursor="next", count=2),
-                _orders_page([_order_node("B")], count=3),
-            ],
-            2,
-            "total_count changed",
         ),
         ([_orders_page([{"order_number": "A"}])], 1, "order id missing"),
     ],
@@ -452,6 +490,68 @@ def test_orders_total_count_mismatch_never_returns_partial_day(monkeypatch) -> N
     assert "total_count" in calls[0][0]
 
 
+def test_orders_total_count_change_never_returns_partial_day(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(monkeypatch, client, [_orders_page([_order_node("A")])], final_count=2)
+
+    with pytest.raises(RuntimeError, match="orders total_count changed"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+
+
+def test_order_count_is_checked_before_and_after_without_recounting_each_page(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    count_calls = 0
+    page_calls = 0
+
+    def execute(query, variables=None, retries=6):
+        nonlocal count_calls, page_calls
+        if "total_count" in query:
+            count_calls += 1
+            return {"data": {"orders": {"data": {"total_count": 2}}}}
+        page_calls += 1
+        if page_calls == 1:
+            return _orders_page([_order_node("A")], more=True, cursor="next")
+        return _orders_page([_order_node("B")])
+
+    monkeypatch.setattr(client, "_execute", execute)
+    assert [order["id"] for order in client.fetch_orders_window("2026-11-11T00:00:00")] == [
+        "A",
+        "B",
+    ]
+    assert count_calls == 2
+    assert page_calls == 2
+
+
+def test_credit_refill_retries_same_order_cursor_page(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 2}}}}
+    first = _orders_page([_order_node("A")], more=True, cursor="cursor-a")
+    shortage = {
+        "errors": [
+            {
+                "code": 30,
+                "message": "There are not enough credits",
+                "required_credits": 401,
+                "remaining_credits": 100,
+                "time_remaining": "1 second",
+            }
+        ]
+    }
+    second = _orders_page([_order_node("B")])
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in (count, first, shortage, second, count)],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    result = ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [order["id"] for order in result] == ["A", "B"]
+    variables = [call[1]["json"]["variables"] for call in calls]
+    assert [value.get("after") for value in variables] == [None, None, "cursor-a", "cursor-a", None]
+    assert waits == [0.2, 2]
+
+
 def test_long_order_fetches_remaining_line_items_by_order_cursor(monkeypatch) -> None:
     client = ShipHeroClient(token="secret")
     calls = _script_client_pages(
@@ -468,9 +568,44 @@ def test_long_order_fetches_remaining_line_items_by_order_cursor(monkeypatch) ->
     result = client.fetch_orders_window("2026-11-11T00:00:00")
 
     assert [edge["node"]["sku"] for edge in result[0]["line_items"]["edges"]] == ["COMB", "GEL"]
-    assert len(calls) == 2
-    assert calls[1][1] == {"order_id": "A", "line_after": "line-1"}
-    assert "line_items(first: 15, after: $line_after)" in calls[1][0]
+    line_calls = [call for call in calls if "order(id:" in call[0]]
+    assert len(line_calls) == 1
+    assert line_calls[0][1] == {"order_id": "A", "line_after": "line-1"}
+    assert "line_items(first: 15, after: $line_after)" in line_calls[0][0]
+
+
+def test_long_order_keeps_distinct_lines_with_same_sku(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page([("line-1", "COMB", 1)], more=True, cursor="a"))]
+            ),
+            _order_lines_page("A", _line_page([("line-2", "COMB", 2)])),
+        ],
+    )
+
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+    assert [edge["node"]["quantity"] for edge in result[0]["line_items"]["edges"]] == [1, 2]
+
+
+def test_long_order_rejects_overlapping_line_id_across_cursor_pages(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page([("line-1", "COMB", 1)], more=True, cursor="a"))]
+            ),
+            _order_lines_page("A", _line_page([("line-1", "COMB", 1)], cursor="b")),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="repeated line id.*order A"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
 
 
 @pytest.mark.parametrize(
