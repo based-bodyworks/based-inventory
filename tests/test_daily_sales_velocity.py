@@ -406,8 +406,8 @@ def test_build_about_lines_exposes_checked_order_count_only_when_known() -> None
     multi_day = "\n".join(_about_lines(n_days=2, source_order_count=406))
     assert "all order and line-item cursors exhausted" in known
     assert "matched ShipHero's count before and after the pull: 203" in known
-    assert "Order coverage:" not in unknown
-    assert "Order coverage:" not in multi_day
+    assert "Order coverage at extraction:" not in unknown
+    assert "Order coverage at extraction:" not in multi_day
 
 
 def test_build_about_lines_amazon_note_only_when_amazon_present() -> None:
