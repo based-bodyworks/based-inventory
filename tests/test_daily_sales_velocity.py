@@ -369,7 +369,6 @@ def _about_lines(**overrides):
         start_date=date(2026, 3, 1),
         end_date=date(2026, 3, 1),
         n_days=1,
-        line_items_cap=15,
         sku_count=10,
         total_units=100,
         channel_totals=[("TIKTOK", 60), ("SHOPIFY", 40)],
@@ -398,6 +397,14 @@ def test_build_about_lines_describes_complete_and_partial_utc_days() -> None:
     assert any(
         "The most recent UTC day may be partial." in line
         for line in _about_lines(end_day_complete=False)
+    )
+
+
+def test_build_about_lines_explains_complete_order_lines_without_page_size_claim() -> None:
+    assert any(
+        "Order lines are fetched by cursor until complete" in line
+        and "incomplete pages fail" in line
+        for line in _about_lines()
     )
 
 
@@ -652,6 +659,8 @@ def test_partial_utc_day_is_refetched_after_midnight(tmp_path, monkeypatch) -> N
     assert client.calls == 2
     assert "Order coverage at extraction:" in readme_path.read_text()
     assert json.loads(ckpt_path.read_text())["schema"] == 6
+    assert json.loads(ckpt_path.read_text())["line_items_cap"] == 15
+    assert dsv.ShipHeroClient._ORDERS_EMBEDDED_LINE_ITEMS_CAP == 5
     assert "All UTC days in this window are complete." in readme_path.read_text()
 
     assert dsv.run(args) == 0

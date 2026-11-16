@@ -990,8 +990,22 @@ class ShipHeroClient:
         return [e["node"] for e in payload["data"]["purchase_orders"]["data"]["edges"]]
 
     _ORDERS_PAGE_SIZE = 25
+    # ShipHero reserves complexity for every nested slot on an order page.
+    # Five embedded lines keep a 25-order request at an estimated 151 credits
+    # (1 + 25 * (1 + 5)); fetch any remaining lines with smaller order queries.
+    _ORDERS_EMBEDDED_LINE_ITEMS_CAP = 5
     _ORDERS_LINE_ITEMS_CAP = 15
-    _ORDERS_LINE_ITEMS_MAX_PAGES = 20
+    _ORDERS_LINE_ITEMS_MAX_LINES = 300
+    _ORDERS_LINE_ITEMS_MAX_PAGES = (
+        1
+        + (
+            _ORDERS_LINE_ITEMS_MAX_LINES
+            - _ORDERS_EMBEDDED_LINE_ITEMS_CAP
+            + _ORDERS_LINE_ITEMS_CAP
+            - 1
+        )
+        // _ORDERS_LINE_ITEMS_CAP
+    )
 
     def fetch_orders_window(
         self,
@@ -1052,7 +1066,7 @@ class ShipHeroClient:
                   order_date
                   shop_name
                   line_items(first: """
-            + str(self._ORDERS_LINE_ITEMS_CAP)
+            + str(self._ORDERS_EMBEDDED_LINE_ITEMS_CAP)
             + """) {
                     edges { node { id sku quantity } }
                     pageInfo { hasNextPage endCursor }
@@ -1163,6 +1177,11 @@ class ShipHeroClient:
                 seen_line_ids.add(line_id)
 
         check_ids(lines["edges"])
+        if len(seen_line_ids) > self._ORDERS_LINE_ITEMS_MAX_LINES:
+            raise RuntimeError(
+                f"ShipHero line items exceeded {self._ORDERS_LINE_ITEMS_MAX_LINES} lines "
+                f"for order {order['id']}"
+            )
         if not page_info["hasNextPage"]:
             return
         query = (
@@ -1194,6 +1213,11 @@ class ShipHeroClient:
             if not lines_page["edges"]:
                 raise RuntimeError(f"ShipHero line items empty page for order {order['id']}")
             check_ids(lines_page["edges"])
+            if len(seen_line_ids) > self._ORDERS_LINE_ITEMS_MAX_LINES:
+                raise RuntimeError(
+                    f"ShipHero line items exceeded {self._ORDERS_LINE_ITEMS_MAX_LINES} lines "
+                    f"for order {order['id']}"
+                )
             lines["edges"].extend(lines_page["edges"])
             page_info = lines_page["pageInfo"]
             if not page_info["hasNextPage"]:

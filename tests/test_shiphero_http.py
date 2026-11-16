@@ -501,6 +501,8 @@ def test_order_cursor_paging_keeps_orders_with_earlier_and_equal_order_dates(mon
     assert [call[1]["since"] for call in page_calls] == ["2026-11-11T00:00:00"] * 2
     assert [call[1]["until"] for call in page_calls] == ["2026-11-12T00:00:00"] * 2
     assert "data(first: 25, after: $after)" in page_calls[0][0]
+    assert "line_items(first: 5)" in page_calls[0][0]
+    assert 1 + client._ORDERS_PAGE_SIZE * (1 + client._ORDERS_EMBEDDED_LINE_ITEMS_CAP) == 151
 
 
 @pytest.mark.parametrize(
@@ -611,23 +613,23 @@ def test_order_cursor_overlap_rejects_changed_line_quantity(monkeypatch) -> None
 
 def test_order_cursor_overlap_checks_line_quantity_beyond_first_page(monkeypatch) -> None:
     client = ShipHeroClient(token="secret")
-    first_fifteen = [(f"line-{i}", f"SKU-{i}", 1) for i in range(15)]
+    first_five = [(f"line-{i}", f"SKU-{i}", 1) for i in range(5)]
     _script_client_pages(
         monkeypatch,
         client,
         [
             _orders_page(
-                [_order_node("A", lines=_line_page(first_fifteen, more=True, cursor="tail"))],
+                [_order_node("A", lines=_line_page(first_five, more=True, cursor="tail"))],
                 more=True,
                 cursor="next",
                 count=1,
             ),
-            _order_lines_page("A", _line_page([("line-15", "COMB", 1)])),
+            _order_lines_page("A", _line_page([("line-5", "COMB", 1)])),
             _orders_page(
-                [_order_node("A", lines=_line_page(first_fifteen, more=True, cursor="tail"))],
+                [_order_node("A", lines=_line_page(first_five, more=True, cursor="tail"))],
                 count=1,
             ),
-            _order_lines_page("A", _line_page([("line-15", "COMB", 2)])),
+            _order_lines_page("A", _line_page([("line-5", "COMB", 2)])),
         ],
     )
 
@@ -740,6 +742,67 @@ def test_long_order_fetches_remaining_line_items_by_order_cursor(monkeypatch) ->
     assert len(line_calls) == 1
     assert line_calls[0][1] == {"order_id": "A", "line_after": "line-1"}
     assert "line_items(first: 15, after: $line_after)" in line_calls[0][0]
+
+
+@pytest.mark.parametrize("total_lines", [6, 100, 300])
+def test_long_order_exhausts_all_line_pages_up_to_300(monkeypatch, total_lines) -> None:
+    client = ShipHeroClient(token="secret")
+    all_lines = [(f"line-{i}", "COMB", 1) for i in range(total_lines)]
+    tail = all_lines[5:]
+    answers = [
+        _orders_page(
+            [_order_node("A", lines=_line_page(all_lines[:5], more=True, cursor="line-4"))],
+            count=1,
+        )
+    ]
+    tail_chunks = [tail[i : i + 15] for i in range(0, len(tail), 15)]
+    for index, chunk in enumerate(tail_chunks):
+        answers.append(
+            _order_lines_page(
+                "A",
+                _line_page(
+                    chunk,
+                    more=index < len(tail_chunks) - 1,
+                    cursor=chunk[-1][0],
+                ),
+            )
+        )
+    calls = _script_client_pages(monkeypatch, client, answers)
+
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [edge["node"]["id"] for edge in result[0]["line_items"]["edges"]] == [
+        line[0] for line in all_lines
+    ]
+    line_calls = [call for call in calls if "order(id:" in call[0]]
+    assert len(line_calls) == len(tail_chunks)
+    assert all("line_items(first: 15, after: $line_after)" in query for query, _ in line_calls)
+    assert client._ORDERS_LINE_ITEMS_MAX_PAGES == 21
+
+
+def test_long_order_rejects_301_lines_before_count_attestation(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    all_lines = [(f"line-{i}", "COMB", 1) for i in range(301)]
+    tail = all_lines[5:]
+    answers = [
+        _orders_page(
+            [_order_node("A", lines=_line_page(all_lines[:5], more=True, cursor="line-4"))],
+            count=1,
+        )
+    ]
+    tail_chunks = [tail[i : i + 15] for i in range(0, len(tail), 15)]
+    for index, chunk in enumerate(tail_chunks):
+        answers.append(
+            _order_lines_page(
+                "A",
+                _line_page(chunk, more=index < len(tail_chunks) - 1, cursor=chunk[-1][0]),
+            )
+        )
+    calls = _script_client_pages(monkeypatch, client, answers)
+
+    with pytest.raises(RuntimeError, match="exceeded 300 lines"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+    assert len([query for query, _ in calls if "total_count" in query]) == 1
 
 
 def test_long_order_keeps_distinct_lines_with_same_sku(monkeypatch) -> None:
