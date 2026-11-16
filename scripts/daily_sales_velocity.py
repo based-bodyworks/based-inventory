@@ -107,6 +107,7 @@ from based_inventory.registry import BundleRegistry, build_registry  # noqa: E40
 from based_inventory.shiphero import (  # noqa: E402
     MERCHDROP_WAREHOUSE_ID,
     OrdersCountChangedError,
+    OrdersPaginationUnstableError,
     ShipHeroClient,
     WarehouseStock,
 )
@@ -742,12 +743,13 @@ def _clear_watchdog(previous) -> None:
 def _fetch_orders_resilient(
     client: ShipHeroClient, day: str, since: str, until: str, max_pages: int
 ) -> list[dict]:
-    """Fetch one complete day; retry only if the source day itself changes.
+    """Fetch one complete day; retry if the source day or its page order changes.
 
     The ShipHero client retries a failed request in place. If those retries or
-    the watchdog are exhausted, the day fails closed. An order count change
-    invalidates the whole cursor scan, so a bounded fresh scan is safe. Earlier
-    completed days remain checkpointed and are never fetched again.
+    the watchdog are exhausted, the day fails closed. A changed order count or
+    repeated order invalidates the whole cursor scan, so a bounded fresh scan
+    is safe. Earlier completed days remain checkpointed and are never fetched
+    again.
     """
     previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
     try:
@@ -759,11 +761,11 @@ def _fetch_orders_resilient(
                     max_pages=max_pages,
                     until_iso=until,
                 )
-            except OrdersCountChangedError as exc:
+            except (OrdersCountChangedError, OrdersPaginationUnstableError) as exc:
                 if attempt == 2:
                     raise
                 logger.warning(
-                    "%s: %s; retrying this changed day (%d/2).",
+                    "%s: %s; retrying the complete day (%d/2).",
                     day,
                     exc,
                     attempt + 1,

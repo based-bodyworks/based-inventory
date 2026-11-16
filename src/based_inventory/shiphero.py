@@ -141,6 +141,10 @@ class OrdersCountChangedError(RuntimeError):
         )
 
 
+class OrdersPaginationUnstableError(RuntimeError):
+    """A cursor scan could not prove complete, stable order coverage."""
+
+
 class ShipHeroClient:
     def __init__(
         self,
@@ -1063,7 +1067,8 @@ class ShipHeroClient:
         )
 
         out: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen: dict[str, dict[str, Any]] = {}
+        duplicate_edges = 0
         cursor: str | None = None
         expected_count = count_orders()
         for _ in range(max_pages):
@@ -1086,8 +1091,17 @@ class ShipHeroClient:
                 if not isinstance(order_id, str) or not order_id:
                     raise RuntimeError("ShipHero orders pagination order id missing")
                 if order_id in seen:
-                    raise RuntimeError("ShipHero orders pagination repeated order id")
-                seen.add(order_id)
+                    original = seen[order_id]
+                    if any(
+                        n.get(field) != original.get(field)
+                        for field in ("order_number", "order_date", "shop_name")
+                    ):
+                        raise OrdersPaginationUnstableError(
+                            "ShipHero orders pagination repeated order changed"
+                        )
+                    duplicate_edges += 1
+                    continue
+                seen[order_id] = n
                 self._finish_order_lines(n)
                 out.append(n)
             if not page_info["hasNextPage"]:
@@ -1105,8 +1119,15 @@ class ShipHeroClient:
         if final_count != expected_count:
             raise OrdersCountChangedError(expected_count, final_count)
         if len(out) != expected_count:
-            raise RuntimeError(
+            raise OrdersPaginationUnstableError(
                 f"ShipHero orders total_count mismatch: fetched {len(out)}, expected {expected_count}"
+            )
+        if duplicate_edges:
+            _log.warning(
+                "ShipHero orders cursor pages repeated %d order edges; "
+                "all %d unique orders matched source total_count",
+                duplicate_edges,
+                expected_count,
             )
         return out
 
