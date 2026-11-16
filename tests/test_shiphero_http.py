@@ -586,6 +586,55 @@ def test_order_cursor_overlap_rejects_changed_order_metadata(monkeypatch, change
         client.fetch_orders_window("2026-11-11T00:00:00")
 
 
+def test_order_cursor_overlap_rejects_changed_line_quantity(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page([("line-1", "COMB", 1)]))],
+                more=True,
+                cursor="next",
+                count=1,
+            ),
+            _orders_page(
+                [_order_node("A", lines=_line_page([("line-1", "COMB", 2)]))],
+                count=1,
+            ),
+        ],
+    )
+
+    with pytest.raises(OrdersPaginationUnstableError, match="repeated order lines changed"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+
+
+def test_order_cursor_overlap_checks_line_quantity_beyond_first_page(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    first_fifteen = [(f"line-{i}", f"SKU-{i}", 1) for i in range(15)]
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page(first_fifteen, more=True, cursor="tail"))],
+                more=True,
+                cursor="next",
+                count=1,
+            ),
+            _order_lines_page("A", _line_page([("line-15", "COMB", 1)])),
+            _orders_page(
+                [_order_node("A", lines=_line_page(first_fifteen, more=True, cursor="tail"))],
+                count=1,
+            ),
+            _order_lines_page("A", _line_page([("line-15", "COMB", 2)])),
+        ],
+    )
+
+    with pytest.raises(OrdersPaginationUnstableError, match="repeated order lines changed"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+
+
 def test_orders_with_same_store_number_but_distinct_ids_are_not_dropped(monkeypatch) -> None:
     client = ShipHeroClient(token="secret")
     _script_client_pages(

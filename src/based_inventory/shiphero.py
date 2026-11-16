@@ -1069,6 +1069,13 @@ class ShipHeroClient:
         out: list[dict[str, Any]] = []
         seen: dict[str, dict[str, Any]] = {}
         duplicate_edges = 0
+
+        def line_contents(order: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+            return {
+                edge["node"]["id"]: (edge["node"].get("sku"), edge["node"].get("quantity"))
+                for edge in order["line_items"]["edges"]
+            }
+
         cursor: str | None = None
         expected_count = count_orders()
         for _ in range(max_pages):
@@ -1098,6 +1105,11 @@ class ShipHeroClient:
                     ):
                         raise OrdersPaginationUnstableError(
                             "ShipHero orders pagination repeated order changed"
+                        )
+                    self._finish_order_lines(n)
+                    if line_contents(n) != line_contents(original):
+                        raise OrdersPaginationUnstableError(
+                            "ShipHero orders pagination repeated order lines changed"
                         )
                     duplicate_edges += 1
                     continue
