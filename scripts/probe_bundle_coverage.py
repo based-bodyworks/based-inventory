@@ -226,7 +226,7 @@ def main() -> None:
     bundle_attribution: Counter[str] = Counter()
     for day in days:
         try:
-            orders = client.fetch_orders_for_day(day, max_pages=20)
+            orders = client.fetch_orders_for_day(day)
         except RuntimeError as e:
             print(f"  {day}: ERROR {e}")
             continue

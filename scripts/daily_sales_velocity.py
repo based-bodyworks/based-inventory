@@ -58,7 +58,7 @@ override the allowlist with --include-shop / --include-all-shops.
 
 REUSE
 -----
-Auth, the credit-aware client, orders+line_items(first:15) pagination, the
+Auth, the credit-aware client, cursor-paged orders and line items, the
 kit/registry builder and the bundle-explosion aggregator all come from the
 existing based_inventory package. The only new logic here is bucketing by
 day and emitting the dense 0-filled grid (both unit-tested).
@@ -68,7 +68,9 @@ RUNTIME / RESUMABILITY
 A 90-day pull is a long batch (ShipHero's ~60 credits/sec refill paces the
 orders calls; expect well over an hour). Progress is checkpointed to disk
 per day, so a throttle or crash never loses completed days -- just re-run
-the same command and it resumes from the first un-fetched day.
+the same command and it resumes from the first un-fetched day. A day fetched
+before it ends in UTC appears in that run's output but is not checkpointed;
+running the same window later fetches that day again.
 
 USAGE
 -----
@@ -85,16 +87,15 @@ The refresh token is never printed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import signal
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-
-import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -105,6 +106,7 @@ from based_inventory.inventory import aggregate_orders_demand  # noqa: E402
 from based_inventory.registry import BundleRegistry, build_registry  # noqa: E402
 from based_inventory.shiphero import (  # noqa: E402
     MERCHDROP_WAREHOUSE_ID,
+    OrdersCountChangedError,
     ShipHeroClient,
     WarehouseStock,
 )
@@ -121,9 +123,9 @@ DEFAULT_OUTPUT_DIR = DATA_DIR / "sales-velocity"
 # refill wait between calls stays closer to the cost of a single call.
 DEFAULT_CREDITS_FLOOR = 2000
 
-# Generous per-day page budget: a single day paginates 100 orders/page, so
-# 500 pages covers up to ~50k orders/day -- well beyond any real Based day.
-DEFAULT_MAX_PAGES_PER_DAY = 500
+# Preserve the prior ~50k-orders-per-day ceiling with 25-order cursor pages.
+# Reaching this limit fails closed instead of publishing a partial day.
+DEFAULT_MAX_PAGES_PER_DAY = 2000
 
 DEFINITION = "ordered"  # see module docstring; "shipped" is the unused alternative
 
@@ -156,11 +158,13 @@ CHANNEL_ORDER = (
     "BASED",
 )
 
-# Checkpoint schema. v1 stored a single combined {sku: units} per day; v2 stores
-# per-channel {shop_name: {sku: units}}; v3 adds the sibling bundle_days map
-# (per-day AS-SOLD bundle units). Older checkpoints are discarded on load --
-# resuming a v2 file would skip cached days and leave bundle_days empty.
-CHECKPOINT_SCHEMA = 3
+# v5 also invalidates checkpoints that may contain a day fetched before it ended.
+# A cached day must be complete before it can ever be reused as complete.
+CHECKPOINT_SCHEMA = 6
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()  # noqa: UP017 - Render uses Python 3.10
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +444,8 @@ def build_about_lines(
     bundle_count: int,
     bundle_units: int,
     generated_at: str,
+    end_day_complete: bool,
+    source_order_count: int | None = None,
 ) -> list[str]:
     """The ABOUT sheet / README methodology block (shared by both surfaces).
 
@@ -467,7 +473,7 @@ def build_about_lines(
         f"{label}: {t}" for label, t in channel_totals
     )
     lines = [
-        "Based BodyWorks - Daily Sales Velocity (ShipHero)",
+        "BASED - Daily Sales Velocity (ShipHero)",
         "QTY SOLD = units ORDERED per day (demand), from ShipHero `orders` by order_date.",
         "Kit/bundle demand is resolved to component SKUs: ShipHero pre-explodes kit components",
         "as their own lines, so those lines are counted and the kit line is a marker; a kit",
@@ -476,12 +482,18 @@ def build_about_lines(
         "Multipacks/bundles get NO row of their own in the channel tabs; their units roll into",
         "the component SKUs. The BUNDLE SALES tab (and the .bundles.csv) lists them AS-SOLD for",
         "visibility -- those units are already inside the channel tabs, so do not add them on top.",
+        "Gift-card lines may appear as ordered units; they are nonphysical and must be excluded",
+        "from inventory cover calculations.",
     ]
     if amazon_present:
         lines.append(
             "AMAZON = FBM ONLY (Merchdrop-fulfilled). Amazon FBA ships from Amazon's "
             "warehouses and is NOT in ShipHero, so Amazon undercounts any FBA-fulfilled SKU."
         )
+    lines.append(
+        "Target store sellthrough is not in ShipHero merchant orders; Target replenishment "
+        "outbound is not counted as a sales channel by default."
+    )
     lines += [
         "One tab per sales channel (TikTok / Shopify / Amazon); same SKU rows on each tab.",
         f"Warehouse: Merchdrop ({MERCHDROP_WAREHOUSE_ID}).",
@@ -494,8 +506,23 @@ def build_about_lines(
             "re-run with --include-shop '<name>'."
         )
     lines += [
-        f"Nested line_items capped at first:{line_items_cap} per order (rare >15-line orders truncate their tail).",
-        f"Window: {start_date} .. {end_date} ({n_days} days, UTC). The most recent day may be partial.",
+        f"Order lines start with first:{line_items_cap}; additional pages are fetched. Incomplete pages fail the report.",
+        f"Window: {start_date} .. {end_date} ({n_days} days, UTC). "
+        + (
+            "All UTC days in this window are complete."
+            if end_day_complete
+            else "The most recent UTC day may be partial."
+        ),
+    ]
+    # A multi-day sum could count a midnight boundary order twice if the API's
+    # upper date bound is inclusive. Only a single-day report gets this control.
+    if source_order_count is not None and n_days == 1:
+        lines.append(
+            "Order coverage at extraction: all order and line-item cursors exhausted; "
+            "unique IDs in the raw Merchdrop order query (including excluded shops) "
+            f"matched ShipHero's count before and after the pull: {source_order_count}."
+        )
+    lines += [
         scope_line,
         f"SKUs (rows per tab): {sku_count}  |  Total units ordered (all channels): {total_units}",
         per_channel_line,
@@ -597,6 +624,27 @@ def write_xlsx(
 # ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------
+def catalog_fingerprint(stock: list[WarehouseStock], registry: BundleRegistry) -> str:
+    """Identify the catalog rules that determine cached physical SKU units."""
+    effective_bundles = [
+        {
+            "sku": sku,
+            "name": entry.bundle_name,
+            "source": entry.source,
+            "components": entry.components_resolved,
+            "partially_resolved": entry.partially_resolved,
+        }
+        for sku, entry in sorted(registry.by_bundle_sku.items())
+    ]
+    definition = {
+        "bundle_skus": sorted(registry.bundle_skus),
+        "effective_bundles": effective_bundles,
+        "warehouse_kit_skus": sorted({item.sku for item in stock if item.is_kit}),
+    }
+    encoded = json.dumps(definition, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def load_checkpoint(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -656,34 +704,11 @@ def _load_catalog(client: ShipHeroClient) -> tuple[list[WarehouseStock], BundleR
     return stock, registry
 
 
-# Network errors that should pause-and-retry the day rather than kill the run.
-_RETRYABLE_NETWORK_HINTS = (
-    "network error",
-    "failed to resolve",
-    "max retries exceeded",
-    "connection",
-    "timed out",
-    "timeout",
-    "name resolution",
-    "temporarily",
-    "bad gateway",
-    "gateway time",
-    "503",
-    "502",
-)
-# Generous cap so a long outage (overnight sleep without caffeinate, ISP drop)
-# is ridden through; progress is checkpointed per day regardless.
-_DAY_FETCH_MAX_NETWORK_RETRIES = 240
-# The shared client already retries individual credit-limited requests. If
-# its retry budget runs out, allow a bounded refill pause before restarting
-# the whole day. Keep this separate from the much longer network budget.
-_DAY_FETCH_MAX_CREDIT_RETRIES = 12
-
-# Hard wall-clock cap on a SINGLE day's fetch. A healthy day finishes in well
-# under this even at peak volume (~8-16 min); anything past it is a wedged
-# socket (a reset connection that never times out on read), so we abort and
-# retry the day. Without this, a hung read can stall the whole run silently.
-_DAY_FETCH_WATCHDOG_SECS = 1500
+# Hard wall-clock cap on a SINGLE day's fetch. Current volume can exceed 11k
+# orders/day, so cursor paging needs substantially more than the old 25-minute
+# limit. Keep a bound for genuinely wedged reads without interrupting a healthy
+# full-day pull and restarting its completed pages.
+_DAY_FETCH_WATCHDOG_SECS = 7200
 
 
 class _FetchTimeoutError(Exception):
@@ -714,86 +739,38 @@ def _clear_watchdog(previous) -> None:
         pass
 
 
-def _is_retryable_network_error(exc: Exception) -> bool:
-    """True for transient connectivity failures (drops, DNS, 5xx, hangs) worth retrying."""
-    if isinstance(exc, requests.RequestException):
-        return True
-    if isinstance(exc, _FetchTimeoutError):
-        return True
-    if isinstance(exc, RuntimeError):
-        msg = str(exc).lower()
-        return any(h in msg for h in _RETRYABLE_NETWORK_HINTS)
-    return False
-
-
 def _fetch_orders_resilient(
     client: ShipHeroClient, day: str, since: str, until: str, max_pages: int
 ) -> list[dict]:
-    """fetch_orders_window that PAUSES and retries through network drops / sleep / hangs.
+    """Fetch one complete day; retry only if the source day itself changes.
 
-    A transient connectivity failure (wifi blip, DNS failure, sleep/wake, a
-    ShipHero 5xx) OR a wedged socket that hangs past the per-day watchdog waits
-    with escalating backoff and retries the SAME day instead of crashing or
-    stalling the whole run. A depleted ShipHero credit pool gets a separate,
-    shorter retry budget with fixed refill pauses. Other errors propagate.
-    Each retry starts the same complete day again and can repeat fetched
-    pages. A failed attempt returns no partial day. Completed days remain checkpointed.
+    The ShipHero client retries a failed request in place. If those retries or
+    the watchdog are exhausted, the day fails closed. An order count change
+    invalidates the whole cursor scan, so a bounded fresh scan is safe. Earlier
+    completed days remain checkpointed and are never fetched again.
     """
-    attempt = 0
-    credit_retries = 0
-    while True:
-        previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
-        try:
-            orders = client.fetch_orders_window(
-                since_iso=since,
-                warehouse_id=MERCHDROP_WAREHOUSE_ID,
-                max_pages=max_pages,
-                until_iso=until,
-            )
-        except (RuntimeError, requests.RequestException, _FetchTimeoutError) as e:
-            _clear_watchdog(previous)  # disarm BEFORE the backoff sleep
-            message = str(e).lower()
-            if (
-                isinstance(e, RuntimeError)
-                and "not enough credits" in message
-                and "requires too many credits" not in message
-            ):
-                if credit_retries >= _DAY_FETCH_MAX_CREDIT_RETRIES:
-                    raise RuntimeError(
-                        f"ShipHero credit pool unavailable after {credit_retries} retries on {day}; "
-                        "no partial day accepted. Completed days are checkpointed; "
-                        "re-run the same command to resume."
-                    ) from e
-                credit_retries += 1
+    previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
+    try:
+        for attempt in range(3):
+            try:
+                return client.fetch_orders_window(
+                    since_iso=since,
+                    warehouse_id=MERCHDROP_WAREHOUSE_ID,
+                    max_pages=max_pages,
+                    until_iso=until,
+                )
+            except OrdersCountChangedError as exc:
+                if attempt == 2:
+                    raise
                 logger.warning(
-                    "ShipHero credit shortage on %s (retry %d/%d); waiting 30s "
-                    "then restarting the same complete day.",
+                    "%s: %s; retrying this changed day (%d/2).",
                     day,
-                    credit_retries,
-                    _DAY_FETCH_MAX_CREDIT_RETRIES,
+                    exc,
+                    attempt + 1,
                 )
                 time.sleep(30)
-                continue
-            if not _is_retryable_network_error(e):
-                raise
-            attempt += 1
-            if attempt > _DAY_FETCH_MAX_NETWORK_RETRIES:
-                raise RuntimeError(
-                    f"Network unavailable after {attempt} retries on {day}; progress is "
-                    "checkpointed -- re-run the same command to resume."
-                ) from e
-            wait = min(30 * (2 ** min(attempt - 1, 4)), 300)  # 30,60,120,240,300,...
-            logger.warning(
-                "Network issue on %s (retry %d): %s -- waiting %ds then retrying.",
-                day,
-                attempt,
-                str(e)[:120],
-                wait,
-            )
-            time.sleep(wait)
-        else:
-            _clear_watchdog(previous)  # disarm on success before returning to caller
-            return orders
+    finally:
+        _clear_watchdog(previous)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -803,7 +780,7 @@ def run(args: argparse.Namespace) -> int:
     end_date = (
         datetime.strptime(args.end_date, "%Y-%m-%d").date()
         if args.end_date
-        else datetime.utcnow().date()
+        else datetime.now(timezone.utc).date()  # noqa: UP017 - Render uses Python 3.10
     )
     start_date = resolve_start_date(end_date, args.days, args.start_date)
     day_strs = [d.strftime("%Y-%m-%d") for d in date_range(start_date, end_date)]
@@ -827,6 +804,7 @@ def run(args: argparse.Namespace) -> int:
 
     client = _build_client(args.credits_floor)
     stock, registry = _load_catalog(client)
+    catalog_hash = catalog_fingerprint(stock, registry)
 
     # --- checkpoint state ---
     # The cached per-day, per-channel maps are channel-filtered + bundle-
@@ -838,8 +816,11 @@ def run(args: argparse.Namespace) -> int:
         or state.get("definition") != DEFINITION
         or state.get("warehouse_id") != MERCHDROP_WAREHOUSE_ID
         or state.get("include_shops") != include_shops_key
+        or state.get("catalog_fingerprint") != catalog_hash
     ):
-        logger.warning("Checkpoint schema/definition/warehouse/channel mismatch; starting fresh.")
+        logger.warning(
+            "Checkpoint schema/definition/warehouse/channel/catalog mismatch; starting fresh."
+        )
         state = None
     if state is None:
         state = {
@@ -848,15 +829,18 @@ def run(args: argparse.Namespace) -> int:
             "warehouse_id": MERCHDROP_WAREHOUSE_ID,
             "line_items_cap": ShipHeroClient._ORDERS_LINE_ITEMS_CAP,
             "include_shops": include_shops_key,
+            "catalog_fingerprint": catalog_hash,
             "days": {},
             "bundle_days": {},
             "excluded_shops": {},
+            "source_order_counts": {},
         }
     # days_done[day] = {shop_name: {sku: units}}  (per-channel, exploded)
     days_done: dict[str, dict[str, dict[str, int]]] = state["days"]
     # bundle_days[day] = {shop_name: {bundle_sku: units}}  (AS-SOLD, un-exploded)
     bundle_days: dict[str, dict[str, dict[str, int]]] = state.setdefault("bundle_days", {})
     excluded_shops: dict[str, int] = state.setdefault("excluded_shops", {})
+    source_order_counts: dict[str, int] = state.setdefault("source_order_counts", {})
 
     # --- fetch each day not already checkpointed ---
     todo = [d for d in day_strs if d not in days_done]
@@ -866,9 +850,13 @@ def run(args: argparse.Namespace) -> int:
         len(day_strs),
         len(todo),
     )
+    partial_days: set[str] = set()
     for idx, day in enumerate(todo, start=1):
         t0 = time.time()
         since, until = day_bounds(day)
+        # Decide before fetching: a pull begun before this UTC day ends cannot
+        # become a reusable complete-day checkpoint, even if midnight passes.
+        day_complete_before_fetch = date.fromisoformat(day) < _utc_today()
         orders = _fetch_orders_resilient(client, day, since, until, args.max_pages)
         sales_orders, excluded = select_sales_orders(orders, include_shops)
         for shop, n in excluded.items():
@@ -883,7 +871,13 @@ def run(args: argparse.Namespace) -> int:
         channel_maps = units_ordered_by_channel(sales_orders, registry, day, day_channels)
         days_done[day] = channel_maps
         bundle_days[day] = bundle_units_by_channel(sales_orders, registry, day, day_channels)
-        save_checkpoint(ckpt_path, state)
+        source_order_counts[day] = len(orders)
+        if not day_complete_before_fetch:
+            partial_days.add(day)
+        # Keep the in-memory partial day in this run's output, but never save
+        # it or a later day to the reusable checkpoint.
+        if not partial_days:
+            save_checkpoint(ckpt_path, state)
         per_ch = ", ".join(
             f"{channel_label(s)}:{sum(channel_maps[s].values())}"
             for s in ordered_channels(set(channel_maps))
@@ -997,7 +991,16 @@ def run(args: argparse.Namespace) -> int:
         amazon_present=AMAZON_SHOP in emit_channels,
         bundle_count=len(bundle_skus_seen),
         bundle_units=bundle_units_total,
-        generated_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),  # noqa: UP017 - Render uses Python 3.10
+        end_day_complete=end_date < _utc_today() and not partial_days,
+        source_order_count=(
+            source_order_counts[day_strs[0]]
+            if len(day_strs) == 1
+            and day_strs[0] in todo
+            and type(source_order_counts.get(day_strs[0])) is int
+            and source_order_counts[day_strs[0]] >= 0
+            else None
+        ),
     )
     guard_lines: list[str] = []
     if missing_kits:

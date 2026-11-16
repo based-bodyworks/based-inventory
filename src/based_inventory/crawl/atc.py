@@ -313,7 +313,7 @@ class AtcCrawler:
                 page_handle = tail.split("/")[0].split("?")[0] or None
             with contextlib.suppress(Exception):
                 page.wait_for_function(
-                    """(pageHandle) => {
+                    r"""(pageHandle) => {
                         // Mirrors _ATC_SCAN_JS regex: action phrase plus
                         // optional `\\s+\\$price` suffix(es); rejects
                         // marketing banners and 'ADD TO CARTRIDGE'-style
