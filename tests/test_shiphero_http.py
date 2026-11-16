@@ -119,7 +119,7 @@ def test_429_throttle_hint_remains_bounded(monkeypatch) -> None:
     assert waits == [15]
 
 
-def test_repeated_credit_contention_can_recover_after_six_shortages(monkeypatch) -> None:
+def test_repeated_credit_shortages_can_recover_after_longer_waits(monkeypatch) -> None:
     shortage = json.dumps(
         {
             "errors": [
@@ -141,7 +141,57 @@ def test_repeated_credit_contention_can_recover_after_six_shortages(monkeypatch)
 
     assert ShipHeroClient(token="secret")._execute("query")["data"] == {"ok": True}
     assert len(calls) == 8
-    assert waits == [15] * 7
+    assert waits == [15, 30, 60, 90, 90, 90, 90]
+
+
+def test_credit_backoff_resets_for_next_successful_request(monkeypatch) -> None:
+    shortage = json.dumps({"errors": [{"code": 30, "time_remaining": "1 second"}]})
+    _scripted_post(
+        monkeypatch,
+        [
+            _response(200, shortage),
+            _response(200, shortage),
+            _response(200, '{"data":{"first":true}}'),
+            _response(200, shortage),
+            _response(200, '{"data":{"second":true}}'),
+        ],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+    client = ShipHeroClient(token="secret")
+
+    assert client._execute("first", retries=2)["data"] == {"first": True}
+    assert client._execute("second", retries=1)["data"] == {"second": True}
+    assert waits == [15, 30, 15]
+
+
+def test_credit_backoff_honors_longer_provider_hint(monkeypatch) -> None:
+    shortage = json.dumps({"errors": [{"code": 30, "time_remaining": "40 seconds"}]})
+    _scripted_post(
+        monkeypatch,
+        [
+            _response(200, shortage),
+            _response(200, shortage),
+            _response(200, '{"data":{}}'),
+        ],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=2) == {"data": {}}
+    assert waits == [41, 41]
+
+
+def test_credit_backoff_still_fails_after_retry_limit(monkeypatch) -> None:
+    shortage = json.dumps({"errors": [{"code": 30, "time_remaining": "1 second"}]})
+    calls = _scripted_post(monkeypatch, [_response(200, shortage) for _ in range(4)])
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    with pytest.raises(RuntimeError, match="^ShipHero GraphQL not enough credits$"):
+        ShipHeroClient(token="secret")._execute("query", retries=3)
+    assert len(calls) == 4
+    assert waits == [15, 30, 60]
 
 
 def test_credit_wait_uses_deficit_when_provider_hint_is_too_short(monkeypatch) -> None:

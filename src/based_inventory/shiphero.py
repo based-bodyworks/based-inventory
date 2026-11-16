@@ -294,9 +294,11 @@ class ShipHeroClient:
             rate = _quota_number(quota.get("increment_rate")) or _DEFAULT_CREDIT_REFILL_RATE
             refill = max(required - remaining, 0) / rate
             hint = max(hint or 0, refill)
-        # Other ShipHero consumers share this pool. A retry exactly at the
-        # provider's refill estimate can lose every time under contention.
-        wait = min(max(math.ceil(hint if hint is not None else 60) + 1, 15), 90)
+        # The account pool can refill slowly or serve other requests. Repeated
+        # short waits can exhaust this request's retries before credits free up.
+        # The attempt count resets on the next _execute call.
+        backoff = min(15 * (2**attempt), 90)
+        wait = min(max(math.ceil(hint if hint is not None else 60) + 1, backoff), 90)
         _log.warning(
             "ShipHero credit refill: required=%s remaining=%s max=%s wait=%ss attempt=%d/%d",
             f"{required:g}" if required is not None else "unknown",
