@@ -171,6 +171,7 @@ class ShipHeroClient:
     ) -> dict[str, Any]:
         if type(retries) is not int or not 0 <= retries <= 12:
             raise ValueError("ShipHero retries must be between 0 and 12")
+        credit_shortages = 0
         for attempt in range(retries + 1):
             try:
                 r = requests.post(
@@ -185,6 +186,7 @@ class ShipHeroClient:
                 requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ContentDecodingError,
             ):
+                credit_shortages = 0
                 if attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
                     continue
@@ -202,8 +204,12 @@ class ShipHeroClient:
                         errors = throttle_payload.get("errors")
                         first = errors[0] if isinstance(errors, list) and errors else None
                         if isinstance(first, dict) and first.get("code") == 30:
-                            self._handle_credit_error(first, throttle_payload, attempt, retries)
+                            self._handle_credit_error(
+                                first, throttle_payload, attempt, retries, credit_shortages
+                            )
+                            credit_shortages += 1
                             continue
+                credit_shortages = 0
                 if status in _RETRYABLE_HTTP_STATUSES and attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
                     continue
@@ -212,6 +218,7 @@ class ShipHeroClient:
                 )
 
             if response_type == "non-json" or not r.content:
+                credit_shortages = 0
                 if attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
                     continue
@@ -221,6 +228,7 @@ class ShipHeroClient:
             try:
                 payload = r.json()
             except ValueError:
+                credit_shortages = 0
                 if attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
                     continue
@@ -228,6 +236,7 @@ class ShipHeroClient:
                     f"ShipHero HTTP {status} invalid {response_type} response after {attempt} retries"
                 ) from None
             if not isinstance(payload, dict):
+                credit_shortages = 0
                 if attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
                     continue
@@ -240,7 +249,8 @@ class ShipHeroClient:
                 if not isinstance(err, dict):
                     err = {}
                 if err.get("code") == 30:
-                    self._handle_credit_error(err, payload, attempt, retries)
+                    self._handle_credit_error(err, payload, attempt, retries, credit_shortages)
+                    credit_shortages += 1
                     continue
                 # Preserve the callers' distinct refill and window-splitting
                 # signals without echoing any provider error details.
@@ -265,7 +275,12 @@ class ShipHeroClient:
         raise RuntimeError("ShipHero retries exhausted")
 
     def _handle_credit_error(
-        self, error: dict[str, Any], payload: dict[str, Any], attempt: int, retries: int
+        self,
+        error: dict[str, Any],
+        payload: dict[str, Any],
+        attempt: int,
+        retries: int,
+        credit_shortages: int,
     ) -> None:
         """Wait for a refill on this request, or fail fast if it cannot fit."""
         quota = ((payload.get("extensions") or {}).get("throttling") or {}).get("user_quota") or {}
@@ -295,10 +310,11 @@ class ShipHeroClient:
             refill = max(required - remaining, 0) / rate
             hint = max(hint or 0, refill)
         # The account pool can refill slowly or serve other requests. Repeated
-        # short waits can exhaust this request's retries before credits free up.
-        # The attempt count resets on the next _execute call.
-        backoff = min(15 * (2**attempt), 90)
-        wait = min(max(math.ceil(hint if hint is not None else 60) + 1, backoff), 90)
+        # short waits can exhaust retries before credits free up. Only credit
+        # shortages increase this backoff; it resets after another error or
+        # when the next _execute call starts.
+        backoff = min(15 * (2**credit_shortages), 90)
+        wait = min(max(math.ceil(hint or 0) + 1, backoff), 90)
         _log.warning(
             "ShipHero credit refill: required=%s remaining=%s max=%s wait=%ss attempt=%d/%d",
             f"{required:g}" if required is not None else "unknown",

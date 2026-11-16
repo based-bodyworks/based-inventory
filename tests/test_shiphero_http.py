@@ -182,6 +182,57 @@ def test_credit_backoff_honors_longer_provider_hint(monkeypatch) -> None:
     assert waits == [41, 41]
 
 
+def test_credit_backoff_progresses_without_provider_hint(monkeypatch) -> None:
+    shortage = json.dumps({"errors": [{"code": 30}]})
+    _scripted_post(
+        monkeypatch,
+        [_response(200, shortage) for _ in range(4)] + [_response(200, '{"data":{}}')],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=4) == {"data": {}}
+    assert waits == [15, 30, 60, 90]
+
+
+def test_first_credit_shortage_after_network_error_starts_at_short_wait(monkeypatch) -> None:
+    responses = iter(
+        [_response(200, json.dumps({"errors": [{"code": 30}]})), _response(200, '{"data":{}}')]
+    )
+    calls = []
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.Timeout("private timeout")
+        return next(responses)
+
+    monkeypatch.setattr("based_inventory.shiphero.requests.post", post)
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=2) == {"data": {}}
+    assert waits == [2, 15]
+
+
+def test_credit_backoff_resets_after_noncredit_response(monkeypatch) -> None:
+    shortage = _response(200, json.dumps({"errors": [{"code": 30}]}))
+    _scripted_post(
+        monkeypatch,
+        [
+            shortage,
+            _response(503, "temporary", "text/html"),
+            shortage,
+            _response(200, '{"data":{}}'),
+        ],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=3) == {"data": {}}
+    assert waits == [15, 4, 15]
+
+
 def test_credit_backoff_still_fails_after_retry_limit(monkeypatch) -> None:
     shortage = json.dumps({"errors": [{"code": 30, "time_remaining": "1 second"}]})
     calls = _scripted_post(monkeypatch, [_response(200, shortage) for _ in range(4)])
