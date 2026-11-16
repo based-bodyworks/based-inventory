@@ -434,7 +434,6 @@ def build_about_lines(
     start_date: date,
     end_date: date,
     n_days: int,
-    line_items_cap: int,
     sku_count: int,
     total_units: int,
     channel_totals: list[tuple[str, int]],
@@ -507,7 +506,7 @@ def build_about_lines(
             "re-run with --include-shop '<name>'."
         )
     lines += [
-        f"Order lines start with first:{line_items_cap}; additional pages are fetched. Incomplete pages fail the report.",
+        "Order lines are fetched by cursor until complete; incomplete pages fail the report.",
         f"Window: {start_date} .. {end_date} ({n_days} days, UTC). "
         + (
             "All UTC days in this window are complete."
@@ -983,7 +982,6 @@ def run(args: argparse.Namespace) -> int:
         start_date=start_date,
         end_date=end_date,
         n_days=len(day_strs),
-        line_items_cap=ShipHeroClient._ORDERS_LINE_ITEMS_CAP,
         sku_count=len(sku_codes),
         total_units=total_units,
         channel_totals=channel_totals,
