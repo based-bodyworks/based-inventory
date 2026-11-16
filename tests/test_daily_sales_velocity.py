@@ -24,6 +24,7 @@ import daily_sales_velocity as dsv  # noqa: E402
 from based_inventory.registry import BundleEntry, BundleRegistry  # noqa: E402
 from based_inventory.shiphero import (  # noqa: E402
     OrdersCountChangedError,
+    OrdersPaginationUnstableError,
     ShipHeroClient,
     WarehouseStock,
 )
@@ -764,6 +765,55 @@ def test_fetch_orders_stops_after_three_changed_day_scans(monkeypatch) -> None:
         dsv._fetch_orders_resilient(client, "2026-11-14", "s", "u", 100)
     assert client.calls == 3
     assert waits == [30, 30]
+
+
+def test_fetch_orders_retries_repeated_order_with_fresh_day_scan(monkeypatch) -> None:
+    waits = []
+    cleared = []
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "previous")
+    monkeypatch.setattr(dsv, "_clear_watchdog", cleared.append)
+
+    class UnstableClient:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_orders_window(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise OrdersPaginationUnstableError("ShipHero orders pagination repeated order id")
+            return [{"id": "complete"}]
+
+    client = UnstableClient()
+    assert dsv._fetch_orders_resilient(client, "2026-11-02", "s", "u", 100) == [{"id": "complete"}]
+    assert len(client.calls) == 2
+    assert client.calls[0] == client.calls[1]
+    assert client.calls[0]["since_iso"] == "s"
+    assert client.calls[0]["until_iso"] == "u"
+    assert waits == [30]
+    assert cleared == ["previous"]
+
+
+def test_fetch_orders_stops_after_three_repeated_order_scans(monkeypatch) -> None:
+    waits = []
+    cleared = []
+    monkeypatch.setattr(dsv.time, "sleep", waits.append)
+    monkeypatch.setattr(dsv, "_set_watchdog", lambda _s: "previous")
+    monkeypatch.setattr(dsv, "_clear_watchdog", cleared.append)
+
+    class AlwaysUnstableClient:
+        calls = 0
+
+        def fetch_orders_window(self, **kwargs):
+            self.calls += 1
+            raise OrdersPaginationUnstableError("ShipHero orders pagination repeated order id")
+
+    client = AlwaysUnstableClient()
+    with pytest.raises(OrdersPaginationUnstableError, match="repeated order id"):
+        dsv._fetch_orders_resilient(client, "2026-11-02", "s", "u", 100)
+    assert client.calls == 3
+    assert waits == [30, 30]
+    assert cleared == ["previous"]
 
 
 def test_fetch_orders_resilient_does_not_restart_after_network_exhaustion(monkeypatch) -> None:

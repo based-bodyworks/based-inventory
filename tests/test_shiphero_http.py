@@ -9,7 +9,7 @@ import pytest
 import requests
 
 from based_inventory.jobs.quantity_alerts import _fetch_candidate_depletion
-from based_inventory.shiphero import ShipHeroClient
+from based_inventory.shiphero import OrdersPaginationUnstableError, ShipHeroClient
 
 
 def _response(status: int, body: str, content_type: str | None = "application/json"):
@@ -517,14 +517,6 @@ def test_order_cursor_paging_keeps_orders_with_earlier_and_equal_order_dates(mon
         ),
         ([_orders_page([_order_node("A")], more=True, cursor="next")], 1, "exceeded 1 pages"),
         ([_orders_page([], more=True, cursor="next")], 1, "empty page"),
-        (
-            [
-                _orders_page([_order_node("A")], more=True, cursor="next"),
-                _orders_page([_order_node("A")]),
-            ],
-            2,
-            "repeated order id",
-        ),
         ([_orders_page([{"order_number": "A"}])], 1, "order id missing"),
     ],
 )
@@ -536,6 +528,111 @@ def test_order_pagination_failures_never_return_partial_day(
 
     with pytest.raises(RuntimeError, match=error):
         client.fetch_orders_window("2026-11-11T00:00:00", max_pages=limit)
+
+
+def test_order_cursor_overlap_passes_when_all_unique_orders_arrive(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    calls = _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page([_order_node("A"), _order_node("B")], more=True, cursor="next", count=3),
+            _orders_page([_order_node("B"), _order_node("C")], count=3),
+        ],
+    )
+
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [order["id"] for order in result] == ["A", "B", "C"]
+    assert len([query for query, _ in calls if "total_count" in query]) == 2
+    assert len([query for query, _ in calls if "data(first: 25" in query]) == 2
+
+
+def test_order_cursor_overlap_cannot_hide_a_missing_order(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page([_order_node("A"), _order_node("B")], more=True, cursor="next", count=3),
+            _orders_page([_order_node("B")], count=3),
+        ],
+    )
+
+    with pytest.raises(OrdersPaginationUnstableError, match="total_count mismatch"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+
+
+@pytest.mark.parametrize(
+    "changed_fields",
+    [
+        {"order_date": "2026-11-11T00:41:00"},
+        {"shop_name": "Based Bodyworks Amazon"},
+    ],
+)
+def test_order_cursor_overlap_rejects_changed_order_metadata(monkeypatch, changed_fields) -> None:
+    client = ShipHeroClient(token="secret")
+    changed_order = {**_order_node("A"), **changed_fields}
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page([_order_node("A")], more=True, cursor="next", count=1),
+            _orders_page([changed_order], count=1),
+        ],
+    )
+
+    with pytest.raises(OrdersPaginationUnstableError, match="repeated order changed"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+
+
+def test_order_cursor_overlap_rejects_changed_line_quantity(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page([("line-1", "COMB", 1)]))],
+                more=True,
+                cursor="next",
+                count=1,
+            ),
+            _orders_page(
+                [_order_node("A", lines=_line_page([("line-1", "COMB", 2)]))],
+                count=1,
+            ),
+        ],
+    )
+
+    with pytest.raises(OrdersPaginationUnstableError, match="repeated order lines changed"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+
+
+def test_order_cursor_overlap_checks_line_quantity_beyond_first_page(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    first_fifteen = [(f"line-{i}", f"SKU-{i}", 1) for i in range(15)]
+    _script_client_pages(
+        monkeypatch,
+        client,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page(first_fifteen, more=True, cursor="tail"))],
+                more=True,
+                cursor="next",
+                count=1,
+            ),
+            _order_lines_page("A", _line_page([("line-15", "COMB", 1)])),
+            _orders_page(
+                [_order_node("A", lines=_line_page(first_fifteen, more=True, cursor="tail"))],
+                count=1,
+            ),
+            _order_lines_page("A", _line_page([("line-15", "COMB", 2)])),
+        ],
+    )
+
+    with pytest.raises(OrdersPaginationUnstableError, match="repeated order lines changed"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
 
 
 def test_orders_with_same_store_number_but_distinct_ids_are_not_dropped(monkeypatch) -> None:
