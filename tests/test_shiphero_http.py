@@ -777,7 +777,52 @@ def test_long_order_exhausts_all_line_pages_up_to_300(monkeypatch, total_lines) 
     line_calls = [call for call in calls if "order(id:" in call[0]]
     assert len(line_calls) == len(tail_chunks)
     assert all("line_items(first: 15, after: $line_after)" in query for query, _ in line_calls)
-    assert client._ORDERS_LINE_ITEMS_MAX_PAGES == 21
+    assert client._ORDERS_LINE_ITEMS_MAX_PAGES == 300
+
+
+@pytest.mark.parametrize("total_lines", [300, 301])
+def test_long_order_handles_short_cursor_pages_without_partial_result(
+    monkeypatch, total_lines
+) -> None:
+    client = ShipHeroClient(token="secret")
+    all_lines = [(f"line-{i}", "COMB", 1) for i in range(total_lines)]
+    answers = [
+        _orders_page(
+            [_order_node("A", lines=_line_page(all_lines[:1], more=True, cursor="line-0"))],
+            count=1,
+        )
+    ]
+    for index, line in enumerate(all_lines[1:], start=1):
+        answers.append(
+            _order_lines_page(
+                "A",
+                _line_page([line], more=index < total_lines - 1, cursor=line[0]),
+            )
+        )
+    calls = _script_client_pages(monkeypatch, client, answers)
+
+    if total_lines == 300:
+        result = client.fetch_orders_window("2026-11-11T00:00:00")
+        assert len(result[0]["line_items"]["edges"]) == 300
+        assert len([query for query, _ in calls if "order(id:" in query]) == 299
+        assert len([query for query, _ in calls if "total_count" in query]) == 2
+    else:
+        with pytest.raises(RuntimeError, match="exceeded 300 pages"):
+            client.fetch_orders_window("2026-11-11T00:00:00")
+        assert len([query for query, _ in calls if "total_count" in query]) == 1
+
+
+def test_long_order_rejects_empty_first_line_page_with_more_data(monkeypatch) -> None:
+    client = ShipHeroClient(token="secret")
+    calls = _script_client_pages(
+        monkeypatch,
+        client,
+        [_orders_page([_order_node("A", lines=_line_page(more=True, cursor="next"))])],
+    )
+
+    with pytest.raises(RuntimeError, match="line items empty page"):
+        client.fetch_orders_window("2026-11-11T00:00:00")
+    assert len([query for query, _ in calls if "order(id:" in query]) == 0
 
 
 def test_long_order_rejects_301_lines_before_count_attestation(monkeypatch) -> None:

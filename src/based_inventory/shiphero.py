@@ -996,16 +996,9 @@ class ShipHeroClient:
     _ORDERS_EMBEDDED_LINE_ITEMS_CAP = 5
     _ORDERS_LINE_ITEMS_CAP = 15
     _ORDERS_LINE_ITEMS_MAX_LINES = 300
-    _ORDERS_LINE_ITEMS_MAX_PAGES = (
-        1
-        + (
-            _ORDERS_LINE_ITEMS_MAX_LINES
-            - _ORDERS_EMBEDDED_LINE_ITEMS_CAP
-            + _ORDERS_LINE_ITEMS_CAP
-            - 1
-        )
-        // _ORDERS_LINE_ITEMS_CAP
-    )
+    # ShipHero can return fewer than requested. Every nonempty page contributes
+    # at least one new line, so 300 lines can legitimately require 300 pages.
+    _ORDERS_LINE_ITEMS_MAX_PAGES = _ORDERS_LINE_ITEMS_MAX_LINES
 
     def fetch_orders_window(
         self,
@@ -1177,6 +1170,8 @@ class ShipHeroClient:
                 seen_line_ids.add(line_id)
 
         check_ids(lines["edges"])
+        if not lines["edges"] and page_info["hasNextPage"]:
+            raise RuntimeError(f"ShipHero line items empty page for order {order['id']}")
         if len(seen_line_ids) > self._ORDERS_LINE_ITEMS_MAX_LINES:
             raise RuntimeError(
                 f"ShipHero line items exceeded {self._ORDERS_LINE_ITEMS_MAX_LINES} lines "
