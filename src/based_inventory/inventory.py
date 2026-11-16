@@ -29,7 +29,7 @@ in test_inventory.py that will fail if you wire kit numerics through.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 
 from .registry import BundleEntry, BundleRegistry
@@ -243,6 +243,7 @@ class DemandSample:
 def aggregate_orders_demand(
     orders: list[dict],
     registry: BundleRegistry,
+    known_kit_skus: Collection[str] | None = None,
 ) -> dict[str, DemandSample]:
     """Aggregate order-intake demand per component SKU over a set of orders.
 
@@ -257,10 +258,12 @@ def aggregate_orders_demand(
       - A kit line whose components are NOT pre-listed (e.g. some website
         set SKUs) is exploded into components via the BundleRegistry.
 
-    Mirrors order_physical_contents in based-packaging-optimization/
-    scripts/analyze_order_profiles.py (the verified reference): larger kits
-    are checked first so a duo doesn't claim a deluxe kit's pre-listed
-    components.
+    Nested kits are resolved to physical component SKUs before matching their
+    order lines. A child kit marker implied by its parent is structural; any
+    child quantity beyond that is a separate sale. For unrelated direct kits,
+    larger definitions are still checked first. When a parent and an identical
+    child kit are purchased separately but ShipHero lists only one child marker,
+    their lines alone cannot distinguish the separate purchase.
 
     For each component SKU we track two things:
       - units: total deduped units across all orders.
@@ -268,9 +271,51 @@ def aggregate_orders_demand(
         order is counted once per component even if the component appears both
         as a standalone line and inside a bundle line in that same order.
 
+    known_kit_skus is the warehouse's kit flag set. A flagged kit without a
+    recipe cannot safely be treated as a physical SKU, so a relevant order
+    fails instead of publishing incomplete component demand.
+
     Returns: SKU -> DemandSample.
     """
     by_bundle = registry.by_bundle_sku
+    known_kit_skus = set(known_kit_skus or ())
+    resolved_kits: dict[str, tuple[dict[str, int], int, bool]] = {}
+    resolving: set[str] = set()
+
+    def resolve_kit(sku: str) -> tuple[dict[str, int], int, bool]:
+        """Return physical leaves, nesting depth, and unresolved-component flag."""
+        if sku in resolved_kits:
+            return resolved_kits[sku]
+        if sku in resolving:
+            raise RuntimeError(f"bundle cycle involving {sku}")
+
+        resolving.add(sku)
+        try:
+            leaves: dict[str, int] = {}
+            depth = 0
+            # An empty child recipe is as unsafe as an unknown component:
+            # flattening its parent would otherwise silently lose its units.
+            unresolved = by_bundle[sku].partially_resolved or not by_bundle[sku].components_resolved
+            for comp_sku, _name, comp_qty in by_bundle[sku].components_resolved:
+                if comp_sku is None:
+                    unresolved = True
+                    continue
+                if comp_sku in registry.bundle_skus or comp_sku in known_kit_skus:
+                    if comp_sku not in by_bundle:
+                        raise RuntimeError(f"unresolved nested bundle {comp_sku} in {sku}")
+                    child_leaves, child_depth, child_unresolved = resolve_kit(comp_sku)
+                    depth = max(depth, child_depth + 1)
+                    unresolved |= child_unresolved
+                    for leaf_sku, child_qty in child_leaves.items():
+                        leaves[leaf_sku] = leaves.get(leaf_sku, 0) + child_qty * comp_qty
+                else:
+                    leaves[comp_sku] = leaves.get(comp_sku, 0) + comp_qty
+            result = (leaves, depth, unresolved)
+            resolved_kits[sku] = result
+            return result
+        finally:
+            resolving.remove(sku)
+
     units: dict[str, int] = {}
     order_count: dict[str, int] = {}
     for order in orders:
@@ -282,21 +327,54 @@ def aggregate_orders_demand(
             qty = int(n.get("quantity") or 0)
             if not sku or qty <= 0:
                 continue
+            if sku in known_kit_skus and sku not in by_bundle:
+                raise RuntimeError(f"unresolved bundle {sku}: no component recipe")
             lines[sku] = lines.get(sku, 0) + qty
 
         # Pass 2: non-kit lines are physical demand as-is; kit lines are
         # markers when pre-exploded, definitions to add when not.
         physical: dict[str, int] = {s: q for s, q in lines.items() if s not in by_bundle}
-        kit_lines = [(s, q) for s, q in lines.items() if s in by_bundle]
-        kit_lines.sort(key=lambda kq: -len(by_bundle[kq[0]].components_resolved))
-        for kit_sku, kit_qty in kit_lines:
-            needed: dict[str, int] = {}
+        available = physical.copy()
+        for kit_sku in lines:
+            if kit_sku not in by_bundle:
+                continue
+            _leaves, depth, unresolved = resolve_kit(kit_sku)
+            if unresolved and (depth or kit_sku in known_kit_skus):
+                raise RuntimeError(f"unresolved bundle components in {kit_sku}")
+
+        # A parent can imply child markers even when an intermediate marker
+        # is absent from the order. Propagate those implied quantities from
+        # parent to child, then expand only each kit's remaining sale quantity.
+        implied: dict[str, int] = {}
+        residual: dict[str, int] = {}
+        for kit_sku in sorted(resolved_kits, key=lambda s: -resolved_kits[s][1]):
+            observed = lines.get(kit_sku, 0)
+            inherited = implied.get(kit_sku, 0)
+            residual[kit_sku] = max(observed - inherited, 0)
+            effective = max(observed, inherited)
+            if not effective:
+                continue
             for comp_sku, _name, comp_qty in by_bundle[kit_sku].components_resolved:
-                if comp_sku is None:
-                    continue
-                needed[comp_sku] = needed.get(comp_sku, 0) + comp_qty * kit_qty
-            if needed and all(physical.get(c, 0) >= n for c, n in needed.items()):
-                continue  # pre-exploded: component lines already carry it
+                if comp_sku in by_bundle:
+                    implied[comp_sku] = implied.get(comp_sku, 0) + comp_qty * effective
+
+        kit_lines = [
+            (sku, qty, resolved_kits[sku][0], resolved_kits[sku][1])
+            for sku, qty in residual.items()
+            if qty > 0
+        ]
+        kit_lines.sort(key=lambda k: (-k[3], -len(by_bundle[k[0]].components_resolved)))
+        for kit_sku, kit_qty, leaves, depth in kit_lines:
+            needed = {comp_sku: comp_qty * kit_qty for comp_sku, comp_qty in leaves.items()}
+            # Reserve pre-listed leaves only within a nested family. Direct,
+            # unrelated kits retain their prior shared-line matching rule.
+            nested_family = depth > 0 or implied.get(kit_sku, 0) > 0
+            matching_lines = available if nested_family else physical
+            if needed and all(matching_lines.get(c, 0) >= n for c, n in needed.items()):
+                if nested_family:
+                    for comp_sku, n in needed.items():
+                        available[comp_sku] -= n
+                continue  # pre-listed component lines already carry this demand
             for comp_sku, n in needed.items():
                 physical[comp_sku] = physical.get(comp_sku, 0) + n
 

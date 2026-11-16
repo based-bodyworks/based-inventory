@@ -118,6 +118,12 @@ def test_units_ordered_for_day_empty_day() -> None:
     assert dsv.units_ordered_for_day([], _registry(), "2026-03-01") == {}
 
 
+def test_units_ordered_for_day_passes_stock_kit_flags_to_demand() -> None:
+    orders = [_order("2026-03-01T08:00:00", ("UNKNOWN", 1))]
+    with pytest.raises(RuntimeError, match="unresolved bundle UNKNOWN"):
+        dsv.units_ordered_for_day(orders, _registry(), "2026-03-01", known_kit_skus={"UNKNOWN"})
+
+
 # --- channel allowlist ------------------------------------------------------
 def test_select_sales_orders_partitions_and_counts_excluded() -> None:
     orders = [
@@ -230,6 +236,15 @@ def test_units_ordered_by_channel_empty_channel_present() -> None:
     ]
     out = dsv.units_ordered_by_channel(orders, _registry(), "2026-03-01", {"BASED", "X"})
     assert out["X"] == {}  # channel with no sales still appears (stable tabs)
+
+
+def test_units_ordered_by_channel_passes_stock_kit_flags_to_day() -> None:
+    order = _order("2026-03-01T08:00:00", ("UNKNOWN", 1))
+    order["shop_name"] = "BASED"
+    with pytest.raises(RuntimeError, match="unresolved bundle UNKNOWN"):
+        dsv.units_ordered_by_channel(
+            [order], _registry(), "2026-03-01", {"BASED"}, known_kit_skus={"UNKNOWN"}
+        )
 
 
 def test_ordered_channels_known_first_then_alpha() -> None:
@@ -516,7 +531,7 @@ def test_sheet_title_is_excel_safe() -> None:
 def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -> None:
     """One synthetic day through run(): channel grids stay exploded-only, the
     bundle view lands in .bundles.csv + the BUNDLE SALES tab, and a legacy
-    checkpoint is rebuilt with the corrected order pagination."""
+    checkpoint is rebuilt with the corrected demand calculation."""
     import csv
     import json
 
@@ -564,7 +579,7 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     (tmp_path / f"{slug}.checkpoint.json").write_text(
         json.dumps(
             {
-                "schema": 3,
+                "schema": 6,
                 "definition": dsv.DEFINITION,
                 "warehouse_id": dsv.MERCHDROP_WAREHOUSE_ID,
                 "include_shops": sorted(dsv.DEFAULT_SALES_CHANNELS),
@@ -601,7 +616,7 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     assert ["2026-03-01", "Curly Kit", "TIKTOK", 2, "KIT1"] in data
     # The old cached day was discarded; the new checkpoint has bundle_days.
     ckpt = json.loads((tmp_path / f"{slug}.checkpoint.json").read_text())
-    assert ckpt["schema"] == 6
+    assert ckpt["schema"] == 7
     assert ckpt["catalog_fingerprint"] == dsv.catalog_fingerprint(stock, _registry())
     assert ckpt["source_order_counts"] == {"2026-03-01": 2}
     assert ckpt["bundle_days"]["2026-03-01"]["BASED"] == {"KIT1": 2}
@@ -658,7 +673,7 @@ def test_partial_utc_day_is_refetched_after_midnight(tmp_path, monkeypatch) -> N
     assert dsv.run(args) == 0
     assert client.calls == 2
     assert "Order coverage at extraction:" in readme_path.read_text()
-    assert json.loads(ckpt_path.read_text())["schema"] == 6
+    assert json.loads(ckpt_path.read_text())["schema"] == 7
     assert json.loads(ckpt_path.read_text())["line_items_cap"] == 15
     assert dsv.ShipHeroClient._ORDERS_EMBEDDED_LINE_ITEMS_CAP == 5
     assert "All UTC days in this window are complete." in readme_path.read_text()
@@ -729,11 +744,35 @@ def test_changed_bundle_recipe_refetches_cached_day(tmp_path, monkeypatch) -> No
     assert client.calls == 2
 
     current_stock["value"] = [
-        _stock("BB-CC", "Curl Cream", is_kit=True),
+        _stock("BB-CC", "Curl Cream"),
         _stock("BB-SHMP", "Shampoo"),
+        _stock("UNUSED-KIT", "Unused Kit", is_kit=True),
     ]
     assert dsv.run(args) == 0
     assert client.calls == 3
+
+
+def test_run_fails_before_publishing_unknown_stock_kit_demand(tmp_path, monkeypatch) -> None:
+    class FakeClient:
+        def fetch_orders_window(self, **_kwargs):
+            order = _order("2026-03-01T01:00:00", ("UNKNOWN", 1))
+            order["shop_name"] = "BASED"
+            return [order]
+
+    monkeypatch.setattr(dsv, "_build_client", lambda _floor: FakeClient())
+    monkeypatch.setattr(
+        dsv,
+        "_load_catalog",
+        lambda _client: ([_stock("UNKNOWN", "Unknown Kit", is_kit=True)], _registry()),
+    )
+    args = dsv.build_arg_parser().parse_args(
+        ["--start-date", "2026-03-01", "--end-date", "2026-03-01", "--out-dir", str(tmp_path)]
+    )
+    with pytest.raises(RuntimeError, match="unresolved bundle UNKNOWN"):
+        dsv.run(args)
+    assert not list(tmp_path.glob("*.xlsx"))
+    assert not list(tmp_path.glob("*.csv"))
+    assert not list(tmp_path.glob("*.checkpoint.json"))
 
 
 # --- never repeat a completed day's pages after a failed request ------------

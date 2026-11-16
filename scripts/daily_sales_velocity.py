@@ -159,9 +159,9 @@ CHANNEL_ORDER = (
     "BASED",
 )
 
-# v5 also invalidates checkpoints that may contain a day fetched before it ended.
-# A cached day must be complete before it can ever be reused as complete.
-CHECKPOINT_SCHEMA = 6
+# Rebuild cached days whenever extraction or physical-demand rules change.
+# Schema 7 includes nested-kit handling and the missing-recipe guard.
+CHECKPOINT_SCHEMA = 7
 
 
 def _utc_today() -> date:
@@ -218,7 +218,10 @@ def select_sales_orders(
 
 
 def units_ordered_for_day(
-    orders: list[dict], registry: BundleRegistry, day_str: str
+    orders: list[dict],
+    registry: BundleRegistry,
+    day_str: str,
+    known_kit_skus: set[str] | None = None,
 ) -> dict[str, int]:
     """Exploded component-SKU -> units ordered, for orders whose order_date is day_str.
 
@@ -232,12 +235,16 @@ def units_ordered_for_day(
     function assumes `orders` is already restricted to real sales channels.
     """
     day_orders = [o for o in orders if (o.get("order_date") or "")[:10] == day_str]
-    demand = aggregate_orders_demand(day_orders, registry)
+    demand = aggregate_orders_demand(day_orders, registry, known_kit_skus=known_kit_skus)
     return {sku: sample.units for sku, sample in demand.items() if sample.units}
 
 
 def units_ordered_by_channel(
-    orders: list[dict], registry: BundleRegistry, day_str: str, channels: set[str]
+    orders: list[dict],
+    registry: BundleRegistry,
+    day_str: str,
+    channels: set[str],
+    known_kit_skus: set[str] | None = None,
 ) -> dict[str, dict[str, int]]:
     """Per-channel {shop_name -> {sku -> units}} for one day.
 
@@ -249,7 +256,9 @@ def units_ordered_by_channel(
     out: dict[str, dict[str, int]] = {}
     for shop in channels:
         shop_orders = [o for o in orders if (o.get("shop_name") or "(none)") == shop]
-        out[shop] = units_ordered_for_day(shop_orders, registry, day_str)
+        out[shop] = units_ordered_for_day(
+            shop_orders, registry, day_str, known_kit_skus=known_kit_skus
+        )
     return out
 
 
@@ -286,9 +295,8 @@ def bundle_units_by_channel(
 def unregistered_kit_skus(stock: list[WarehouseStock], registry: BundleRegistry) -> set[str]:
     """Warehouse SKUs flagged is_kit but absent from the bundle registry.
 
-    Such a SKU's demand would be silently DROPPED by build_sku_universe (it is
-    excluded as a kit but never exploded into components), so any non-empty
-    result must be reported loudly, not swallowed.
+    Such a SKU has no component recipe. Demand aggregation stops if it occurs
+    in a counted order; otherwise the missing definition is reported.
     """
     return {s.sku for s in stock if s.is_kit} - registry.bundle_skus
 
@@ -298,10 +306,9 @@ def nested_bundle_skus(registry: BundleRegistry) -> set[str]:
 
     ShipHero pre-explodes kit components as their own order lines, so a bundle
     nested inside a larger kit shows up as a line on the parent's orders and
-    the AS-SOLD view would count it on top of the parent -- an overcount in
-    the visibility numbers (the exploded demand path is unaffected; its marker
-    logic handles nesting). None exist today; this feeds a warning if one
-    ever appears.
+    the AS-SOLD view can count it on top of the parent. Physical component
+    demand handles nesting separately. This feeds a warning when a nested kit
+    appears in the bundle view.
     """
     out: set[str] = set()
     for entry in registry.bundles:
@@ -805,6 +812,7 @@ def run(args: argparse.Namespace) -> int:
 
     client = _build_client(args.credits_floor)
     stock, registry = _load_catalog(client)
+    known_kit_skus = {item.sku for item in stock if item.is_kit}
     catalog_hash = catalog_fingerprint(stock, registry)
 
     # --- checkpoint state ---
@@ -869,7 +877,9 @@ def run(args: argparse.Namespace) -> int:
             if include_shops is not None
             else {o.get("shop_name") or "(none)" for o in sales_orders}
         )
-        channel_maps = units_ordered_by_channel(sales_orders, registry, day, day_channels)
+        channel_maps = units_ordered_by_channel(
+            sales_orders, registry, day, day_channels, known_kit_skus=known_kit_skus
+        )
         days_done[day] = channel_maps
         bundle_days[day] = bundle_units_by_channel(sales_orders, registry, day, day_channels)
         source_order_counts[day] = len(orders)
@@ -952,12 +962,12 @@ def run(args: argparse.Namespace) -> int:
         )
     bundle_units_total = sum(qty for _l, rows in bundle_channel_rows for _d, _n, qty, _c in rows)
 
-    # --- coverage guards: an unregistered bundle must never vanish silently ---
+    # --- coverage guards: a missing recipe must never vanish silently ---
     missing_kits = unregistered_kit_skus(stock, registry)
     if missing_kits:
         logger.warning(
-            "COVERAGE GUARD: %d kit-flagged SKUs missing from the bundle registry -- their "
-            "demand is being DROPPED, not exploded: %s",
+            "COVERAGE GUARD: %d kit-flagged SKUs lack a component recipe; none appeared in "
+            "counted orders (the run stops if one does): %s",
             len(missing_kits),
             ", ".join(sorted(missing_kits)),
         )
@@ -1006,7 +1016,8 @@ def run(args: argparse.Namespace) -> int:
     if missing_kits:
         guard_lines.append(
             f"WARNING: {len(missing_kits)} kit-flagged SKUs missing from the bundle registry "
-            f"(their demand is dropped): {', '.join(sorted(missing_kits))}"
+            f"(none appeared in counted orders; a sale would stop the run): "
+            f"{', '.join(sorted(missing_kits))}"
         )
     if stray_bundles:
         guard_lines.append(
