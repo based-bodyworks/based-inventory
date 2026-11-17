@@ -192,6 +192,7 @@ def test_truncated_response_retries_same_read(monkeypatch, error_type) -> None:
 
 def test_credit_refill_waits_and_retries_only_the_current_request(monkeypatch, caplog) -> None:
     shortage = {
+        "request_id": "req-123",
         "errors": [
             {
                 "message": "There are not enough credits: private-provider-detail",
@@ -201,7 +202,13 @@ def test_credit_refill_waits_and_retries_only_the_current_request(monkeypatch, c
                 "time_remaining": "17 seconds",
             }
         ],
-        "extensions": {"throttling": {"user_quota": {"max_available": 4004}}},
+        "extensions": {
+            "throttling": {
+                "estimated_complexity": 1601,
+                "cost": 0,
+                "user_quota": {"max_available": 4004, "credits_remaining": 594},
+            }
+        },
     }
     calls = _scripted_post(
         monkeypatch,
@@ -215,8 +222,27 @@ def test_credit_refill_waits_and_retries_only_the_current_request(monkeypatch, c
     assert waits == [18]
     assert "required=1601" in caplog.text
     assert "remaining=594" in caplog.text
+    assert "request_id=req-123" in caplog.text
+    assert "estimated=1601 cost=0" in caplog.text
+    assert "quota_remaining=594" in caplog.text
     assert "private-provider-detail" not in caplog.text
     assert "secret" not in caplog.text
+
+
+def test_credit_log_rejects_unbounded_request_id(monkeypatch, caplog) -> None:
+    shortage = {
+        "request_id": "private token secret / unsafe",
+        "errors": [{"code": 30, "time_remaining": "1 second"}],
+    }
+    _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(shortage)), _response(200, '{"data":{}}')],
+    )
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", lambda _: None)
+
+    assert ShipHeroClient(token="secret")._execute("query", retries=1) == {"data": {}}
+    assert "request_id=unknown" in caplog.text
+    assert "private token secret" not in caplog.text
 
 
 @pytest.mark.parametrize("include_quota", [True, False])
@@ -720,6 +746,537 @@ def test_credit_refill_retries_same_order_cursor_page(monkeypatch) -> None:
     variables = [call[1]["json"]["variables"] for call in calls]
     assert [value.get("after") for value in variables] == [None, None, "cursor-a", "cursor-a", None]
     assert waits == [0.2, 15]
+
+
+def _credit_shortage(remaining: int = 56, required: int = 151) -> dict:
+    return {
+        "request_id": f"req-{remaining}",
+        "errors": [
+            {
+                "code": 30,
+                "message": "There are not enough credits",
+                "required_credits": required,
+                "remaining_credits": remaining,
+                "time_remaining": "1 second",
+            }
+        ],
+        "extensions": {
+            "throttling": {
+                "estimated_complexity": required,
+                "cost": 0,
+                "user_quota": {
+                    "max_available": 4004,
+                    "increment_rate": 60,
+                    "credits_remaining": remaining,
+                },
+            }
+        },
+    }
+
+
+def _with_quota(payload: dict, remaining: int, rate: int = 60) -> dict:
+    return {
+        **payload,
+        "extensions": {
+            "throttling": {"user_quota": {"credits_remaining": remaining, "increment_rate": rate}}
+        },
+    }
+
+
+def _script_credit_fallback(
+    monkeypatch, pages, *, initial_count: int, final_count: int | None = None
+):
+    def count(value):
+        return {"data": {"orders": {"data": {"total_count": value}}}}
+
+    responses = [count(initial_count), *[_credit_shortage(n) for n in (56, 110, 63)]]
+    responses.extend(pages)
+    responses.append(count(initial_count if final_count is None else final_count))
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+    return calls, waits
+
+
+def _order_page_calls(calls):
+    return [
+        call[1]["json"]
+        for call in calls
+        if "edges" in call[1]["json"]["query"] and "orders(" in call[1]["json"]["query"]
+    ]
+
+
+def test_credit_fallback_retries_same_order_cursor_with_smaller_pages(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 2}}}}
+    first = _orders_page([_order_node("A")], more=True, cursor="cursor-a", count=2)
+    second = _orders_page([_order_node("B")], count=2)
+    responses = [count, first, *[_credit_shortage(n) for n in (56, 110, 63)], second, count]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    client = ShipHeroClient(token="secret")
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [order["id"] for order in result] == ["A", "B"]
+    page_calls = _order_page_calls(calls)
+    assert [call["variables"]["after"] for call in page_calls] == [
+        None,
+        "cursor-a",
+        "cursor-a",
+        "cursor-a",
+        "cursor-a",
+    ]
+    assert all("data(first: 25, after: $after)" in call["query"] for call in page_calls[:4])
+    assert all("line_items(first: 5)" in call["query"] for call in page_calls[:4])
+    assert "data(first: 10, after: $after)" in page_calls[-1]["query"]
+    assert "line_items(first: 3)" in page_calls[-1]["query"]
+    assert 1 + client._ORDERS_PAGE_SIZE * (1 + client._ORDERS_EMBEDDED_LINE_ITEMS_CAP) == 151
+    assert (
+        1
+        + client._ORDERS_LOW_CREDIT_PAGE_SIZE
+        * (1 + client._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP)
+        == 41
+    )
+    assert waits == [0.2, 15, 15]
+
+
+def test_credit_fallback_finishes_nested_line_pagination(monkeypatch) -> None:
+    first_three = [(f"line-{i}", "COMB", 1) for i in range(3)]
+    calls, _ = _script_credit_fallback(
+        monkeypatch,
+        [
+            _orders_page(
+                [_order_node("A", lines=_line_page(first_three, more=True, cursor="line-2"))],
+                count=1,
+            ),
+            _order_lines_page("A", _line_page([("line-3", "GEL", 2), ("line-4", "OIL", 3)])),
+        ],
+        initial_count=1,
+    )
+
+    result = ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [edge["node"]["id"] for edge in result[0]["line_items"]["edges"]] == [
+        f"line-{i}" for i in range(5)
+    ]
+    line_calls = [call[1]["json"] for call in calls if "order(id:" in call[1]["json"]["query"]]
+    assert len(line_calls) == 1
+    assert line_calls[0]["variables"] == {"order_id": "A", "line_after": "line-2"}
+    assert "line_items(first: 15, after: $line_after)" in line_calls[0]["query"]
+
+
+def test_low_credit_pages_and_lines_use_small_pacing_floor_only_during_scan(
+    monkeypatch,
+) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 2}}}}
+    first_three = [(f"line-{i}", "COMB", 1) for i in range(3)]
+    low_page_one = _orders_page(
+        [_order_node("A", lines=_line_page(first_three, more=True, cursor="line-2"))],
+        more=True,
+        cursor="order-a",
+        count=2,
+    )
+    low_page_two = _orders_page([_order_node("B")], count=2)
+    responses = [
+        _with_quota(count, 2000),
+        *[_credit_shortage(n) for n in (56, 110, 63)],
+        _with_quota(low_page_one, 0),
+        _with_quota(_order_lines_page("A", _line_page([("line-3", "GEL", 2)])), 0),
+        _with_quota(low_page_two, 110),
+        _with_quota(count, 0),
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    client = ShipHeroClient(token="secret", min_credits_floor=2000)
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [order["id"] for order in result] == ["A", "B"]
+    assert len(result[0]["line_items"]["edges"]) == 4
+    assert client.min_credits_floor == 2000
+    assert waits == pytest.approx([15, 15, 100 / 60, 100 / 60, 0.2, 2000 / 60])
+    page_calls = _order_page_calls(calls)
+    assert [call["variables"]["after"] for call in page_calls] == [
+        None,
+        None,
+        None,
+        None,
+        "order-a",
+    ]
+    assert len([call for call in calls if "total_count" in call[1]["json"]["query"]]) == 2
+
+
+def test_low_credit_pacing_obeys_client_sleep_cap(monkeypatch) -> None:
+    calls, waits = _script_credit_fallback(
+        monkeypatch,
+        [_with_quota(_orders_page([_order_node("A")], count=1), 0, rate=1)],
+        initial_count=1,
+    )
+
+    client = ShipHeroClient(token="secret", min_credits_floor=2000, max_pacing_sleep=0.5)
+    assert [order["id"] for order in client.fetch_orders_window("2026-11-11T00:00:00")] == ["A"]
+    assert waits == [15, 15, 0.5]
+    assert len(_order_page_calls(calls)) == 4
+
+
+def test_low_credit_line_query_keeps_reactive_credit_wait(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 1}}}}
+    first_three = [(f"line-{i}", "COMB", 1) for i in range(3)]
+    page = _orders_page(
+        [_order_node("A", lines=_line_page(first_three, more=True, cursor="line-2"))],
+        count=1,
+    )
+    responses = [
+        count,
+        *[_credit_shortage(n) for n in (56, 110, 63)],
+        _with_quota(page, 0),
+        _credit_shortage(0, required=16),
+        _with_quota(_order_lines_page("A", _line_page([("line-3", "GEL", 2)])), 0),
+        count,
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    result = ShipHeroClient(token="secret", min_credits_floor=2000).fetch_orders_window(
+        "2026-11-11T00:00:00"
+    )
+
+    assert len(result[0]["line_items"]["edges"]) == 4
+    assert waits == pytest.approx([15, 15, 100 / 60, 15, 100 / 60])
+    line_calls = [call[1]["json"] for call in calls if "order(id:" in call[1]["json"]["query"]]
+    assert [call["variables"]["line_after"] for call in line_calls] == ["line-2", "line-2"]
+
+
+def test_low_credit_pacing_does_not_enable_disabled_client_pacing(monkeypatch) -> None:
+    _, waits = _script_credit_fallback(
+        monkeypatch,
+        [_with_quota(_orders_page([_order_node("A")], count=1), 0)],
+        initial_count=1,
+    )
+
+    client = ShipHeroClient(token="secret", min_credits_floor=0)
+    assert [order["id"] for order in client.fetch_orders_window("2026-11-11T00:00:00")] == ["A"]
+    assert waits == [15, 15]
+
+
+def test_order_scan_uses_scoped_pacing_before_small_page_switch(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 1}}}}
+    first_five = [(f"line-{i}", "COMB", 1) for i in range(5)]
+    responses = [
+        _with_quota(count, 2000),
+        _with_quota(
+            _orders_page(
+                [_order_node("A", lines=_line_page(first_five, more=True, cursor="line-4"))],
+                count=1,
+            ),
+            500,
+        ),
+        _with_quota(_order_lines_page("A", _line_page([("line-5", "GEL", 2)])), 0),
+        _with_quota(count, 0),
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    client = ShipHeroClient(token="secret", min_credits_floor=2000)
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+
+    assert len(result[0]["line_items"]["edges"]) == 6
+    assert waits == pytest.approx([100 / 60, 2000 / 60])
+    assert client.min_credits_floor == 2000
+    assert len(_order_page_calls(calls)) == 1
+
+
+@pytest.mark.parametrize("remaining", [0, 110, 151])
+def test_successful_full_page_low_quota_switches_next_cursor_without_code_30(
+    monkeypatch, remaining
+) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 26}}}}
+    first_page = _orders_page(
+        [_order_node(f"A-{i}") for i in range(25)], more=True, cursor="after-25", count=26
+    )
+    responses = [
+        count,
+        _with_quota(first_page, remaining),
+        _with_quota(_orders_page([_order_node("B")], count=26), 110),
+        count,
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    result = ShipHeroClient(token="secret", min_credits_floor=2000).fetch_orders_window(
+        "2026-11-11T00:00:00"
+    )
+
+    assert len(result) == 26
+    page_calls = _order_page_calls(calls)
+    assert [call["variables"]["after"] for call in page_calls] == [None, "after-25"]
+    assert "data(first: 25, after: $after)" in page_calls[0]["query"]
+    assert "data(first: 10, after: $after)" in page_calls[1]["query"]
+    assert waits == pytest.approx(([100 / 60] if remaining == 0 else []) + [0.2])
+
+
+def test_successful_full_pages_do_not_wait_for_2000_before_quota_switch(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 76}}}}
+    third_page_nodes = [_order_node(f"C-{i}") for i in range(24)]
+    first_five = [(f"line-{i}", "COMB", 1) for i in range(5)]
+    third_page_nodes.append(
+        _order_node("C-24", lines=_line_page(first_five, more=True, cursor="line-4"))
+    )
+    responses = [
+        _with_quota(count, 2000),
+        _with_quota(
+            _orders_page(
+                [_order_node(f"A-{i}") for i in range(25)],
+                more=True,
+                cursor="after-a",
+                count=76,
+            ),
+            1500,
+        ),
+        _with_quota(
+            _orders_page(
+                [_order_node(f"B-{i}") for i in range(25)],
+                more=True,
+                cursor="after-b",
+                count=76,
+            ),
+            500,
+        ),
+        _with_quota(
+            _orders_page(third_page_nodes, more=True, cursor="after-c", count=76),
+            110,
+        ),
+        _with_quota(_order_lines_page("C-24", _line_page([("line-5", "GEL", 2)])), 0),
+        _with_quota(_orders_page([_order_node("D")], count=76), 0),
+        _with_quota(count, 0),
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    result = ShipHeroClient(token="secret", min_credits_floor=2000).fetch_orders_window(
+        "2026-11-11T00:00:00"
+    )
+
+    assert len(result) == 76
+    assert len(result[74]["line_items"]["edges"]) == 6
+    page_calls = _order_page_calls(calls)
+    assert [call["variables"]["after"] for call in page_calls] == [
+        None,
+        "after-a",
+        "after-b",
+        "after-c",
+    ]
+    assert all("data(first: 25, after: $after)" in call["query"] for call in page_calls[:3])
+    assert "data(first: 10, after: $after)" in page_calls[3]["query"]
+    assert waits == pytest.approx([0.2, 0.2, 100 / 60, 0.2, 100 / 60, 2000 / 60])
+
+
+def test_proactive_small_page_switch_still_rejects_missing_unique_order(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 2}}}}
+    responses = [
+        count,
+        _with_quota(_orders_page([_order_node("A")], more=True, cursor="next", count=2), 0),
+        _with_quota(_orders_page([_order_node("A")], count=2), 0),
+        count,
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", lambda _: None)
+
+    with pytest.raises(OrdersPaginationUnstableError, match="total_count mismatch"):
+        ShipHeroClient(token="secret", min_credits_floor=2000).fetch_orders_window(
+            "2026-11-11T00:00:00"
+        )
+
+    page_calls = _order_page_calls(calls)
+    assert "data(first: 10, after: $after)" in page_calls[1]["query"]
+    assert page_calls[1]["variables"]["after"] == "next"
+
+
+def test_low_credit_line_failure_still_stops_before_final_count(monkeypatch) -> None:
+    first_three = [(f"line-{i}", "COMB", 1) for i in range(3)]
+    calls, waits = _script_credit_fallback(
+        monkeypatch,
+        [
+            _with_quota(
+                _orders_page(
+                    [_order_node("A", lines=_line_page(first_three, more=True, cursor="line-2"))],
+                    count=1,
+                ),
+                0,
+            ),
+            _with_quota(
+                _order_lines_page("A", _line_page([("line-2", "COMB", 1)])),
+                0,
+            ),
+        ],
+        initial_count=1,
+    )
+
+    with pytest.raises(RuntimeError, match="repeated line id"):
+        ShipHeroClient(token="secret", min_credits_floor=2000).fetch_orders_window(
+            "2026-11-11T00:00:00"
+        )
+    assert waits == pytest.approx([15, 15, 100 / 60, 100 / 60])
+    assert len([call for call in calls if "total_count" in call[1]["json"]["query"]]) == 1
+
+
+def test_credit_fallback_accepts_short_pages_and_dedupes_order_overlap(monkeypatch) -> None:
+    calls, _ = _script_credit_fallback(
+        monkeypatch,
+        [
+            _orders_page([_order_node("A")], more=True, cursor="one", count=3),
+            _orders_page([_order_node("A"), _order_node("B")], more=True, cursor="two", count=3),
+            _orders_page([_order_node("C")], count=3),
+        ],
+        initial_count=3,
+    )
+
+    result = ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+
+    assert [order["id"] for order in result] == ["A", "B", "C"]
+    small_calls = _order_page_calls(calls)[3:]
+    assert len(small_calls) == 3
+    assert [call["variables"]["after"] for call in small_calls] == [None, "one", "two"]
+    assert all("data(first: 10, after: $after)" in call["query"] for call in small_calls)
+
+
+def test_credit_fallback_rejects_missing_unique_order_after_overlap(monkeypatch) -> None:
+    _script_credit_fallback(
+        monkeypatch,
+        [
+            _orders_page([_order_node("A")], more=True, cursor="one", count=2),
+            _orders_page([_order_node("A")], count=2),
+        ],
+        initial_count=2,
+    )
+
+    with pytest.raises(OrdersPaginationUnstableError, match="total_count mismatch"):
+        ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+
+
+def test_credit_fallback_preserves_max_pages_guard(monkeypatch) -> None:
+    calls, _ = _script_credit_fallback(
+        monkeypatch,
+        [_orders_page([_order_node("A")], more=True, cursor="next", count=2)],
+        initial_count=2,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded 1 pages"):
+        ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00", max_pages=1)
+    assert len([call for call in calls if "total_count" in call[1]["json"]["query"]]) == 1
+
+
+def test_credit_fallback_keeps_count_change_signal(monkeypatch) -> None:
+    _script_credit_fallback(
+        monkeypatch,
+        [_orders_page([_order_node("A")], count=1)],
+        initial_count=1,
+        final_count=2,
+    )
+
+    with pytest.raises(RuntimeError, match="orders total_count changed"):
+        ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+
+
+def test_credit_fallback_still_fails_if_small_pages_cannot_get_credits(monkeypatch) -> None:
+    calls, _ = _script_credit_fallback(
+        monkeypatch,
+        [_credit_shortage(5) for _ in range(13)],
+        initial_count=1,
+    )
+
+    with pytest.raises(RuntimeError, match="^ShipHero GraphQL not enough credits$"):
+        ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+    assert len(_order_page_calls(calls)) == 16
+    assert len([call for call in calls if "total_count" in call[1]["json"]["query"]]) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "error"),
+    [
+        ({"errors": [{"message": "unrelated GraphQL failure"}]}, "GraphQL error"),
+        ({"errors": [{"message": "There are not enough credits"}]}, "not enough credits"),
+        (
+            {
+                "errors": [
+                    {
+                        "code": 30,
+                        "message": "operation requires too many credits",
+                        "required_credits": 5000,
+                    }
+                ]
+            },
+            "credits limit",
+        ),
+    ],
+)
+def test_credit_fallback_does_not_switch_on_other_errors(monkeypatch, failure, error) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 1}}}}
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in (count, failure)],
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+
+    page_calls = _order_page_calls(calls)
+    assert len(page_calls) == 1
+    assert "data(first: 25, after: $after)" in page_calls[0]["query"]
+
+
+def test_credit_fallback_keeps_http_retries_on_large_page(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 1}}}}
+    calls = _scripted_post(
+        monkeypatch,
+        [
+            _response(200, json.dumps(count)),
+            _response(503, "temporary outage", "text/html"),
+            _response(200, json.dumps(_orders_page([_order_node("A")], count=1))),
+            _response(200, json.dumps(count)),
+        ],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    assert [
+        order["id"]
+        for order in ShipHeroClient(token="secret").fetch_orders_window("2026-11-11T00:00:00")
+    ] == ["A"]
+    page_calls = _order_page_calls(calls)
+    assert len(page_calls) == 2
+    assert all("data(first: 25, after: $after)" in call["query"] for call in page_calls)
+    assert waits == [2]
 
 
 def test_long_order_fetches_remaining_line_items_by_order_cursor(monkeypatch) -> None:

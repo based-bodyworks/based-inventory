@@ -80,6 +80,13 @@ def _credit_wait_hint(value: Any) -> float | None:
     return seconds * (60 if (match.group(2) or "").lower().startswith("minute") else 1)
 
 
+def _request_id_for_log(value: Any) -> str:
+    """Only log short request IDs, never an arbitrary provider response string."""
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value):
+        return value
+    return "unknown"
+
+
 def _response_type(response: requests.Response) -> str:
     """Classify the content type without echoing a provider header into logs."""
     media_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -145,6 +152,28 @@ class OrdersPaginationUnstableError(RuntimeError):
     """A cursor scan could not prove complete, stable order coverage."""
 
 
+class _CreditRefillExhaustedError(RuntimeError):
+    """A code-30 shortage persisted through this request's credit retries."""
+
+
+class _PacingFloorQuery(str):
+    """Limit proactive pacing for one query without changing the client default."""
+
+    def __new__(cls, query: str, floor: int) -> _PacingFloorQuery:
+        instance = super().__new__(cls, query)
+        instance.floor = floor
+        return instance
+
+
+class _CreditRetryQuery(_PacingFloorQuery):
+    """Also bound code-30 retries without changing other retry behavior."""
+
+    def __new__(cls, query: str, credit_retries: int, floor: int) -> _CreditRetryQuery:
+        instance = super().__new__(cls, query, floor)
+        instance.credit_retries = credit_retries
+        return instance
+
+
 class ShipHeroClient:
     def __init__(
         self,
@@ -171,6 +200,7 @@ class ShipHeroClient:
     ) -> dict[str, Any]:
         if type(retries) is not int or not 0 <= retries <= 12:
             raise ValueError("ShipHero retries must be between 0 and 12")
+        credit_failures = 0
         for attempt in range(retries + 1):
             try:
                 r = requests.post(
@@ -202,7 +232,9 @@ class ShipHeroClient:
                         errors = throttle_payload.get("errors")
                         first = errors[0] if isinstance(errors, list) and errors else None
                         if isinstance(first, dict) and first.get("code") == 30:
-                            self._handle_credit_error(first, throttle_payload, attempt, retries)
+                            credit_failures = self._retry_credit_error(
+                                query, first, throttle_payload, attempt, retries, credit_failures
+                            )
                             continue
                 if status in _RETRYABLE_HTTP_STATUSES and attempt < retries:
                     time.sleep(min(2**attempt * 2, 30))
@@ -240,7 +272,9 @@ class ShipHeroClient:
                 if not isinstance(err, dict):
                     err = {}
                 if err.get("code") == 30:
-                    self._handle_credit_error(err, payload, attempt, retries)
+                    credit_failures = self._retry_credit_error(
+                        query, err, payload, attempt, retries, credit_failures
+                    )
                     continue
                 # Preserve the callers' distinct refill and window-splitting
                 # signals without echoing any provider error details.
@@ -260,15 +294,38 @@ class ShipHeroClient:
                 if any("credits" in message for message in messages):
                     raise RuntimeError("ShipHero GraphQL credits limit")
                 raise RuntimeError("ShipHero GraphQL error")
-            self._pace_from_quota(payload)
+            floor_override = query.floor if isinstance(query, _PacingFloorQuery) else None
+            self._pace_from_quota(payload, floor_override)
             return payload
         raise RuntimeError("ShipHero retries exhausted")
+
+    def _retry_credit_error(
+        self,
+        query: str,
+        error: dict[str, Any],
+        payload: dict[str, Any],
+        attempt: int,
+        retries: int,
+        credit_failures: int,
+    ) -> int:
+        if isinstance(query, _CreditRetryQuery):
+            credit_retries = min(query.credit_retries, retries)
+            credit_attempt = credit_retries if attempt >= retries else credit_failures
+            self._handle_credit_error(error, payload, credit_attempt, credit_retries)
+        else:
+            self._handle_credit_error(error, payload, attempt, retries)
+        return credit_failures + 1
 
     def _handle_credit_error(
         self, error: dict[str, Any], payload: dict[str, Any], attempt: int, retries: int
     ) -> None:
         """Wait for a refill on this request, or fail fast if it cannot fit."""
-        quota = ((payload.get("extensions") or {}).get("throttling") or {}).get("user_quota") or {}
+        throttling = (payload.get("extensions") or {}).get("throttling") or {}
+        quota = throttling.get("user_quota") or {}
+        request_id = _request_id_for_log(payload.get("request_id") or error.get("request_id"))
+        estimated = _quota_number(throttling.get("estimated_complexity"))
+        cost = _quota_number(throttling.get("cost"))
+        quota_remaining = _quota_number(quota.get("credits_remaining"))
         required = _quota_number(error.get("required_credits"))
         remaining = _quota_number(error.get("remaining_credits"))
         maximum = _quota_number(quota.get("max_available"))
@@ -281,13 +338,31 @@ class ShipHeroClient:
         exceeds_quota = required is not None and maximum is not None and required > maximum
         if message_says_oversized or exceeds_quota:
             _log.warning(
-                "ShipHero query exceeds credit cap: required=%s max=%s",
+                "ShipHero query exceeds credit cap: request_id=%s required=%s "
+                "estimated=%s cost=%s remaining=%s quota_remaining=%s max=%s",
+                request_id,
                 f"{required:g}" if required is not None else "unknown",
+                f"{estimated:g}" if estimated is not None else "unknown",
+                f"{cost:g}" if cost is not None else "unknown",
+                f"{remaining:g}" if remaining is not None else "unknown",
+                f"{quota_remaining:g}" if quota_remaining is not None else "unknown",
                 f"{maximum:g}" if maximum is not None else "unknown",
             )
             raise RuntimeError("ShipHero GraphQL credits limit")
         if attempt >= retries:
-            raise RuntimeError("ShipHero GraphQL not enough credits")
+            _log.warning(
+                "ShipHero credit refill exhausted: request_id=%s required=%s estimated=%s "
+                "cost=%s remaining=%s quota_remaining=%s max=%s attempts=%d",
+                request_id,
+                f"{required:g}" if required is not None else "unknown",
+                f"{estimated:g}" if estimated is not None else "unknown",
+                f"{cost:g}" if cost is not None else "unknown",
+                f"{remaining:g}" if remaining is not None else "unknown",
+                f"{quota_remaining:g}" if quota_remaining is not None else "unknown",
+                f"{maximum:g}" if maximum is not None else "unknown",
+                attempt + 1,
+            )
+            raise _CreditRefillExhaustedError("ShipHero GraphQL not enough credits")
 
         hint = _credit_wait_hint(error.get("time_remaining"))
         if required is not None and remaining is not None and maximum is not None:
@@ -298,9 +373,14 @@ class ShipHeroClient:
         # provider's refill estimate can lose every time under contention.
         wait = min(max(math.ceil(hint if hint is not None else 60) + 1, 15), 90)
         _log.warning(
-            "ShipHero credit refill: required=%s remaining=%s max=%s wait=%ss attempt=%d/%d",
+            "ShipHero credit refill: request_id=%s required=%s estimated=%s cost=%s "
+            "remaining=%s quota_remaining=%s max=%s wait=%ss attempt=%d/%d",
+            request_id,
             f"{required:g}" if required is not None else "unknown",
+            f"{estimated:g}" if estimated is not None else "unknown",
+            f"{cost:g}" if cost is not None else "unknown",
             f"{remaining:g}" if remaining is not None else "unknown",
+            f"{quota_remaining:g}" if quota_remaining is not None else "unknown",
             f"{maximum:g}" if maximum is not None else "unknown",
             wait,
             attempt + 1,
@@ -308,21 +388,25 @@ class ShipHeroClient:
         )
         time.sleep(wait)
 
-    def _pace_from_quota(self, payload: dict[str, Any]) -> None:
+    def _pace_from_quota(self, payload: dict[str, Any], floor_override: int | None = None) -> None:
         """Proactively wait so the credit pool stays above min_credits_floor.
 
         Reads the live quota ShipHero returns on every response under
         extensions.throttling.user_quota. No-op when pacing is disabled
-        (min_credits_floor <= 0) or the quota is absent.
+        (min_credits_floor <= 0) or the quota is absent. A per-query override
+        may lower the floor but cannot raise a client's configured floor.
         """
-        if self.min_credits_floor <= 0:
+        floor = self.min_credits_floor
+        if floor_override is not None:
+            floor = min(floor, floor_override)
+        if floor <= 0:
             return
         quota = ((payload.get("extensions") or {}).get("throttling") or {}).get("user_quota") or {}
         remaining = quota.get("credits_remaining")
         if remaining is None:
             return
         rate = quota.get("increment_rate") or _DEFAULT_CREDIT_REFILL_RATE
-        wait = _credits_refill_wait(int(remaining), self.min_credits_floor, float(rate))
+        wait = _credits_refill_wait(int(remaining), floor, float(rate))
         if wait > 0:
             time.sleep(min(wait, self.max_pacing_sleep))
 
@@ -994,6 +1078,14 @@ class ShipHeroClient:
     # Five embedded lines keep a 25-order request at an estimated 151 credits
     # (1 + 25 * (1 + 5)); fetch any remaining lines with smaller order queries.
     _ORDERS_EMBEDDED_LINE_ITEMS_CAP = 5
+    # After two code-30 waits, 10 orders x 3 lines lowers the estimated cost
+    # to 41 credits (1 + 10 * (1 + 3)) for this and all later order pages.
+    _ORDERS_LOW_CREDIT_PAGE_SIZE = 10
+    _ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP = 3
+    # Keep one small page's cost plus headroom in the pool during an order
+    # scan, so successful pages do not repeatedly wait for the normal floor.
+    _ORDERS_LOW_CREDIT_PACING_FLOOR = 100
+    _ORDERS_PAGE_CREDIT_RETRIES = 2
     _ORDERS_LINE_ITEMS_CAP = 15
     _ORDERS_LINE_ITEMS_MAX_LINES = 300
     # ShipHero can return fewer than requested. Every nonempty page contributes
@@ -1041,8 +1133,9 @@ class ShipHeroClient:
                 raise RuntimeError("ShipHero orders invalid total_count")
             return reported
 
-        query = (
-            """
+        def page_query(page_size: int, embedded_lines: int) -> str:
+            return (
+                """
         query($since: ISODateTime!, $until: ISODateTime!, $warehouse_id: String!, $after: String) {
           orders(
             order_date_from: $since
@@ -1050,8 +1143,8 @@ class ShipHeroClient:
             warehouse_id: $warehouse_id
           ) {
             data(first: """
-            + str(self._ORDERS_PAGE_SIZE)
-            + """, after: $after) {
+                + str(page_size)
+                + """, after: $after) {
               edges {
                 node {
                   id
@@ -1059,8 +1152,8 @@ class ShipHeroClient:
                   order_date
                   shop_name
                   line_items(first: """
-            + str(self._ORDERS_EMBEDDED_LINE_ITEMS_CAP)
-            + """) {
+                + str(embedded_lines)
+                + """) {
                     edges { node { id sku quantity } }
                     pageInfo { hasNextPage endCursor }
                   }
@@ -1071,6 +1164,22 @@ class ShipHeroClient:
           }
         }
         """
+            )
+
+        def low_credit_page_query() -> _PacingFloorQuery:
+            return _PacingFloorQuery(
+                page_query(
+                    self._ORDERS_LOW_CREDIT_PAGE_SIZE,
+                    self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
+                ),
+                self._ORDERS_LOW_CREDIT_PACING_FLOOR,
+            )
+
+        full_page_cost = 1 + self._ORDERS_PAGE_SIZE * (1 + self._ORDERS_EMBEDDED_LINE_ITEMS_CAP)
+        query = _CreditRetryQuery(
+            page_query(self._ORDERS_PAGE_SIZE, self._ORDERS_EMBEDDED_LINE_ITEMS_CAP),
+            self._ORDERS_PAGE_CREDIT_RETRIES,
+            self._ORDERS_LOW_CREDIT_PACING_FLOOR,
         )
 
         out: list[dict[str, Any]] = []
@@ -1086,10 +1195,35 @@ class ShipHeroClient:
         cursor: str | None = None
         expected_count = count_orders()
         for _ in range(max_pages):
-            payload = self._execute(
-                query,
-                {**filters, "after": cursor},
-            )
+            while True:
+                try:
+                    payload = self._execute(query, {**filters, "after": cursor})
+                    break
+                except _CreditRefillExhaustedError:
+                    if not isinstance(query, _CreditRetryQuery):
+                        raise
+                    query = low_credit_page_query()
+                    _log.warning(
+                        "ShipHero orders page credit fallback: page_size=%d embedded_lines=%d",
+                        self._ORDERS_LOW_CREDIT_PAGE_SIZE,
+                        self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
+                    )
+            if isinstance(query, _CreditRetryQuery):
+                quota = ((payload.get("extensions") or {}).get("throttling") or {}).get(
+                    "user_quota"
+                ) or {}
+                remaining = _quota_number(quota.get("credits_remaining"))
+                if remaining is not None and remaining <= full_page_cost:
+                    query = low_credit_page_query()
+                    _log.warning(
+                        "ShipHero orders page low quota: remaining=%s full_page_cost=%d "
+                        "page_size=%d embedded_lines=%d",
+                        f"{remaining:g}",
+                        full_page_cost,
+                        self._ORDERS_LOW_CREDIT_PAGE_SIZE,
+                        self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
+                    )
+            line_pacing_floor = query.floor if isinstance(query, _PacingFloorQuery) else None
             connection = payload["data"]["orders"]["data"]
             edges = connection["edges"]
             page_info = connection["pageInfo"]
@@ -1113,7 +1247,7 @@ class ShipHeroClient:
                         raise OrdersPaginationUnstableError(
                             "ShipHero orders pagination repeated order changed"
                         )
-                    self._finish_order_lines(n)
+                    self._finish_order_lines(n, pacing_floor=line_pacing_floor)
                     if line_contents(n) != line_contents(original):
                         raise OrdersPaginationUnstableError(
                             "ShipHero orders pagination repeated order lines changed"
@@ -1121,7 +1255,7 @@ class ShipHeroClient:
                     duplicate_edges += 1
                     continue
                 seen[order_id] = n
-                self._finish_order_lines(n)
+                self._finish_order_lines(n, pacing_floor=line_pacing_floor)
                 out.append(n)
             if not page_info["hasNextPage"]:
                 break
@@ -1150,7 +1284,7 @@ class ShipHeroClient:
             )
         return out
 
-    def _finish_order_lines(self, order: dict[str, Any]) -> None:
+    def _finish_order_lines(self, order: dict[str, Any], pacing_floor: int | None = None) -> None:
         """Append line-item pages for an order whose first page is truncated."""
         lines = order["line_items"]
         page_info = lines["pageInfo"]
@@ -1196,6 +1330,8 @@ class ShipHeroClient:
         }
         """
         )
+        if pacing_floor is not None:
+            query = _PacingFloorQuery(query, pacing_floor)
         cursor = page_info.get("endCursor")
         for _ in range(self._ORDERS_LINE_ITEMS_MAX_PAGES - 1):
             if not isinstance(cursor, str) or not cursor:
