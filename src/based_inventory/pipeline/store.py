@@ -115,6 +115,18 @@ class Store:
             (version_id, destination),
         ).fetchone()["plan"]
 
+    def assert_destination_current(self, version_id: str, destination: str) -> None:
+        self._destination(destination)
+        self.assert_current(version_id)
+        version = self.load(version_id)
+        newer = self.connection.execute(
+            """SELECT 1 FROM pipeline_plans p JOIN sales_versions v USING(version_id)
+            WHERE p.destination=%s AND v.day>%s LIMIT 1""",
+            (destination, version.day),
+        ).fetchone()
+        if newer:
+            raise ValueError("A later reporting day owns this source destination")
+
     def get_plan(self, version_id: str, destination: str) -> dict | None:
         self._destination(destination)
         row = self.connection.execute(

@@ -59,3 +59,19 @@ def test_saved_blob_corruption_and_no_run_are_visible(stores):
     first.connection.execute("UPDATE sales_versions SET report = %s", (b"bad workbook",))
     with pytest.raises(ValueError, match="report hash"):
         first.load(version.version_id)
+
+
+def test_later_source_day_fences_old_stock_replay_before_receipt_exists(stores):
+    first, _ = stores
+    old = verified()
+    newer = replace(
+        old, day=old.day + timedelta(days=1), captured_at=old.captured_at + timedelta(days=1)
+    )
+    first.save_version(old)
+    first.save_version(newer)
+    first.assert_destination_current(old.version_id, "inventory")
+    first.plan_once(newer.version_id, "inventory", {"captured": "newer stock"})
+    with pytest.raises(ValueError, match="later reporting day"):
+        first.assert_destination_current(old.version_id, "inventory")
+    first.assert_destination_current(newer.version_id, "inventory")
+    first.assert_destination_current(old.version_id, "target")

@@ -45,9 +45,12 @@ def refresh_sources(
     def run(name, action):
         try:
             store.assert_current(version_id)
+            if mode == "publish":
+                store.assert_destination_current(version_id, name)
             saved = store.get_plan(version_id, name) if mode == "publish" else None
 
             def freeze(verification):
+                store.assert_destination_current(version_id, name)
                 intended = {"status": "verified", "verification": verification}
                 digest = sha256(
                     json.dumps(intended, sort_keys=True, separators=(",", ":")).encode()

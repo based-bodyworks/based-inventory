@@ -728,3 +728,33 @@ def test_crash_after_stock_write_replays_frozen_capture_without_provider_pull(mo
     row["available"] = 99
     assert replay_source_plan(google, frozen[0]) is True
     assert google.data[(7, 4)]["effectiveValue"] == {"numberValue": 0}
+
+
+def test_older_pending_source_retry_cannot_write_after_later_day(monkeypatch):
+    from unittest.mock import Mock
+
+    from based_inventory.pipeline.source_refresh import refresh_sources
+    from tests.test_pipeline_models import verified
+
+    monkeypatch.setenv("PIPELINE_ALLOW_WRITES", "1")
+    version = verified()
+    store, google = Mock(), Mock()
+    store.load.return_value = version
+    store.assert_destination_current.side_effect = ValueError(
+        "A later reporting day owns this source destination"
+    )
+    result = refresh_sources(
+        version.day,
+        store,
+        version.version_id,
+        google,
+        mode="publish",
+        polar_token="unused",
+        target_query="unused",
+        target_workbook_id="unused",
+    )
+    assert result["status"] == "incomplete"
+    assert all(r["status"] == "incomplete" for r in result["sources"].values())
+    assert google.mock_calls == []
+    store.plan_once.assert_not_called()
+    store.record_receipt.assert_not_called()
