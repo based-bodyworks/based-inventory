@@ -165,6 +165,15 @@ class _CreditRetryQuery(str):
         return instance
 
 
+class _PacingFloorQuery(str):
+    """Limit proactive pacing for one query without changing the client default."""
+
+    def __new__(cls, query: str, floor: int) -> _PacingFloorQuery:
+        instance = super().__new__(cls, query)
+        instance.floor = floor
+        return instance
+
+
 class ShipHeroClient:
     def __init__(
         self,
@@ -285,7 +294,8 @@ class ShipHeroClient:
                 if any("credits" in message for message in messages):
                     raise RuntimeError("ShipHero GraphQL credits limit")
                 raise RuntimeError("ShipHero GraphQL error")
-            self._pace_from_quota(payload)
+            floor_override = query.floor if isinstance(query, _PacingFloorQuery) else None
+            self._pace_from_quota(payload, floor_override)
             return payload
         raise RuntimeError("ShipHero retries exhausted")
 
@@ -378,21 +388,25 @@ class ShipHeroClient:
         )
         time.sleep(wait)
 
-    def _pace_from_quota(self, payload: dict[str, Any]) -> None:
+    def _pace_from_quota(self, payload: dict[str, Any], floor_override: int | None = None) -> None:
         """Proactively wait so the credit pool stays above min_credits_floor.
 
         Reads the live quota ShipHero returns on every response under
         extensions.throttling.user_quota. No-op when pacing is disabled
-        (min_credits_floor <= 0) or the quota is absent.
+        (min_credits_floor <= 0) or the quota is absent. A per-query override
+        may lower the floor but cannot raise a client's configured floor.
         """
-        if self.min_credits_floor <= 0:
+        floor = self.min_credits_floor
+        if floor_override is not None:
+            floor = min(floor, floor_override)
+        if floor <= 0:
             return
         quota = ((payload.get("extensions") or {}).get("throttling") or {}).get("user_quota") or {}
         remaining = quota.get("credits_remaining")
         if remaining is None:
             return
         rate = quota.get("increment_rate") or _DEFAULT_CREDIT_REFILL_RATE
-        wait = _credits_refill_wait(int(remaining), self.min_credits_floor, float(rate))
+        wait = _credits_refill_wait(int(remaining), floor, float(rate))
         if wait > 0:
             time.sleep(min(wait, self.max_pacing_sleep))
 
@@ -1068,6 +1082,9 @@ class ShipHeroClient:
     # to 41 credits (1 + 10 * (1 + 3)) for this and all later order pages.
     _ORDERS_LOW_CREDIT_PAGE_SIZE = 10
     _ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP = 3
+    # Keep one small page's cost plus headroom in the pool; avoid waiting for
+    # the normal 2,000-credit floor after every successful fallback page.
+    _ORDERS_LOW_CREDIT_PACING_FLOOR = 100
     _ORDERS_PAGE_CREDIT_RETRIES = 2
     _ORDERS_LINE_ITEMS_CAP = 15
     _ORDERS_LINE_ITEMS_MAX_LINES = 300
@@ -1174,15 +1191,19 @@ class ShipHeroClient:
                 except _CreditRefillExhaustedError:
                     if not isinstance(query, _CreditRetryQuery):
                         raise
-                    query = page_query(
-                        self._ORDERS_LOW_CREDIT_PAGE_SIZE,
-                        self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
+                    query = _PacingFloorQuery(
+                        page_query(
+                            self._ORDERS_LOW_CREDIT_PAGE_SIZE,
+                            self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
+                        ),
+                        self._ORDERS_LOW_CREDIT_PACING_FLOOR,
                     )
                     _log.warning(
                         "ShipHero orders page credit fallback: page_size=%d embedded_lines=%d",
                         self._ORDERS_LOW_CREDIT_PAGE_SIZE,
                         self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
                     )
+            line_pacing_floor = query.floor if isinstance(query, _PacingFloorQuery) else None
             connection = payload["data"]["orders"]["data"]
             edges = connection["edges"]
             page_info = connection["pageInfo"]
@@ -1206,7 +1227,7 @@ class ShipHeroClient:
                         raise OrdersPaginationUnstableError(
                             "ShipHero orders pagination repeated order changed"
                         )
-                    self._finish_order_lines(n)
+                    self._finish_order_lines(n, pacing_floor=line_pacing_floor)
                     if line_contents(n) != line_contents(original):
                         raise OrdersPaginationUnstableError(
                             "ShipHero orders pagination repeated order lines changed"
@@ -1214,7 +1235,7 @@ class ShipHeroClient:
                     duplicate_edges += 1
                     continue
                 seen[order_id] = n
-                self._finish_order_lines(n)
+                self._finish_order_lines(n, pacing_floor=line_pacing_floor)
                 out.append(n)
             if not page_info["hasNextPage"]:
                 break
@@ -1243,7 +1264,7 @@ class ShipHeroClient:
             )
         return out
 
-    def _finish_order_lines(self, order: dict[str, Any]) -> None:
+    def _finish_order_lines(self, order: dict[str, Any], pacing_floor: int | None = None) -> None:
         """Append line-item pages for an order whose first page is truncated."""
         lines = order["line_items"]
         page_info = lines["pageInfo"]
@@ -1289,6 +1310,8 @@ class ShipHeroClient:
         }
         """
         )
+        if pacing_floor is not None:
+            query = _PacingFloorQuery(query, pacing_floor)
         cursor = page_info.get("endCursor")
         for _ in range(self._ORDERS_LINE_ITEMS_MAX_PAGES - 1):
             if not isinstance(cursor, str) or not cursor:
