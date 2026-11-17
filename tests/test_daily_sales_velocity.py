@@ -939,7 +939,7 @@ def test_real_client_credit_retry_is_bounded_and_sanitized(monkeypatch, caplog):
             ShipHeroClient(token="private-token"), "2026-11-01", "since", "until", 100
         )
 
-    assert waits == [18] * 12
+    assert waits == [18, 30, 60] + [90] * 9
     assert "private-provider-detail" not in str(caught.value) + caplog.text
     assert "private-token" not in str(caught.value) + caplog.text
 
