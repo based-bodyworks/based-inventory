@@ -974,7 +974,7 @@ def test_low_credit_pacing_does_not_enable_disabled_client_pacing(monkeypatch) -
     assert waits == [15, 15]
 
 
-def test_normal_order_page_and_line_keep_configured_pacing_floor(monkeypatch) -> None:
+def test_order_scan_uses_scoped_pacing_before_small_page_switch(monkeypatch) -> None:
     count = {"data": {"orders": {"data": {"total_count": 1}}}}
     first_five = [(f"line-{i}", "COMB", 1) for i in range(5)]
     responses = [
@@ -984,10 +984,40 @@ def test_normal_order_page_and_line_keep_configured_pacing_floor(monkeypatch) ->
                 [_order_node("A", lines=_line_page(first_five, more=True, cursor="line-4"))],
                 count=1,
             ),
-            0,
+            500,
         ),
         _with_quota(_order_lines_page("A", _line_page([("line-5", "GEL", 2)])), 0),
-        _with_quota(count, 2000),
+        _with_quota(count, 0),
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    client = ShipHeroClient(token="secret", min_credits_floor=2000)
+    result = client.fetch_orders_window("2026-11-11T00:00:00")
+
+    assert len(result[0]["line_items"]["edges"]) == 6
+    assert waits == pytest.approx([100 / 60, 2000 / 60])
+    assert client.min_credits_floor == 2000
+    assert len(_order_page_calls(calls)) == 1
+
+
+@pytest.mark.parametrize("remaining", [0, 110, 151])
+def test_successful_full_page_low_quota_switches_next_cursor_without_code_30(
+    monkeypatch, remaining
+) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 26}}}}
+    first_page = _orders_page(
+        [_order_node(f"A-{i}") for i in range(25)], more=True, cursor="after-25", count=26
+    )
+    responses = [
+        count,
+        _with_quota(first_page, remaining),
+        _with_quota(_orders_page([_order_node("B")], count=26), 110),
+        count,
     ]
     calls = _scripted_post(
         monkeypatch,
@@ -1000,9 +1030,96 @@ def test_normal_order_page_and_line_keep_configured_pacing_floor(monkeypatch) ->
         "2026-11-11T00:00:00"
     )
 
-    assert len(result[0]["line_items"]["edges"]) == 6
-    assert waits == pytest.approx([2000 / 60, 2000 / 60])
-    assert len(_order_page_calls(calls)) == 1
+    assert len(result) == 26
+    page_calls = _order_page_calls(calls)
+    assert [call["variables"]["after"] for call in page_calls] == [None, "after-25"]
+    assert "data(first: 25, after: $after)" in page_calls[0]["query"]
+    assert "data(first: 10, after: $after)" in page_calls[1]["query"]
+    assert waits == pytest.approx(([100 / 60] if remaining == 0 else []) + [0.2])
+
+
+def test_successful_full_pages_do_not_wait_for_2000_before_quota_switch(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 76}}}}
+    third_page_nodes = [_order_node(f"C-{i}") for i in range(24)]
+    first_five = [(f"line-{i}", "COMB", 1) for i in range(5)]
+    third_page_nodes.append(
+        _order_node("C-24", lines=_line_page(first_five, more=True, cursor="line-4"))
+    )
+    responses = [
+        _with_quota(count, 2000),
+        _with_quota(
+            _orders_page(
+                [_order_node(f"A-{i}") for i in range(25)],
+                more=True,
+                cursor="after-a",
+                count=76,
+            ),
+            1500,
+        ),
+        _with_quota(
+            _orders_page(
+                [_order_node(f"B-{i}") for i in range(25)],
+                more=True,
+                cursor="after-b",
+                count=76,
+            ),
+            500,
+        ),
+        _with_quota(
+            _orders_page(third_page_nodes, more=True, cursor="after-c", count=76),
+            110,
+        ),
+        _with_quota(_order_lines_page("C-24", _line_page([("line-5", "GEL", 2)])), 0),
+        _with_quota(_orders_page([_order_node("D")], count=76), 0),
+        _with_quota(count, 0),
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    waits = []
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", waits.append)
+
+    result = ShipHeroClient(token="secret", min_credits_floor=2000).fetch_orders_window(
+        "2026-11-11T00:00:00"
+    )
+
+    assert len(result) == 76
+    assert len(result[74]["line_items"]["edges"]) == 6
+    page_calls = _order_page_calls(calls)
+    assert [call["variables"]["after"] for call in page_calls] == [
+        None,
+        "after-a",
+        "after-b",
+        "after-c",
+    ]
+    assert all("data(first: 25, after: $after)" in call["query"] for call in page_calls[:3])
+    assert "data(first: 10, after: $after)" in page_calls[3]["query"]
+    assert waits == pytest.approx([0.2, 0.2, 100 / 60, 0.2, 100 / 60, 2000 / 60])
+
+
+def test_proactive_small_page_switch_still_rejects_missing_unique_order(monkeypatch) -> None:
+    count = {"data": {"orders": {"data": {"total_count": 2}}}}
+    responses = [
+        count,
+        _with_quota(_orders_page([_order_node("A")], more=True, cursor="next", count=2), 0),
+        _with_quota(_orders_page([_order_node("A")], count=2), 0),
+        count,
+    ]
+    calls = _scripted_post(
+        monkeypatch,
+        [_response(200, json.dumps(value)) for value in responses],
+    )
+    monkeypatch.setattr("based_inventory.shiphero.time.sleep", lambda _: None)
+
+    with pytest.raises(OrdersPaginationUnstableError, match="total_count mismatch"):
+        ShipHeroClient(token="secret", min_credits_floor=2000).fetch_orders_window(
+            "2026-11-11T00:00:00"
+        )
+
+    page_calls = _order_page_calls(calls)
+    assert "data(first: 10, after: $after)" in page_calls[1]["query"]
+    assert page_calls[1]["variables"]["after"] == "next"
 
 
 def test_low_credit_line_failure_still_stops_before_final_count(monkeypatch) -> None:

@@ -156,21 +156,21 @@ class _CreditRefillExhaustedError(RuntimeError):
     """A code-30 shortage persisted through this request's credit retries."""
 
 
-class _CreditRetryQuery(str):
-    """Attach a credit-only retry budget without changing other retry behavior."""
-
-    def __new__(cls, query: str, credit_retries: int) -> _CreditRetryQuery:
-        instance = super().__new__(cls, query)
-        instance.credit_retries = credit_retries
-        return instance
-
-
 class _PacingFloorQuery(str):
     """Limit proactive pacing for one query without changing the client default."""
 
     def __new__(cls, query: str, floor: int) -> _PacingFloorQuery:
         instance = super().__new__(cls, query)
         instance.floor = floor
+        return instance
+
+
+class _CreditRetryQuery(_PacingFloorQuery):
+    """Also bound code-30 retries without changing other retry behavior."""
+
+    def __new__(cls, query: str, credit_retries: int, floor: int) -> _CreditRetryQuery:
+        instance = super().__new__(cls, query, floor)
+        instance.credit_retries = credit_retries
         return instance
 
 
@@ -1082,8 +1082,8 @@ class ShipHeroClient:
     # to 41 credits (1 + 10 * (1 + 3)) for this and all later order pages.
     _ORDERS_LOW_CREDIT_PAGE_SIZE = 10
     _ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP = 3
-    # Keep one small page's cost plus headroom in the pool; avoid waiting for
-    # the normal 2,000-credit floor after every successful fallback page.
+    # Keep one small page's cost plus headroom in the pool during an order
+    # scan, so successful pages do not repeatedly wait for the normal floor.
     _ORDERS_LOW_CREDIT_PACING_FLOOR = 100
     _ORDERS_PAGE_CREDIT_RETRIES = 2
     _ORDERS_LINE_ITEMS_CAP = 15
@@ -1166,9 +1166,20 @@ class ShipHeroClient:
         """
             )
 
+        def low_credit_page_query() -> _PacingFloorQuery:
+            return _PacingFloorQuery(
+                page_query(
+                    self._ORDERS_LOW_CREDIT_PAGE_SIZE,
+                    self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
+                ),
+                self._ORDERS_LOW_CREDIT_PACING_FLOOR,
+            )
+
+        full_page_cost = 1 + self._ORDERS_PAGE_SIZE * (1 + self._ORDERS_EMBEDDED_LINE_ITEMS_CAP)
         query = _CreditRetryQuery(
             page_query(self._ORDERS_PAGE_SIZE, self._ORDERS_EMBEDDED_LINE_ITEMS_CAP),
             self._ORDERS_PAGE_CREDIT_RETRIES,
+            self._ORDERS_LOW_CREDIT_PACING_FLOOR,
         )
 
         out: list[dict[str, Any]] = []
@@ -1191,15 +1202,24 @@ class ShipHeroClient:
                 except _CreditRefillExhaustedError:
                     if not isinstance(query, _CreditRetryQuery):
                         raise
-                    query = _PacingFloorQuery(
-                        page_query(
-                            self._ORDERS_LOW_CREDIT_PAGE_SIZE,
-                            self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
-                        ),
-                        self._ORDERS_LOW_CREDIT_PACING_FLOOR,
-                    )
+                    query = low_credit_page_query()
                     _log.warning(
                         "ShipHero orders page credit fallback: page_size=%d embedded_lines=%d",
+                        self._ORDERS_LOW_CREDIT_PAGE_SIZE,
+                        self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
+                    )
+            if isinstance(query, _CreditRetryQuery):
+                quota = ((payload.get("extensions") or {}).get("throttling") or {}).get(
+                    "user_quota"
+                ) or {}
+                remaining = _quota_number(quota.get("credits_remaining"))
+                if remaining is not None and remaining <= full_page_cost:
+                    query = low_credit_page_query()
+                    _log.warning(
+                        "ShipHero orders page low quota: remaining=%s full_page_cost=%d "
+                        "page_size=%d embedded_lines=%d",
+                        f"{remaining:g}",
+                        full_page_cost,
                         self._ORDERS_LOW_CREDIT_PAGE_SIZE,
                         self._ORDERS_LOW_CREDIT_EMBEDDED_LINE_ITEMS_CAP,
                     )
