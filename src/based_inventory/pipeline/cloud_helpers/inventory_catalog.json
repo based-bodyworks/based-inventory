@@ -1,0 +1,232 @@
+[
+  {
+    "product": "Texture Powder",
+    "sku": "44126606262501",
+    "required": true
+  },
+  {
+    "product": "Hair Clay",
+    "sku": "CLAY1",
+    "required": true
+  },
+  {
+    "product": "Shampoo",
+    "sku": "44114434293989",
+    "required": true
+  },
+  {
+    "product": "Conditioner",
+    "sku": "44114437669093",
+    "required": true
+  },
+  {
+    "product": "Leave-In Conditioner",
+    "sku": "BB-LEAVEIN-ONE",
+    "required": true
+  },
+  {
+    "product": "Sea Salt Spray",
+    "sku": "BB2000S-1-6-1",
+    "required": true
+  },
+  {
+    "product": "Under Eye Elixir",
+    "sku": "BB-UEE-SINGLE",
+    "required": true
+  },
+  {
+    "product": "Skin Revival Spray",
+    "sku": "BB-SRS-4OZ",
+    "required": true
+  },
+  {
+    "product": "Curl Cream",
+    "sku": "BB-CC-SINGLE",
+    "required": true
+  },
+  {
+    "product": "Pomade",
+    "sku": "POMADE1",
+    "required": true
+  },
+  {
+    "product": "Curl Mousse",
+    "sku": "BB-MOUS-SINGLE",
+    "required": true
+  },
+  {
+    "product": "Tallow Moisturizer (Full)",
+    "sku": "BB-ONE-BTAL-100ML",
+    "required": true
+  },
+  {
+    "product": "Curl Gel",
+    "sku": "BB-CGEL-SINGLE",
+    "required": true
+  },
+  {
+    "product": "Curl Refresh Spray",
+    "sku": "BB-CRS-SINGLE",
+    "required": true
+  },
+  {
+    "product": "Body Wash - Santal Sandalwood",
+    "sku": "BB-SS-01",
+    "required": true
+  },
+  {
+    "product": "Hair Elixir",
+    "sku": "BB-HRELXR-SINGLE",
+    "required": true
+  },
+  {
+    "product": "Body Lotion Santal",
+    "sku": "BB-BDYLTN-SINGLE-SNTL",
+    "required": true
+  },
+  {
+    "product": "Body Lotion Amber",
+    "sku": "BB-BDYLTN-SINGLE-AMBR",
+    "required": true
+  },
+  {
+    "product": "Body Lotion Dawn",
+    "sku": "BB-BDYLTN-SINGLE-DAWN",
+    "required": true
+  },
+  {
+    "product": "Body Lotion Dusk",
+    "sku": "BB-BDYLTN-SINGLE-DUSK",
+    "required": true
+  },
+  {
+    "product": "Daily Cleanser",
+    "sku": "BB-ONE-CLEANSER",
+    "required": true
+  },
+  {
+    "product": "Daily Moisturizer",
+    "sku": "BB-ONE-MOISTURIZER",
+    "required": true
+  },
+  {
+    "product": "Deodorant - Santal Sandalwood",
+    "sku": "BB-DEO-SS-01",
+    "required": true
+  },
+  {
+    "product": "Scalp Scrubber",
+    "sku": "BB-ACCS-SCLPSCRBR-V2",
+    "required": true
+  },
+  {
+    "product": "Body Wash - Guava Nectar",
+    "sku": "BB-GN-01",
+    "required": true
+  },
+  {
+    "product": "Deodorant - Bergamot & Vanilla",
+    "sku": "BB-DEO-BM-01",
+    "required": true
+  },
+  {
+    "product": "Deodorant - Guava Nectar",
+    "sku": "BB-DEO-GN-01",
+    "required": true
+  },
+  {
+    "product": "Body Wash - Caribbean Coconut",
+    "sku": "BB-CC-01",
+    "required": true
+  },
+  {
+    "product": "Hair Revival Serum",
+    "sku": "BB-HRS-01",
+    "required": true
+  },
+  {
+    "product": "Tallow Moisturizer (Travel)",
+    "sku": "BB-ONE-BTAL-50ML",
+    "required": true
+  },
+  {
+    "product": "Skin Elixir",
+    "sku": "BB-SKNELXR-SINGLE",
+    "required": true
+  },
+  {
+    "product": "White Face Towel",
+    "sku": "BB-ACCS-FCTWL-WHITE",
+    "required": true
+  },
+  {
+    "product": "Skin Revival Spray Mini",
+    "sku": "BB-SRS-MINI",
+    "required": true
+  },
+  {
+    "product": "Black Toiletry Bag",
+    "sku": "BB-ACCS-TTBAG-BLK",
+    "required": true
+  },
+  {
+    "product": "Wide Toothed Comb (Dark)",
+    "sku": "BB-GWP-COMB-DARK",
+    "required": true
+  },
+  {
+    "product": "Curly Hair Continuous Sprayer",
+    "sku": "BB-ACCS-CONSPRYR-TAN",
+    "required": true
+  },
+  {
+    "product": "White Toiletry Bag",
+    "sku": "BB-ACCS-TTBAG-WHT",
+    "required": true
+  },
+  {
+    "product": "Mini Body Lotion - Dusk",
+    "sku": "BB-BDYLTN-MINI-DUSK",
+    "required": true
+  },
+  {
+    "product": "Mini Curl Cream - Santal",
+    "sku": "BB-CC-MINI-SANTAL",
+    "required": true
+  },
+  {
+    "product": "Mini Leave-In Conditioner",
+    "sku": "BB-LI-MINI",
+    "required": true
+  },
+  {
+    "product": "Mini Sea Salt Spray - Dusk",
+    "sku": "BB-SSS-MINI-DUSK",
+    "required": true
+  },
+  {
+    "product": "Target retail Sea Salt Spray",
+    "sku": "BB2000S-1-6-1-RETAIL",
+    "required": true
+  },
+  {
+    "product": "Target retail Leave-In Conditioner",
+    "sku": "BB-LEAVEIN-ONE-RETAIL",
+    "required": true
+  },
+  {
+    "product": "Target retail Texture Powder",
+    "sku": "44126606262501-RETAIL",
+    "required": true
+  },
+  {
+    "product": "Target retail Curl Cream",
+    "sku": "BB-CC-SINGLE-RETAIL",
+    "required": true
+  },
+  {
+    "product": "Target retail Mini Skin Revival Spray",
+    "sku": "BB-SRS-MINI-RETAIL",
+    "required": true
+  }
+]

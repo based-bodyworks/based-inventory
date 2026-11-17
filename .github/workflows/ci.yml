@@ -19,6 +19,20 @@ jobs:
     # Bumping Playwright would reach across into production — cheaper to
     # pin the runner here. Revisit when we upgrade Playwright deliberately.
     runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: synthetic-ci-password
+          POSTGRES_DB: pipeline_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_PIPELINE_DATABASE_URL: postgresql://postgres:synthetic-ci-password@127.0.0.1:5432/pipeline_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,3 +49,7 @@ jobs:
         run: docker build -t based-inventory-ci .
       - name: Check velocity entrypoint in production image
         run: docker run --rm based-inventory-ci python scripts/daily_sales_velocity.py --help
+      - name: Build cloud pipeline image
+        run: docker build -f Dockerfile.pipeline -t based-sales-pipeline-ci .
+      - name: Check cloud pipeline entrypoint
+        run: docker run --rm based-sales-pipeline-ci python -m based_inventory.pipeline --help

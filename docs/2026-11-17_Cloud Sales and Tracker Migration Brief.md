@@ -12,7 +12,7 @@ Use Render Postgres for normalized daily merchant sales, verification records, w
 
 Each immutable version records the complete UTC day, warehouse, source order count, excluded-shop count, catalog and mapping hashes, extractor commit, extraction time, normalized SKU/channel rows, report hash and verification outcome. Accept only a fresh schema-7 extraction whose unique order count matches ShipHero before and after complete order and line pagination. A source revision creates a new version instead of overwriting the old version.
 
-All merchant outputs consume the same version ID. Rerunning a publication step retries that version without querying orders again. A database lock prevents competing merchant extractions across daily jobs, repairs and backfills. Use database transaction locks and conditional publication updates to prevent older retries from replacing a newer version.
+All merchant outputs consume the same version ID. Rerunning a publication step retries that version without querying orders again. A database lock prevents competing merchant extractions across daily jobs, repairs and backfills. Use a connection-owned database session lock and checks of the current saved version to prevent older retries from replacing a newer version.
 
 ## Publish matching report and tracker values
 
@@ -40,7 +40,7 @@ Preserve the current daily extraction schedule of 11:00 UTC, the tracker refresh
 
 First run the cloud clients in read-only comparison mode against stored verified fixtures and current native sheets. Exercise duplicate runs, source-count changes, interrupted writes, expired credentials, missing reports, late Target emails, incomplete Amazon coverage, new positive SKUs and daylight-saving transitions. Preserve verified values when a source is incomplete.
 
-After a reviewed PR is approved and deployed, use a controlled live test that verifies one complete reporting day, all merchant SKU/channel rows, every rolling product and stock-cover formula, Target product rows, Amazon controls and the uploaded workbook. Only then switch the production entrypoint and disable local writers so there is one active publisher. Keep a read-only comparison monitor for seven scheduled mornings. Do not trigger a Slack-posting live test without approval of that specific test.
+After Avi approves merging the actual reviewed PR, merge it and prepare the cloud resources with publishing disabled. Obtain approval for a controlled live test that verifies one complete reporting day, all merchant SKU/channel rows, every rolling product and stock-cover formula, Target product rows, Amazon controls and the uploaded workbook. Only then switch the production entrypoint and disable local writers so there is one active publisher. Keep a read-only comparison monitor for seven scheduled mornings. Do not trigger a Slack-posting live test without approval of that specific test.
 
 Rollback disables new cloud writers, preserves their snapshots and receipts, restores the prior Render command and re-enables the previous local tracker schedule if needed. Never run both writer paths together. Owner roadmap and lifecycle calendars remain read-only throughout.
 

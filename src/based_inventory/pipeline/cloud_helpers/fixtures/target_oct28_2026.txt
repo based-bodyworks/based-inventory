@@ -1,0 +1,104 @@
+Hi All,
+
+Daily Sales as of 10.28:
+
+  *   5,451 units sold yesterday, missing Target’s forecast by -24%.
+     *   25,369 total week to date, down -15%. 875,058 Launch to date.
+     *   1,506 stores registered a sale yesterday.
+        *   Sea Salt Spray is 2% OOS, Leave In 3%, Curl Cream 2%, and Texture Powder 15% OOS.
+     *   See Linked file [​xlsb icon]  HERE<https://onepltfrm.sharepoint.com/:x:/r/sites/RetailServicesFiles/Shared%20Documents/General/Target/All%20Vendors/BASED/2026/Reporting/Daily%20Sales/2026%20PLTFRM%20-%20Target%20Daily%20Sales%20-%20BASED.xlsb?d=w71e3a5542a3a4c0997cb1566d82b4050&csf=1&web=1&e=ULKMoF> for item and store level details.
+
+Week to Date Performance:
+Row Labels
+$ ty
+U ty
+U frst
+% to fcst
+asp
+locs trk
+oos locs
+oos%
+SANTAL SEA SALT SPRAY
+$149,247
+8,367
+9,044
+-7.5%
+$   17.84
+6,976
+600
+2.2%
+LEAVE-IN CONDITIONER
+$115,024
+6,447
+7913.5
+-18.5%
+$   17.84
+6,976
+663
+2.4%
+TEXTURE POWDER
+$101,420
+5,692
+7394.8
+-23.0%
+$   17.82
+6,976
+4,004
+14.4%
+CURL CREAM
+$86,566
+4,857
+5533.7
+-12.2%
+$   17.82
+6,976
+412
+1.5%
+MINI-SEA SALT SPRAY-DUSK
+$27
+3
+0
+$     9.00
+0
+0
+0.0%
+MINI-BODY LOTION-DUSK
+$18
+2
+0
+$     9.00
+0
+0
+0.0%
+MINI-LEAVE-IN COND
+$10
+1
+0
+$   10.00
+0
+0
+0.0%
+MINI-SKIN REVIVAL SPRAY
+$0
+0
+0
+0
+0
+0.0%
+MINI-CURL CREAM
+$0
+0
+0
+0
+0
+0.0%
+Grand Total
+$452,312
+25,369
+29886
+-15.1%
+$   17.83
+27,904
+22,714
+2.3%
+

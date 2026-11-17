@@ -26,6 +26,7 @@ DESTINATIONS = frozenset(
         "target",
         "amazon",
         "workbook",
+        "report_archive",
         "monitor",
     }
 )
@@ -47,10 +48,11 @@ class Store:
         self.connection.close()
 
     def migrate(self) -> None:
-        sql = Path(__file__).resolve().parents[3] / "migrations/001_sales_pipeline.sql"
+        migrations = Path(__file__).resolve().parents[3] / "migrations"
         with self.connection.transaction():
             self.connection.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_ID + 1,))
-            self.connection.execute(sql.read_text())
+            for sql in sorted(migrations.glob("*.sql")):
+                self.connection.execute(sql.read_text())
 
     @contextmanager
     def lock_merchant_pull(self):
@@ -112,6 +114,14 @@ class Store:
             "SELECT plan FROM pipeline_plans WHERE version_id=%s AND destination=%s",
             (version_id, destination),
         ).fetchone()["plan"]
+
+    def get_plan(self, version_id: str, destination: str) -> dict | None:
+        self._destination(destination)
+        row = self.connection.execute(
+            "SELECT plan FROM pipeline_plans WHERE version_id=%s AND destination=%s",
+            (version_id, destination),
+        ).fetchone()
+        return row["plan"] if row else None
 
     @staticmethod
     def _destination(destination: str) -> None:
@@ -179,3 +189,9 @@ class Store:
             "SELECT * FROM pipeline_runs WHERE kind=%s AND day=%s ORDER BY started_at DESC LIMIT 1",
             (kind, day),
         ).fetchone()
+
+    def heartbeat(self, run_id: str) -> None:
+        self.connection.execute(
+            "UPDATE pipeline_runs SET updated_at=now() WHERE run_id=%s AND status='running'",
+            (run_id,),
+        )
