@@ -46,7 +46,7 @@ Rollback disables new cloud writers, preserves their snapshots and receipts, res
 
 ## Sources
 
-- Avi's request and provider approval: this chat, November 17, 2026.
+- Recorded decision, November 17, 2026: Avi selected Render and authorized implementation. Merge and live cutover approvals remain separate.
 - Existing source contracts: based-sop-deck skill and references/source-workflow.md, read November 17, 2026.
 - Repository baseline: based-bodyworks/based-inventory main, 6fcc9bb20bec1e183c104d3b94e3a8255f6c088c.
 - Local tracker and monitor definitions: update-target-daily-sales-tracker and monitor-based-daily-sales-velocity automation.toml, read November 17, 2026. Both remain active locally.
