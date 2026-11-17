@@ -734,11 +734,12 @@ def test_older_pending_source_retry_cannot_write_after_later_day(monkeypatch):
     from unittest.mock import Mock
 
     from based_inventory.pipeline.source_refresh import refresh_sources
+    from based_inventory.pipeline.store import Store
     from tests.test_pipeline_models import verified
 
     monkeypatch.setenv("PIPELINE_ALLOW_WRITES", "1")
     version = verified()
-    store, google = Mock(), Mock()
+    store, google = Mock(spec=Store), Mock()
     store.load.return_value = version
     store.assert_destination_current.side_effect = ValueError(
         "A later reporting day owns this source destination"
