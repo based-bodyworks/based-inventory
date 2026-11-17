@@ -1,0 +1,65 @@
+Hi All,
+
+Daily Sales as of 10.27:
+
+  *   5,087 units sold yesterday, missing Target’s forecast by -25%.
+     *   19,917 total week to date, down -12%. 869,606 Launch to date.
+     *   1,531 stores registered a sale yesterday.
+        *   Sea Salt Spray is 2% OOS, Leave In 3%, Curl Cream 2%, and Texture Powder 15% OOS.
+     *   See Linked file [​xlsb icon]  HERE<https://onepltfrm.sharepoint.com/:x:/r/sites/RetailServicesFiles/Shared%20Documents/General/Target/All%20Vendors/BASED/2026/Reporting/Daily%20Sales/2026%20PLTFRM%20-%20Target%20Daily%20Sales%20-%20BASED.xlsb?d=w71e3a5542a3a4c0997cb1566d82b4050&csf=1&web=1&e=ULKMoF> for item and store level details.
+
+Week to Date Performance:
+Row Labels
+$ ty
+U ty
+U fcst
+% to fcst
+asp
+locs trk
+oos locs
+oos%
+SANTAL SEA SALT SPRAY
+$117,265
+6,575
+6,877
+-4.4%
+$17.83
+5,232
+113
+2.1%
+LEAVE-IN CONDITIONER
+$90,778
+5,089
+6,017
+-15.4%
+$17.84
+5,232
+113
+2.1%
+TEXTURE POWDER
+$78,962
+4,432
+5,623
+-21.2%
+$17.82
+5,232
+764
+14.2%
+CURL CREAM
+$68,098
+3,820
+4,208
+-9.2%
+$17.83
+5,232
+74
+1.4%
+Grand Total
+$355,103
+19,916
+22,725
+-12.4%
+$17.83
+20,928
+1,064
+4.9%

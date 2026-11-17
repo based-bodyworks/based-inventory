@@ -1,0 +1,116 @@
+{
+  "schema_version": "based.target-inventory-bindings.v1",
+  "reviewed_on": "2026-11-04",
+  "source_of_truth": "ShipHero available for the exact verified warehouse SKU. Never subtract Target retail sellthrough again.",
+  "bindings": [
+    {
+      "report_label": "SANTAL SEA SALT SPRAY",
+      "report_sku": "BB2000S-1-6-1",
+      "inventory_sku": "BB2000S-1-6-1-RETAIL",
+      "identity_status": "verified_retail_alias",
+      "provider_product_name": "Sea Salt Spray Retail",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live ShipHero exact retail SKU and provider title; /Users/avijhingan/Desktop/sop-target-retail-aliases-snapshot-2026-11-04.json"
+    },
+    {
+      "report_label": "LEAVE-IN CONDITIONER",
+      "report_sku": "BB-LEAVEIN-ONE",
+      "inventory_sku": "BB-LEAVEIN-ONE-RETAIL",
+      "identity_status": "verified_retail_alias",
+      "provider_product_name": "Leave In Cond Retail",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live ShipHero exact retail SKU and provider title; /Users/avijhingan/Desktop/sop-target-retail-aliases-snapshot-2026-11-04.json"
+    },
+    {
+      "report_label": "TEXTURE POWDER",
+      "report_sku": "44126606262501",
+      "inventory_sku": "44126606262501-RETAIL",
+      "identity_status": "verified_retail_alias",
+      "provider_product_name": "Texture Powder Retail",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live ShipHero exact retail SKU and provider title; /Users/avijhingan/Desktop/sop-target-retail-aliases-snapshot-2026-11-04.json"
+    },
+    {
+      "report_label": "CURL CREAM",
+      "report_sku": "BB-CC-SINGLE",
+      "inventory_sku": "BB-CC-SINGLE-RETAIL",
+      "identity_status": "verified_retail_alias",
+      "provider_product_name": "Curl Cream Retail",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live ShipHero exact retail SKU and provider title; /Users/avijhingan/Desktop/sop-target-retail-aliases-snapshot-2026-11-04.json"
+    },
+    {
+      "report_label": "MINI-SEA SALT SPRAY-DUSK",
+      "report_sku": "BB-SSS-MINI-DUSK",
+      "inventory_sku": "BB-SSS-MINI-DUSK",
+      "identity_status": "verified_target_order",
+      "provider_product_name": "Mini Sea Salt Spray - Dusk ",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live exact ShipHero warehouse SKU/title plus fulfilled TARGET-BULKSHIP-9547 line item, quantity 37380. /Users/avijhingan/Desktop/sop-target-bulkship-lineitems-2026-11-04.json",
+      "verified_order": {
+        "id": "T3JkZXI6ODk3NzE4OTQ4",
+        "order_number": "TARGET-BULKSHIP-9547",
+        "fulfillment_status": "fulfilled",
+        "sku": "BB-SSS-MINI-DUSK",
+        "quantity": 37380
+      }
+    },
+    {
+      "report_label": "MINI-BODY LOTION-DUSK",
+      "report_sku": "BB-BDYLTN-MINI-DUSK",
+      "inventory_sku": "BB-BDYLTN-MINI-DUSK",
+      "identity_status": "verified_target_order",
+      "provider_product_name": "Mini Body Lotion - Dusk ",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live exact ShipHero warehouse SKU/title plus fulfilled TARGET-BULKSHIP-9547 line item, quantity 37380. /Users/avijhingan/Desktop/sop-target-bulkship-lineitems-2026-11-04.json",
+      "verified_order": {
+        "id": "T3JkZXI6ODk3NzE4OTQ4",
+        "order_number": "TARGET-BULKSHIP-9547",
+        "fulfillment_status": "fulfilled",
+        "sku": "BB-BDYLTN-MINI-DUSK",
+        "quantity": 37380
+      }
+    },
+    {
+      "report_label": "MINI-LEAVE-IN COND",
+      "report_sku": "BB-LI-MINI",
+      "inventory_sku": "BB-LI-MINI",
+      "identity_status": "verified_target_order",
+      "provider_product_name": "Mini Leave-In Conditioner ",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live exact ShipHero warehouse SKU/title plus fulfilled TARGET-BULKSHIP-9547 line item, quantity 37380. /Users/avijhingan/Desktop/sop-target-bulkship-lineitems-2026-11-04.json",
+      "verified_order": {
+        "id": "T3JkZXI6ODk3NzE4OTQ4",
+        "order_number": "TARGET-BULKSHIP-9547",
+        "fulfillment_status": "fulfilled",
+        "sku": "BB-LI-MINI",
+        "quantity": 37380
+      }
+    },
+    {
+      "report_label": "MINI-SKIN REVIVAL SPRAY",
+      "report_sku": "BB-SRS-MINI",
+      "inventory_sku": "BB-SRS-MINI-RETAIL",
+      "identity_status": "verified_retail_alias",
+      "provider_product_name": "Mini Skin Revival Spray Retail",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live ShipHero exact retail SKU and provider title; /Users/avijhingan/Desktop/sop-target-retail-aliases-snapshot-2026-11-04.json"
+    },
+    {
+      "report_label": "MINI-CURL CREAM",
+      "report_sku": "BB-CC-MINI-SANTAL",
+      "inventory_sku": "BB-CC-MINI-SANTAL",
+      "identity_status": "verified_target_order",
+      "provider_product_name": "Mini Curl Cream - Santal ",
+      "provider_kit": false,
+      "evidence": "2026-11-04 live exact ShipHero warehouse SKU/title plus fulfilled TARGET-BULKSHIP-9547 line item, quantity 37380. /Users/avijhingan/Desktop/sop-target-bulkship-lineitems-2026-11-04.json",
+      "verified_order": {
+        "id": "T3JkZXI6ODk3NzE4OTQ4",
+        "order_number": "TARGET-BULKSHIP-9547",
+        "fulfillment_status": "fulfilled",
+        "sku": "BB-CC-MINI-SANTAL",
+        "quantity": 37380
+      }
+    }
+  ]
+}

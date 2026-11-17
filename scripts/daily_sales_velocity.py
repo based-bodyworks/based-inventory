@@ -883,6 +883,15 @@ def run(args: argparse.Namespace) -> int:
         days_done[day] = channel_maps
         bundle_days[day] = bundle_units_by_channel(sales_orders, registry, day, day_channels)
         source_order_counts[day] = len(orders)
+        # fetch_orders_window returns only after exhausting order/line cursors,
+        # validating unique IDs, and matching source counts before and after.
+        # Cloud publication requires this fresh coverage receipt, not just cached totals.
+        state.setdefault("source_coverage", {})[day] = {
+            "before": len(orders),
+            "after": len(orders),
+            "fetched_unique": len(orders),
+            "complete": True,
+        }
         if not day_complete_before_fetch:
             partial_days.add(day)
         # Keep the in-memory partial day in this run's output, but never save

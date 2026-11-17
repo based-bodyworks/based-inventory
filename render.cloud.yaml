@@ -1,0 +1,74 @@
+# OPT-IN PROPOSAL ONLY. This file is not the active render.yaml.
+# Do not connect this Blueprint, provision secrets, deploy services, or enable
+# writers until the specific PR, live test and cutover approvals are complete.
+# autoDeployTrigger: "off" prevents commit-triggered updates, not initial creation.
+# Writes remain disabled even if someone imports this file accidentally.
+# Official schema: https://render.com/docs/blueprint-spec
+services:
+  - type: cron
+    name: based-cloud-sales-proposed
+    runtime: docker
+    region: oregon
+    dockerfilePath: ./Dockerfile.pipeline
+    dockerContext: .
+    autoDeployTrigger: "off"
+    schedule: "0 11 * * *"
+    dockerCommand: python -m based_inventory.pipeline sales
+    envVars: &pipeline_env
+      - key: PIPELINE_ALLOW_WRITES
+        value: "0"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: based-cloud-sales-db-proposed
+          property: connectionString
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      - key: SHIPHERO_REFRESH_TOKEN
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_REPORT_CHANNEL_ID
+        sync: false
+      - key: POLAR_API_KEY
+        sync: false
+      - key: TARGET_GMAIL_QUERY
+        sync: false
+      - key: TARGET_WORKBOOK_ID
+        sync: false
+  - type: cron
+    name: based-cloud-trackers-proposed
+    runtime: docker
+    region: oregon
+    dockerfilePath: ./Dockerfile.pipeline
+    dockerContext: .
+    autoDeployTrigger: "off"
+    # Summer 14:00 UTC; winter 15:00 UTC. Allow 07:00 <= local start < 08:00.
+    # The adjacent DST candidate falls outside this window and exits untouched.
+    schedule: "0 14,15 * * *"
+    dockerCommand: python -m based_inventory.pipeline trackers --at-local-time 07:00
+    envVars: *pipeline_env
+  - type: cron
+    name: based-cloud-monitor-proposed
+    runtime: docker
+    region: oregon
+    dockerfilePath: ./Dockerfile.pipeline
+    dockerContext: .
+    autoDeployTrigger: "off"
+    # Summer 15:45 UTC; winter 16:45 UTC. Allow 08:45 <= local start < 09:45.
+    # A delay of 60 minutes or more is outside the window. Monitor never sends Slack messages.
+    schedule: "45 15,16 * * *"
+    dockerCommand: python -m based_inventory.pipeline monitor --at-local-time 08:45
+    envVars: *pipeline_env
+databases:
+  - name: based-cloud-sales-db-proposed
+    region: oregon
+    plan: 0.1c-256mb
+    diskSizeGB: 5
+    connectionPool: none
+    databaseName: based_sales_pipeline
+    user: based_sales_pipeline
+    ipAllowList: []

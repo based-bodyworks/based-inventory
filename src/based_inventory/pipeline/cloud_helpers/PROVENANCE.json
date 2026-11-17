@@ -1,0 +1,19 @@
+{
+  "source": "based-sop-deck/scripts, read 2026-11-17",
+  "sha256_before_port": {
+    "parse_target_report.py": "63386494e1113030fea7b44cc99d4518bc7b368080183f2a2835ee7c545bedeb",
+    "verify_target_readback.py": "37a33196650a54e0c8fbfb50d93c5978edbee8c416f32713f66f2f78d33c625f",
+    "normalize_afn.py": "12cfff4f1ab2ae24b1354d7b8a5c34b8e54e34c50969cdfaf124d368d9043857",
+    "amazon_inventory_plan.py": "9e6d28a060d4c76801c06d8dfa30f5052b8945d8289e3d1a6218c13118420bcd",
+    "collect_inventory_snapshot.py": "99fab33451238ad5e0f20e80a36cd073a1eba357cef56bd42829576da248b01e",
+    "catalog.json": "b36a4c78ba8be2e1249d3d9eba232ced9a5dee2a1bd032f254a60ec8ebafb40f",
+    "inventory_catalog.json": "e94e1077f72d1d5310f565da644e1e9a461842a92ddfe096dfcf08451a1395f1",
+    "target_product_map.json": "455bffc1456c6dac3005e45d96dfdbd979e102495fb9772a7ca4ca20c5a591ae",
+    "target_inventory_bindings.json": "69469619d336dac5f24f5559e26508e4ce38ba84dc0777703590e37c8847bc21",
+    "amazon_listing_annotations.json": "244a0e7d8d09374b914a647497d04b5b072ce24b7c5ae332675c2b09f5c583bf",
+    "test_parse_target_report.py": "3ec36d23299c984cdc2e37f50e5fb9e14d2b65708742008d6fb9df040811001f",
+    "test_collect_inventory_snapshot.py": "dd57f00b867bab9fdee399d91fa076474b851832eefeaf2916ed72dfd2b1db8f",
+    "test_amazon_inventory_plan.py": "e9f9b09d7536a346cad400cb5f4fdd53addd71980ada3867f3720e0efbd265fc"
+  },
+  "changes": "Stock helper retains pure validation/planning only; removed local credential loader/CLI and its two loader-specific tests. Replaced those checks with server adapter checks. Applied repository Python 3.12 lint/format fixes; retained 61 pure helper regression cases. synthetic_target_template.xlsx contains only inspected formula/header layout and invented numeric source records; no original workbook sales, caches, notes, metadata or messages."
+}
