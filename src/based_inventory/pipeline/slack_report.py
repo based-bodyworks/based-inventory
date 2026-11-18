@@ -79,7 +79,9 @@ class SlackReport:
         if digest(self.download(info["url_private_download"])) != digest(version.report):
             raise SlackReportError("Saved Slack report hash mismatch")
 
-    def publish(self, store, version, *, summary_text: str | None = None):
+    def publish(
+        self, store, version, *, summary_text: str | None = None, report_title: str | None = None
+    ):
         store.assert_current(version.version_id)
         receipt = store.receipts(version.version_id).get("slack")
         if receipt:
@@ -124,7 +126,12 @@ class SlackReport:
             self.call(
                 "files.completeUploadExternal",
                 {
-                    "files": [{"id": file_id, "title": f"BASED Merchant Sales {version.day}"}],
+                    "files": [
+                        {
+                            "id": file_id,
+                            "title": report_title or f"BASED Merchant Sales {version.day}",
+                        }
+                    ],
                     "channel_id": self.channel,
                     "initial_comment": summary_text,
                 },

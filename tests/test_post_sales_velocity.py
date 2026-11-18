@@ -72,6 +72,7 @@ def test_first_complete_send_is_frozen_and_a_retry_does_not_recollect_or_duplica
     assert len(calls) == 1
     assert server.reservations == 1
     assert len(server.comments) == 1
+    assert server.titles == [f"BASED Daily SKU Sales Velocity | {source.day}"]
 
 
 def test_partial_source_data_never_posts_a_false_all_channel_total(setup, tmp_path, monkeypatch):

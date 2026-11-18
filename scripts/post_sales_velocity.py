@@ -205,7 +205,10 @@ def _run(args, now):
             return 0
         _output(package, args.out_dir)
         file_id = SlackReport(token, channel).publish(
-            archive.delivery_store(package, channel), package, summary_text=package.summary
+            archive.delivery_store(package, channel),
+            package,
+            summary_text=package.summary,
+            report_title=f"BASED Daily SKU Sales Velocity | {package.day}",
         )
     print(f"All-channel daily SKU report checked in {channel} for {day} ({file_id})")
     return 0

@@ -54,6 +54,7 @@ class SlackServer:
         self.completed = False
         self.report = b""
         self.comments = []
+        self.titles = []
 
     def post(self, url, *, data=None, json=None, **kwargs):
         if url.endswith("files.getUploadURLExternal"):
@@ -66,6 +67,7 @@ class SlackServer:
             return Response()
         if url.endswith("files.completeUploadExternal"):
             self.comments.append(json["initial_comment"])
+            self.titles.append(json["files"][0]["title"])
             if self.mode != "ambiguous":
                 self.completed = True
             if self.mode in {"ambiguous", "lost-success"}:
