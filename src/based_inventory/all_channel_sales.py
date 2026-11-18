@@ -40,6 +40,11 @@ METRICS = {
 MAX_ROWS = 100_000
 MAX_RAW_BYTES = 64 * 1024 * 1024
 COMPONENTS_PATH = Path(__file__).resolve().parents[2] / "data/set-components.json"
+# Bound to native Shopify app/order metadata on 2026-11-18. These are
+# non-customer seeding sources, not marketplace mirrors or paid channels.
+SHOPIFY_PROMOTIONAL_SOURCES = frozenset(
+    {"73360408577", "influencer gift form", "cortex-pr-orders", "cortex"}
+)
 
 
 def _freeze(value):
@@ -172,6 +177,9 @@ class SalesDay:
                 raise ValueError("Saved sales source integrity is mismatched or differs from proof")
             if source.get("response_limits", {}) != proof.get("response_limits", {}):
                 raise ValueError("Saved sales source response limits differ from proof")
+            for key in ("excluded_mirrored_listing_units", "excluded_promotional_listing_units"):
+                if source.get(key) != proof.get(key):
+                    raise ValueError("Saved sales source exclusions differ from proof")
             for key in ("listing_units", "control_listing_units", "source_row_count"):
                 if type(source.get(key)) is not int or source[key] < 0:
                     raise ValueError("Invalid saved sales source control")
@@ -271,6 +279,10 @@ def _marketplace_mirror(label: str) -> bool:
     )
 
 
+def _promotional_source(label: str) -> bool:
+    return label.casefold().strip() in SHOPIFY_PROMOTIONAL_SOURCES
+
+
 def normalize_online_rows(records, channel, registry, known_kit_skus, inventory, aliases):
     """Normalize native per-order listing rows, not an already summed SKU grid."""
     if channel not in METRICS:
@@ -296,6 +308,8 @@ def normalize_online_rows(records, channel, registry, known_kit_skus, inventory,
         seen.add(key)
         if channel == "Shopify" and _marketplace_mirror(str(row.get("sales_channel_name") or "")):
             excluded += units
+            continue
+        if channel == "Shopify" and _promotional_source(str(row.get("sales_channel_name") or "")):
             continue
         candidates = list(dict.fromkeys((raw_sku, base_sku(raw_sku))))
         sku = next(
@@ -561,6 +575,15 @@ def collect_online_source(
     rows, issues, excluded = normalize_online_rows(
         records, channel, registry, known_kit_skus, inventory, aliases
     )
+    promotional = (
+        sum(
+            row["units"]
+            for row in records
+            if _promotional_source(str(row.get("sales_channel_name") or ""))
+        )
+        if channel == "Shopify"
+        else 0
+    )
     integrity = {
         label: verdict
         for label, result in (("report", report), ("control", control))
@@ -580,6 +603,11 @@ def collect_online_source(
             "aliases": {key: sorted(values) for key, values in aliases.items()},
             "integrity": integrity,
             "response_limits": response_limits,
+            "excluded_mirrored_listing_units": excluded,
+            "excluded_promotional_listing_units": promotional,
+            "promotional_source_labels": sorted(SHOPIFY_PROMOTIONAL_SOURCES)
+            if channel == "Shopify"
+            else [],
         }
     )
     return {
@@ -601,6 +629,7 @@ def collect_online_source(
         "integrity": integrity,
         "response_limits": response_limits,
         "excluded_mirrored_listing_units": excluded,
+        "excluded_promotional_listing_units": promotional,
         "source_labels": sorted(
             {str(r.get("sales_channel_name")) for r in records if r.get("sales_channel_name")}
         ),
@@ -609,6 +638,9 @@ def collect_online_source(
             "returns": "not deducted",
             "zero_value_orders": "included",
             "gift_cards": "excluded" if channel == "Shopify" else "not applicable",
+            "creator_gifting_and_pr_orders": "known Shopify sources excluded"
+            if channel == "Shopify"
+            else "not separately identified",
             "fulfillment": "all",
         },
         "issues": issues,

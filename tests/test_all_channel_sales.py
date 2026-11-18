@@ -219,12 +219,47 @@ def test_shopify_marketplace_mirrors_are_excluded_but_numeric_sources_are_not_gu
     records = [
         {"order_id": "one", "sku": "SALT", "units": 2, "sales_channel_name": "TikTok Shop"},
         {"order_id": "two", "sku": "SALT", "units": 3, "sales_channel_name": "Amazon.com"},
-        {"order_id": "three", "sku": "SALT", "units": 4, "sales_channel_name": "73360408577"},
+        {"order_id": "three", "sku": "SALT", "units": 4, "sales_channel_name": "294412648449"},
     ]
     rows, issues, excluded = normalize_online_rows(
         records, "Shopify", empty_registry(), set(), {"SALT": "Sea Salt"}, {}
     )
     assert rows[0].units == 4 and excluded == 5 and not issues
+
+
+def test_known_shopify_creator_and_pr_orders_are_separate_from_customer_sales():
+    from based_inventory.all_channel_sales import (
+        METRICS,
+        collect_online_source,
+        decode_source_proof,
+    )
+
+    metric = METRICS["Shopify"]
+    records = [
+        {"order_id": "creator", "sku": "SALT", metric: 3, "sales_channel_name": "73360408577"},
+        {"order_id": "pr", "sku": "SALT", metric: 2, "sales_channel_name": "cortex-pr-orders"},
+        {"order_id": "paid", "sku": "SALT", metric: 1, "sales_channel_name": "294412648449"},
+        {"order_id": "customer-gift", "sku": "SALT", metric: 4, "sales_channel_name": "web"},
+        {"order_id": "mirror", "sku": "SALT", metric: 6, "sales_channel_name": "Amazon"},
+    ]
+    result = collect_online_source(
+        DAY,
+        "Shopify",
+        Polar(report(metric, records)),
+        ZONE,
+        empty_registry(),
+        set(),
+        {"SALT": "Salt"},
+        {},
+    )
+    assert result["listing_units"] == result["control_listing_units"] == 16
+    assert result["component_units"] == 5
+    assert result["excluded_promotional_listing_units"] == 5
+    assert result["excluded_mirrored_listing_units"] == 6
+    proof = decode_source_proof(result)
+    assert proof["excluded_promotional_listing_units"] == 5
+    assert proof["excluded_mirrored_listing_units"] == 6
+    assert "73360408577" in proof["promotional_source_labels"]
 
 
 @pytest.mark.parametrize(

@@ -241,6 +241,17 @@ def test_workbook_provider_names_are_text_not_excel_formulas(tmp_path):
     workbook.close()
 
 
+def test_saved_workbook_does_not_claim_a_warehouse_source_when_none_is_attached():
+    workbook = openpyxl.load_workbook(io.BytesIO(build(sales(), {})))
+    definition = next(
+        row[1].value for row in workbook["Methods"] if row[0].value == "Warehouse-only reference"
+    )
+    assert "unavailable for this report" in definition
+    assert "date and scope are shown" not in definition
+    assert not any(row[0].value == "Warehouse-only" for row in workbook["Sources"])
+    workbook.close()
+
+
 def test_numeric_sku_identifiers_keep_their_full_text_display(tmp_path):
     identifier = "00441266062650"
     path = catalog(tmp_path, [{"sku": identifier, "product": "Texture Powder"}])

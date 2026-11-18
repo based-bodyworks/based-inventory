@@ -57,7 +57,7 @@ daily average, and Shopify, TikTok, Amazon and Target counts.
 
 | Source | Count used |
 | --- | --- |
-| Shopify, through Polar | Units ordered, including free items; cancelled orders and gift cards excluded; before returns. Recognized marketplace mirror channels are excluded. |
+| Shopify, through Polar | Units ordered, including free items within customer orders; cancelled orders and gift cards excluded; before returns. Recognized marketplace mirror channels and verified creator-gifting/PR sources are excluded. |
 | TikTok Shop, through Polar | Units ordered across seller and TikTok fulfillment, including free items; cancelled orders excluded; before returns. |
 | Amazon, through Polar | Units ordered across Amazon and merchant fulfillment; cancelled orders excluded; before returns. |
 | Target daily email report | Product-row retail units for the printed report date, including the mapped retail packaging and minis. Replenishment shipments are not store sales. |
@@ -69,8 +69,8 @@ calendar dates; it does not relabel a UTC warehouse interval as a Pacific day.
 
 Each as-sold kit expands into its component quantities. Separately ordered
 loose units are added to those quantities. Additional positive sold SKUs remain
-visible with their SKU codes. An unverified product
-mapping withholds the affected channel and headline physical-unit totals and
+visible with their SKU codes. An unverified product mapping withholds the
+affected channel and headline physical-unit totals and
 the seven-day average, rather than silently dropping that SKU.
 
 The average is the sum of seven complete reporting dates divided by seven.
@@ -93,6 +93,11 @@ to that control. An explicit provider integrity mismatch blocks the report.
 Target must have a complete dated product table with verified product
 bindings; daily units and week-to-date units are kept distinct. Any difference
 between Target's product-row total and its headline stays visible.
+
+Shopify creator-gifting and PR exclusions are based on verified source/app
+bindings (`73360408577` / Influencer Gift Form and `cortex-pr-orders` / Cortex).
+They are recorded separately from marketplace mirror exclusions. Numeric
+channels are otherwise retained; the verified Google AI channel is customer sales.
 
 Unavailable, late or failed required sources withhold the all-channel report.
 The job records at most one pending-report notice attempt for that date and

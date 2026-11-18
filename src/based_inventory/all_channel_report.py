@@ -244,6 +244,7 @@ def render_sales_report(
             "",
             "Online counts are units ordered, including free items, before returns. "
             "Cancelled online orders are excluded. Target units follow its retail report.",
+            "Known Shopify creator-gifting and PR orders are excluded from sales counts; free items within customer orders remain included.",
             "Packs and bundles are counted once through their components. "
             "TikTok includes TikTok fulfillment; Amazon includes Amazon and merchant fulfillment.",
             _RECIPE_HISTORY,
@@ -328,7 +329,7 @@ def _row_height(values, widths, minimum: int) -> float:
 def _source_rows(current, merchant):
     rows = []
     definitions = {
-        "Shopify": "Units ordered on Shopify; packs and bundles count through their contents. Cancelled orders and gift cards excluded; free items included; before returns.",
+        "Shopify": "Units ordered on Shopify; packs and bundles count through their contents. Cancelled orders, gift cards, recognized marketplace mirrors and known creator-gifting/PR orders excluded; free items within customer orders included; before returns.",
         "TikTok": "Units ordered on TikTok Shop across seller and TikTok fulfillment. Packs and bundles count through their contents; cancelled orders excluded; free items included; before returns.",
         "Amazon": "Units ordered on Amazon across Amazon and merchant fulfillment. Packs and bundles count through their contents; cancelled orders excluded; before returns.",
         "Target": "Units sold in the dated retailer report, derived from product rows; Target replenishment shipments excluded.",
@@ -336,10 +337,12 @@ def _source_rows(current, merchant):
     labels = {
         "captured_at": "When this source was collected.",
         "data_through": "Latest sales time available in the source when collected.",
-        "listing_units": "Source units before pack and bundle component expansion.",
+        "listing_units": "Source units before source exclusions and pack or bundle component expansion.",
         "control_listing_units": "Independent total before pack and bundle component expansion.",
         "source_row_count": "Number of complete source rows read.",
-        "component_units": "Units after pack and bundle component expansion.",
+        "component_units": "Sales units after source exclusions and pack or bundle component expansion.",
+        "excluded_mirrored_listing_units": "Shopify listing units from recognized marketplace mirrors, excluded to avoid adding them again.",
+        "excluded_promotional_listing_units": "Shopify creator-gifting and PR listing units excluded from sales, before pack expansion.",
         "raw_sha256": "Hash identifying the exact captured source data.",
         "provider_query": "Source report link or query reference.",
         "scope": "Orders and exclusions covered by this source.",
@@ -524,7 +527,7 @@ def build_sales_workbook(
     method_rows = [
         (
             "Reported units",
-            "Online counts are units ordered, including free items, before returns. Cancelled online orders are excluded. Target units follow its retail report.",
+            "Online counts are units ordered, including free items, before returns. Cancelled online orders are excluded. Known Shopify creator-gifting and PR orders are excluded from sales; free items within customer orders remain included. Target units follow its retail report.",
         ),
         (
             "Reporting day",
@@ -561,7 +564,9 @@ def build_sales_workbook(
         ),
         (
             "Warehouse-only reference",
-            "The separate Merchdrop reference uses complete UTC order dates before cancellation or return adjustments. It is not added to the all-channel sales counts. Its date and scope are shown in the column label and Sources.",
+            "The separate Merchdrop reference uses complete UTC order dates before cancellation or return adjustments. It is not added to the all-channel sales counts. Its date and scope are shown in the column label and Sources."
+            if merchant is not None
+            else "Warehouse-only units are unavailable for this report and are not included in all-channel sales counts.",
         ),
         (
             "Observed sales",
