@@ -555,7 +555,10 @@ def test_dynamic_target_only_appends_to_empty_projection_and_reuses_exact_day():
         target_dynamic_plan(parsed, google)
 
 
-def test_server_afn_query_uses_complete_utc_scope_and_independent_total(monkeypatch):
+@pytest.mark.parametrize("force_truncated", [False, True])
+def test_server_afn_query_uses_complete_utc_scope_and_independent_total(
+    monkeypatch, force_truncated
+):
     from datetime import timedelta
     from unittest.mock import Mock
 
@@ -589,6 +592,15 @@ def test_server_afn_query_uses_complete_utc_scope_and_independent_total(monkeypa
                         "fulfillment_status",
                     ],
                 }
+            # Polar switches to a download preview above its 5,000-row inline cap,
+            # even when the complete dataset is small enough to return inline.
+            if args["limit"] > 5000 or force_truncated:
+                return {
+                    "tableData": rows[:1],
+                    "totalData": [{module.METRIC: 7}],
+                    "truncated": True,
+                    "download": {"url": "https://api.polaranalytics.com/fake-export"},
+                }
             return {
                 "tableData": rows,
                 "totalData": [{module.METRIC: 7}],
@@ -617,6 +629,10 @@ def test_server_afn_query_uses_complete_utc_scope_and_independent_total(monkeypa
     polar = Polar()
     shiphero = Mock()
     shiphero.fetch_all_kits.return_value = []
+    if force_truncated:
+        with pytest.raises(SourceIncomplete, match="query incomplete"):
+            module.collect_amazon(end, polar, shiphero)
+        return
     result = module.collect_amazon(end, polar, shiphero)
     assert result["normalized"]["physical_units"] == 7
     reports = [args for name, args in polar.queries if name == "generate_report"]
