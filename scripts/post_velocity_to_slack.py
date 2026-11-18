@@ -19,12 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from dotenv import load_dotenv  # noqa: E402
-from redis.exceptions import RedisError  # noqa: E402
+from psycopg import Error as DatabaseError  # noqa: E402
 
 from based_inventory.daily_velocity_report import render_report  # noqa: E402
 from based_inventory.pipeline.extract import load_extract  # noqa: E402
 from based_inventory.pipeline.slack_report import SlackReport, SlackReportError  # noqa: E402
-from based_inventory.velocity_archive import VelocityArchive  # noqa: E402
+from based_inventory.velocity_archive import POSTGRES_SCHEMES, VelocityArchive  # noqa: E402
 
 
 def _load_version(xlsx: Path, day: date):
@@ -43,11 +43,11 @@ def _run(args) -> int:
     version = _load_version(Path(args.xlsx), day)
     preview = args.preview or os.getenv("DRY_RUN", "0") == "1"
     if preview:
-        # Environment state may be a production Redis URL. A preview must not
-        # contact it, nor create any history/receipt merely to print a draft.
+        # Production database secrets must never turn a preview into a remote
+        # read or create history/receipts merely to print a draft.
         history = {}
         if args.history:
-            if args.history.startswith(("redis://", "rediss://")):
+            if "://" in args.history:
                 raise ValueError(
                     "Preview accepts only explicit local history, never remote history"
                 )
@@ -58,12 +58,12 @@ def _run(args) -> int:
 
     location = (
         args.history
+        or os.getenv("VELOCITY_DATABASE_URL")
         or os.getenv("VELOCITY_HISTORY_PATH")
-        or os.getenv("STATE_PATH")
         or str(ROOT / "data/sales-velocity/history")
     )
-    if os.getenv("ENV") == "prod" and not location.startswith(("redis://", "rediss://")):
-        raise ValueError("Production daily velocity requires a durable Redis history archive")
+    if os.getenv("ENV") == "prod" and not location.startswith(POSTGRES_SCHEMES):
+        raise ValueError("Production daily velocity requires PostgreSQL via VELOCITY_DATABASE_URL")
     token = os.getenv("SLACK_BOT_TOKEN")
     if not args.archive_only and not token:
         raise ValueError("SLACK_BOT_TOKEN is required to publish; use --preview for a draft")
@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--xlsx", required=True)
     parser.add_argument("--day", required=True, help="Complete UTC day, YYYY-MM-DD")
     parser.add_argument("--channel", help="Slack channel; defaults to SLACK_CHANNEL")
-    parser.add_argument("--history", help="Dedicated local archive directory or Redis URL")
+    parser.add_argument("--history", help="Dedicated local archive directory or PostgreSQL URL")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--preview", action="store_true", help="Print the draft without any network access"
@@ -104,8 +104,8 @@ def main(argv: list[str] | None = None) -> int:
             "ERROR: required daily source artifacts or archive files are unavailable",
             file=sys.stderr,
         )
-    except RedisError:
-        print("ERROR: durable daily velocity archive is unavailable", file=sys.stderr)
+    except DatabaseError:
+        print("ERROR: durable PostgreSQL velocity archive is unavailable", file=sys.stderr)
     return 1
 
 

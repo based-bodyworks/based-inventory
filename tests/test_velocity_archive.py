@@ -1,7 +1,6 @@
 import json
 from datetime import date, timedelta
 
-import fakeredis
 import pytest
 
 from based_inventory.pipeline.models import digest
@@ -49,17 +48,11 @@ def test_archive_window_keeps_missing_dates_missing_and_rejects_misdated_record(
         archive.window(end)
 
 
-def test_redis_archive_uses_its_own_namespace_and_report_retention(monkeypatch):
-    client = fakeredis.FakeRedis(decode_responses=True)
-    client.set("based-inventory:alert-state", "original alert state")
-    monkeypatch.setattr("redis.from_url", lambda *a, **k: client)
-    with VelocityArchive("redis://local") as archive:
-        archive.save(verified())
-        assert archive.latest(verified().day) == verified()
-    assert client.get("based-inventory:alert-state") == "original alert state"
-    keys = client.keys("based-inventory:daily-velocity:v1:day:*")
-    assert len(keys) == 1
-    assert 0 < client.ttl(keys[0]) <= 45 * 86400
+@pytest.mark.parametrize("location", ["redis://local", "rediss://local"])
+def test_nonpersistent_redis_is_never_an_archive_backend(location, monkeypatch):
+    monkeypatch.setattr("redis.from_url", lambda *a, **k: pytest.fail("Redis opened"))
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        VelocityArchive(location)
 
 
 def test_daily_delivery_receipts_survive_reruns_and_block_a_different_version(tmp_path):

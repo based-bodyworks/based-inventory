@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 import requests
+from psycopg import OperationalError
 
 from based_inventory.velocity_archive import VelocityArchive
 from tests.test_pipeline_extract import package
@@ -30,6 +31,7 @@ def report(tmp_path, monkeypatch):
     monkeypatch.delenv("DRY_RUN", raising=False)
     monkeypatch.delenv("STATE_PATH", raising=False)
     monkeypatch.delenv("VELOCITY_HISTORY_PATH", raising=False)
+    monkeypatch.delenv("VELOCITY_DATABASE_URL", raising=False)
     return stem, ["--xlsx", str(stem.with_suffix(".xlsx")), "--day", "2026-11-16"]
 
 
@@ -93,7 +95,9 @@ def test_preview_needs_no_credentials_or_network_and_shows_every_catalog_row(
     _, args = report
     monkeypatch.setattr(requests, "Session", lambda: pytest.fail("preview opened Slack"))
     monkeypatch.setattr("redis.from_url", lambda *a, **k: pytest.fail("preview opened Redis"))
+    monkeypatch.setattr("psycopg.connect", lambda *a, **k: pytest.fail("preview opened database"))
     monkeypatch.setenv("STATE_PATH", "redis://not-a-preview-source")
+    monkeypatch.setenv("VELOCITY_DATABASE_URL", "postgresql://not-a-preview-source")
     assert pvs.main([*args, "--preview"]) == 0
     text = capsys.readouterr().out
     assert "46 tracked SKUs" in text
@@ -103,12 +107,14 @@ def test_preview_needs_no_credentials_or_network_and_shows_every_catalog_row(
     assert "Product (`sku`): *4* | n/a" in text
 
 
-def test_dry_run_never_opens_redis_or_sends_slack(report, monkeypatch, capsys):
+def test_dry_run_never_opens_remote_history_or_sends_slack(report, monkeypatch, capsys):
     _, args = report
     monkeypatch.setenv("DRY_RUN", "1")
     monkeypatch.setenv("STATE_PATH", "redis://not-a-preview-source")
+    monkeypatch.setenv("VELOCITY_DATABASE_URL", "postgresql://not-a-preview-source")
     monkeypatch.setattr(requests, "Session", lambda: pytest.fail("dry run opened Slack"))
     monkeypatch.setattr("redis.from_url", lambda *a, **k: pytest.fail("dry run opened Redis"))
+    monkeypatch.setattr("psycopg.connect", lambda *a, **k: pytest.fail("dry run opened database"))
     assert pvs.main(args) == 0
     assert "Daily SKU Velocity" in capsys.readouterr().out
 
@@ -126,9 +132,10 @@ def test_preview_can_read_only_explicit_local_verified_history(report, tmp_path,
     assert not any(p.name.endswith("2026-11-16.json") for p in history.glob("day*.json"))
 
 
-def test_preview_refuses_an_explicit_remote_history_source(report, capsys):
+@pytest.mark.parametrize("location", ["redis://not-allowed", "postgresql://not-allowed"])
+def test_preview_refuses_an_explicit_remote_history_source(report, capsys, location):
     _, args = report
-    assert pvs.main([*args, "--preview", "--history", "redis://not-allowed"]) == 1
+    assert pvs.main([*args, "--preview", "--history", location]) == 1
     assert "local history" in capsys.readouterr().err
 
 
@@ -152,7 +159,36 @@ def test_production_requires_a_durable_history_backend(report, tmp_path, monkeyp
     monkeypatch.setenv("SLACK_BOT_TOKEN", "test-token")
     monkeypatch.setattr(requests, "Session", lambda: pytest.fail("invalid config opened Slack"))
     assert pvs.main([*args, "--history", str(tmp_path / "ephemeral")]) == 1
-    assert "durable Redis" in capsys.readouterr().err
+    assert "PostgreSQL" in capsys.readouterr().err
+
+
+def test_production_refuses_redis_instead_of_claiming_durable_history(report, monkeypatch, capsys):
+    _, args = report
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("VELOCITY_DATABASE_URL", "redis://nonpersistent-service")
+    monkeypatch.setattr(requests, "Session", lambda: pytest.fail("invalid config opened Slack"))
+    assert pvs.main(args) == 1
+    assert "PostgreSQL" in capsys.readouterr().err
+
+
+def test_database_failure_stops_delivery_without_exposing_the_secret(report, monkeypatch, capsys):
+    _, args = report
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("VELOCITY_DATABASE_URL", "postgresql://private-connection")
+
+    def unavailable(_):
+        raise OperationalError("private-connection with credentials")
+
+    monkeypatch.setattr(pvs, "VelocityArchive", unavailable)
+    monkeypatch.setattr(
+        requests, "Session", lambda: pytest.fail("unavailable archive opened Slack")
+    )
+    assert pvs.main(args) == 1
+    text = capsys.readouterr().err
+    assert "PostgreSQL velocity archive is unavailable" in text
+    assert "private-connection" not in text
 
 
 def test_verified_send_saves_the_day_and_does_not_repeat_a_successful_upload(
