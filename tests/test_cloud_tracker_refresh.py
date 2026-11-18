@@ -429,6 +429,87 @@ def test_missing_formula_or_wrong_stock_readback_cannot_verify(monkeypatch):
         verify_requests(google, "spreadsheet", [request])
 
 
+@pytest.mark.parametrize("missing_cover", [None, "online", "online_as_scoped", "scope_marker"])
+@pytest.mark.parametrize(
+    ("scoped_sku", "scope_note"),
+    [
+        ("BB2000S-1-6-1-RETAIL", "Target retail-only SKU; online cover not applicable"),
+        ("BB-SSS-MINI-DUSK", "No verified online sales mapping; online cover unavailable"),
+    ],
+)
+def test_stock_refresh_preserves_registered_cover_scope(
+    monkeypatch, missing_cover, scoped_sku, scope_note
+):
+    import json
+    from datetime import datetime
+    from hashlib import sha256
+
+    from based_inventory.pipeline.cloud_helpers.collect_inventory_snapshot import build_snapshot
+    from based_inventory.pipeline.inventory_refresh import publish_inventory
+    from based_inventory.pipeline.source_refresh import verify_source_plan
+
+    now = datetime(2026, 11, 18, tzinfo=UTC)
+    catalog = [
+        {"sku": "online", "product": "Online item", "required": True},
+        {"sku": scoped_sku, "product": "Known scoped item", "required": True},
+    ]
+    source = {
+        "warehouse_id": "warehouse",
+        "warehouse_identifier": "main",
+        "on_hand": 7,
+        "available": 0,
+        "allocated": 7,
+        "reserve_inventory": 0,
+        "backorder": 0,
+        "sell_ahead": 0,
+        "updated_at": now.isoformat(),
+        "product": {"name": "Physical item", "kit": False},
+    }
+    snapshot = build_snapshot(
+        catalog,
+        [source | {"sku": item["sku"]} for item in catalog],
+        merchdrop_warehouse_id="warehouse",
+        collected_at=now,
+        now=now,
+    )
+    google = NativeSheets()
+    for column in range(8, 16):
+        google.data[(7, column)] = {"userEnteredValue": {"formulaValue": "=1"}}
+        google.data[(8, column)] = {
+            "userEnteredValue": {"stringValue": "n/a" if column < 15 else scope_note}
+        }
+    if missing_cover == "online":
+        for column in range(8, 16):
+            google.data[(7, column)] = {}
+    elif missing_cover == "online_as_scoped":
+        from copy import deepcopy
+
+        for column in range(8, 16):
+            google.data[(7, column)] = deepcopy(google.data[(8, column)])
+    elif missing_cover == "scope_marker":
+        google.data[(8, 15)] = {}
+    monkeypatch.setenv("PIPELINE_ALLOW_WRITES", "1")
+    if missing_cover:
+        with pytest.raises(SourceIncomplete, match="formulas|cover"):
+            publish_inventory(snapshot, google, mode="publish")
+        assert not google.writes
+        return
+    result = publish_inventory(snapshot, google, mode="publish")
+    assert result["status"] == "verified"
+    assert google.data[(8, 8)]["userEnteredValue"] == {"stringValue": "n/a"}
+    assert google.data[(8, 15)]["userEnteredValue"] == {"stringValue": scope_note}
+    plan = {
+        "receipt": result,
+        "digest": sha256(
+            json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+    verify_source_plan(google, plan)
+    google.data[(8, 8)]["userEnteredValue"] = {"stringValue": "incorrect"}
+    with pytest.raises(SourceIncomplete, match="stock-cover"):
+        verify_source_plan(google, plan)
+
+
 def test_unknown_workbook_summary_formula_blocks_refresh():
     from io import BytesIO
     from pathlib import Path

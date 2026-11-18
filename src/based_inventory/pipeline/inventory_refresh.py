@@ -14,6 +14,37 @@ from .google_api import ERP_ID, GoogleAPIError
 from .target_refresh import SourceIncomplete, asset, validate_mode, verify_requests
 
 
+def inventory_cover_values(native):
+    """Freeze both formulas and deliberate constants in the protected I:P range."""
+    return [
+        [dict(c.get("userEnteredValue", {})) for c in row.get("values", [])]
+        + [{}] * (8 - len(row.get("values", [])))
+        for sheet in native.get("sheets", [])
+        for grid in sheet.get("data", [])
+        for row in grid.get("rowData", [])
+    ]
+
+
+def verified_inventory_cover(native, products):
+    """Require formulas or the SKU's explicitly registered unavailable-scope cells."""
+    values = inventory_cover_values(native)
+    if len(values) != len(products) or not values:
+        raise SourceIncomplete("Current Inventory stock-cover rows are missing")
+    scope_notes = {
+        item["sku"]: item["online_cover_note"]
+        for item in asset("inventory_catalog.json")
+        if item.get("online_cover_note")
+    }
+    for product, row in zip(products, values, strict=True):
+        if product["sku"] in scope_notes:
+            expected = [{"stringValue": "n/a"}] * 7 + [{"stringValue": scope_notes[product["sku"]]}]
+            if row != expected:
+                raise SourceIncomplete("Current Inventory stock-cover scope changed")
+        elif not any(value.get("formulaValue") for value in row):
+            raise SourceIncomplete("Current Inventory I:P formulas are missing before refresh")
+    return values
+
+
 def collect_inventory(shiphero, *, now=None):
     catalog = asset("inventory_catalog.json")
     rows = []
@@ -81,19 +112,14 @@ def publish_inventory(snapshot, google, *, mode="compare", before_write=None):
                                 }
                             }
                         )
-    frozen_formulas = [
-        [c.get("userEnteredValue", {}).get("formulaValue") for c in r.get("values", [])]
-        for sh in before.get("sheets", [])
-        for g in sh.get("data", [])
-        for r in g.get("rowData", [])
-    ]
-    if not frozen_formulas or any(not any(r) for r in frozen_formulas):
-        raise SourceIncomplete("Current Inventory I:P formulas are missing before refresh")
+    frozen_cover = verified_inventory_cover(before, snapshot["products"])
+    frozen_formulas = [[value.get("formulaValue") for value in row] for row in frozen_cover]
     if mode == "publish" and before_write:
         before_write(
             {
                 "requests": {ERP_ID: requests},
                 "inventory_formulas": frozen_formulas,
+                "inventory_cover_values": frozen_cover,
                 "inventory_range": a1 + "!I8:P" + str(7 + len(snapshot["products"])),
                 "source_captured_at": snapshot["as_of_utc"],
             }
@@ -114,17 +140,8 @@ def publish_inventory(snapshot, google, *, mode="compare", before_write=None):
         )
     after = google.cells(ERP_ID, [a1 + "!I8:P" + str(7 + len(expected))])
 
-    def formulas(native):
-        return [
-            [c.get("userEnteredValue", {}).get("formulaValue") for c in r.get("values", [])]
-            for s in native.get("sheets", [])
-            for g in s.get("data", [])
-            for r in g.get("rowData", [])
-        ]
-
-    initial = formulas(before)
-    if initial != formulas(after) or not initial or any(not any(row) for row in initial):
-        raise SourceIncomplete("Current Inventory I:P formulas missing or changed")
+    if inventory_cover_values(after) != frozen_cover:
+        raise SourceIncomplete("Current Inventory I:P stock-cover cells missing or changed")
     return {
         "status": "verified",
         "captured_at": snapshot["as_of_utc"],
@@ -132,7 +149,8 @@ def publish_inventory(snapshot, google, *, mode="compare", before_write=None):
         "pool": snapshot["pool"],
         "verification": {
             "requests": {ERP_ID: requests},
-            "inventory_formulas": initial,
+            "inventory_formulas": frozen_formulas,
+            "inventory_cover_values": frozen_cover,
             "inventory_range": a1 + "!I8:P" + str(7 + len(expected)),
         },
     }

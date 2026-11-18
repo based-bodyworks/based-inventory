@@ -202,31 +202,37 @@
   {
     "product": "Mini Sea Salt Spray - Dusk",
     "sku": "BB-SSS-MINI-DUSK",
+    "online_cover_note": "No verified online sales mapping; online cover unavailable",
     "required": true
   },
   {
     "product": "Target retail Sea Salt Spray",
     "sku": "BB2000S-1-6-1-RETAIL",
+    "online_cover_note": "Target retail-only SKU; online cover not applicable",
     "required": true
   },
   {
     "product": "Target retail Leave-In Conditioner",
     "sku": "BB-LEAVEIN-ONE-RETAIL",
+    "online_cover_note": "Target retail-only SKU; online cover not applicable",
     "required": true
   },
   {
     "product": "Target retail Texture Powder",
     "sku": "44126606262501-RETAIL",
+    "online_cover_note": "Target retail-only SKU; online cover not applicable",
     "required": true
   },
   {
     "product": "Target retail Curl Cream",
     "sku": "BB-CC-SINGLE-RETAIL",
+    "online_cover_note": "Target retail-only SKU; online cover not applicable",
     "required": true
   },
   {
     "product": "Target retail Mini Skin Revival Spray",
     "sku": "BB-SRS-MINI-RETAIL",
+    "online_cover_note": "Target retail-only SKU; online cover not applicable",
     "required": true
   }
 ]
