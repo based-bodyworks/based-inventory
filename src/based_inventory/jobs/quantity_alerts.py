@@ -38,9 +38,9 @@ Live-SKU filter (DiscontinuedFilter) removes test / cruft / EOL SKUs
 before any tier check; otherwise alerts on Tallow Moisturizer-style
 deliberate run-downs would generate noise.
 
-Each alert annotates weeks-of-cover + velocity-per-day computed from
-ShipHero inventory_changes (~5 pages cap, kit-rollup events INCLUDED;
-hero SKUs saturate the cap and effective-window scaling kicks in).
+Stock alerts show current availability, backorders and inbound stock. Sales
+velocity is reported separately from complete daily order history. A capped
+inventory-change sample cannot establish a daily rate or days of sellable cover.
 
 Bundle-affected list comes from BundleRegistry: any bundle whose
 components include the at-risk SKU. Source-of-truth for bundle definitions
@@ -64,7 +64,6 @@ from typing import Any
 
 from based_inventory.config import Config
 from based_inventory.discontinued import DiscontinuedFilter
-from based_inventory.inventory import compute_sku_cover
 from based_inventory.jobs._common import run_job
 from based_inventory.registry import build_registry
 from based_inventory.shiphero import MERCHDROP_WAREHOUSE_ID, ShipHeroClient
@@ -118,9 +117,7 @@ SEVERITY_RANK: dict[tuple[str, int], int] = {
     ("backorder", 100): 450,
 }
 
-# Velocity sourcing knobs. Per-SKU max page cap keeps total run time bounded;
-# effective-window scaling in fetch_sku_depletion handles the saturation case.
-VELOCITY_WINDOW_DAYS = 7
+# Legacy depletion-reader helper limit. The stock-alert job does not call it.
 VELOCITY_MAX_PAGES = 5
 
 # Amazon US marketplace ID; only marketplace currently in scope for FBA visibility.
@@ -134,18 +131,16 @@ class Alert:
     sku: str
     product_name: str
     on_hand: int
-    velocity_per_day: float
-    weeks_of_cover: float
     affected_bundles: list[str]
+    # Accepted for callers constructing old Alert objects; never rendered as
+    # sales demand or stock cover. The live stock job no longer fetches them.
+    velocity_per_day: float = 0.0
+    weeks_of_cover: float = 0.0
     inbound_outstanding: int = 0
     inbound_po_count: int = 0
     inbound_latest_po_date: str | None = None
     inbound_latest_ship_date: str | None = None
-    # Velocity interpretation context (so readers know what 1,667/day means).
-    # depletion_units = total units captured in the sample (saturates at 500).
-    # effective_window_days = actual span the captured events covered. When
-    # this is much smaller than VELOCITY_WINDOW_DAYS (7), the velocity is an
-    # in-stock burst rate, NOT a 7-day average.
+    # Legacy sample fields are retained only for constructor compatibility.
     depletion_units: int = 0
     effective_window_days: float = 0.0
     fba_quantity: int | None = None  # Amazon FBA quantity (US marketplace) if present
@@ -257,86 +252,8 @@ def _label_for_tier(kind: str, tier: int) -> str:
     return next(label for threshold, label in BACKORDER_THRESHOLDS if threshold == tier)
 
 
-def _format_cover(weeks: float) -> str:
-    """Render weeks_of_cover for the alert annotation. Sub-week values
-    show 2 decimals so 0.4w doesn't get rounded to 0.0w."""
-    if weeks >= 9999:
-        return "∞ (no observed depletion)"
-    if weeks < 1:
-        return f"{weeks:.2f}w"
-    return f"{weeks:.1f}w"
-
-
-def _format_sample_window(days: float) -> str:
-    """Render the velocity sample window in human terms."""
-    if days >= 1.0:
-        return f"{days:.1f}d"
-    hours = days * 24
-    if hours >= 1.0:
-        return f"{hours:.1f}h"
-    return f"{hours * 60:.0f}min"
-
-
-def _velocity_interpretation(
-    depletion_units: int,
-    effective_window_days: float,
-    requested_window_days: int,
-) -> str | None:
-    """Return a one-line annotation showing the sample size + window behind the
-    in-stock rate.
-
-    Operational consumers (Avi, Carlos) care about the rate when product is
-    actively selling, NOT a calendar average diluted by OOS days — those just
-    become backorders. So we surface what's load-bearing for planning: how
-    many units depleted, over how much in-stock activity the rate was
-    sampled. The calendar-avg framing was actively misleading and was
-    removed 2026-05-08 after operational feedback.
-
-    Known limitation: the rate does NOT account for channel-availability
-    state. When ops marks a SKU OOS on Shopify / TTS / Amazon, demand stops
-    registering on that channel even though customer interest may persist.
-    Bot has no view into those flags, so the in-stock rate it reports is a
-    "rate during periods where SOME channel was selling," not steady-state
-    demand. Operator judgment (knowing which channels were live) outranks
-    this number when they disagree. See docs/plans/2026-05-08-channel-state-
-    limitations.md if/when we add OOS-flag tracking.
-    """
-    if effective_window_days <= 0:
-        return None
-    # If we got the full requested window, velocity is unambiguous.
-    if effective_window_days >= requested_window_days * 0.95:
-        return None
-    sample = _format_sample_window(effective_window_days)
-    return (
-        f"📊  {depletion_units:,} units shipped last {requested_window_days}d. "
-        f"In-stock rate sampled over {sample} of activity."
-    )
-
-
-def _format_channel_mix(counts: dict[str, int]) -> str | None:
-    """Render the recent channel mix as 'TTS 70% / Shopify 20% / Amazon 10%'.
-    Returns None if no orders observed."""
-    total = sum(counts.values())
-    if total == 0:
-        return None
-    label_map = {
-        "BASED": "TTS",
-        "basedbodyworks.myshopify.com": "Shopify",
-        "Based Bodyworks Amazon": "Amazon",
-    }
-    pieces = []
-    for shop_name, count in sorted(counts.items(), key=lambda x: -x[1]):
-        pct = count * 100 / total
-        if pct < 1:
-            continue
-        label = label_map.get(shop_name, shop_name)
-        pieces.append(f"{label} {pct:.0f}%")
-    return " / ".join(pieces)
-
-
 def build_blocks(
     alerts: list[Alert],
-    channel_mix_summary: str | None = None,
     stock_read_window: tuple[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [
@@ -351,30 +268,14 @@ def build_blocks(
         if a.backorder_label and not a.label.startswith("📥"):
             text_lines.append(a.backorder_label)
         stock_parts = [f"*{a.on_hand:,}* on hand"]
-        if a.available != a.on_hand:
+        if a.available != a.on_hand or a.available <= 0:
             stock_parts.append(f"*{a.available:,}* available")
         if a.backorder > 0:
             stock_parts.append(f"*{a.backorder:,}* backordered")
         owe_suffix = " (already owe customers units)" if a.on_hand < 0 else ""
         text_lines.append("📦  " + "  •  ".join(stock_parts) + owe_suffix)
-        if a.velocity_per_day > 0:
-            # Label the velocity correctly: if the sample window is much
-            # smaller than requested, this is in-stock burst rate, not avg.
-            is_burst = (
-                a.effective_window_days > 0
-                and a.effective_window_days < VELOCITY_WINDOW_DAYS * 0.95
-            )
-            label = "in-stock rate" if is_burst else "velocity"
-            text_lines.append(
-                f"⏱️  {_format_cover(a.weeks_of_cover)} cover at {a.velocity_per_day:,.0f}/day {label}"
-            )
-            interp = _velocity_interpretation(
-                a.depletion_units, a.effective_window_days, VELOCITY_WINDOW_DAYS
-            )
-            if interp:
-                text_lines.append(interp)
-        elif a.on_hand >= 0:
-            text_lines.append("⏱️  no recent depletion observed")
+        if a.available <= 0:
+            text_lines.append("🚫  No sellable units reported for this warehouse SKU")
         if a.fba_quantity is not None:
             text_lines.append(f"🅰️   Amazon FBA on-hand: *{a.fba_quantity:,}* units (US)")
         if a.inbound_outstanding > 0:
@@ -402,8 +303,6 @@ def build_blocks(
     footer = f"🕐  Posted: {ts}  ·  source: ShipHero (Merchdrop)"
     if stock_read_window:
         footer += f"\nStock read: {stock_read_window[0]} to {stock_read_window[1]}"
-    if channel_mix_summary:
-        footer += f"  ·  last 7d channel mix: {channel_mix_summary}"
     blocks.append(context(footer))
     return blocks
 
@@ -491,21 +390,6 @@ def _run(cfg: Config) -> None:
         and not discontinued.should_skip(s.sku, s.product_name)
     ]
 
-    # Velocity sourcing for each candidate.
-    since = time.strftime(
-        "%Y-%m-%dT%H:%M:%S",
-        time.gmtime(time.time() - VELOCITY_WINDOW_DAYS * 86400),
-    )
-    depletion, eff_windows = _fetch_candidate_depletion(client, candidates, since)
-
-    sku_cover = compute_sku_cover(
-        candidates,
-        depletion,
-        window_days=VELOCITY_WINDOW_DAYS,
-        registry=registry,
-        effective_window_by_sku=eff_windows,
-    )
-
     # Inbound visibility: fetch pending POs once and index by SKU. Each
     # alert annotates outstanding inbound qty + most-recent po_date (and
     # ship_date if set).
@@ -555,7 +439,6 @@ def _run(cfg: Config) -> None:
             backorder_info[0] if backorder_info else None,
         )
 
-        cover = sku_cover.get(s.sku)
         inb = inbound.get(s.sku) or {}
 
         # Pull FBA quantity for the at-risk SKU. Only ~10 SKUs cross thresholds
@@ -577,15 +460,11 @@ def _run(cfg: Config) -> None:
                 sku=s.sku,
                 product_name=s.product_name,
                 on_hand=s.on_hand,
-                velocity_per_day=cover.velocity_per_day if cover else 0.0,
-                weeks_of_cover=cover.weeks_of_cover if cover else 0.0,
                 affected_bundles=_affected_bundle_names(s.sku, registry),
                 inbound_outstanding=inb.get("outstanding", 0),
                 inbound_po_count=inb.get("po_count", 0),
                 inbound_latest_po_date=inb.get("latest_po_date"),
                 inbound_latest_ship_date=inb.get("latest_ship_date"),
-                depletion_units=depletion.get(s.sku, 0),
-                effective_window_days=eff_windows.get(s.sku, 0.0),
                 fba_quantity=fba_qty,
                 available=s.available,
                 backorder=s.backorder,
@@ -612,17 +491,8 @@ def _run(cfg: Config) -> None:
     # ASC as tiebreaker so the most-depleted SKU surfaces first within a rank.
     alerts.sort(key=lambda a: (a.tier, a.on_hand))
 
-    # Channel mix snapshot for footer (last 7 days). Cheap, single optional
-    # query; falls back to no annotation on error.
-    try:
-        channel_counts = client.fetch_channel_mix(date_from_iso=since)
-        channel_summary = _format_channel_mix(channel_counts)
-    except RuntimeError:
-        channel_summary = None
-
     blocks = build_blocks(
         alerts,
-        channel_mix_summary=channel_summary,
         stock_read_window=(stock_read_started, stock_read_finished),
     )
     fallback = f"⚡ Inventory Alert: {len(alerts)} SKU(s) below threshold"

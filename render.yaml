@@ -159,21 +159,19 @@ services:
       - key: LOG_LEVEL
         value: INFO
 
-  # Daily sales velocity: ShipHero orders -> per-channel demand workbook, posted
-  # to #alerts-inventory. This pulls all of the previous day's orders and can
-  # run much longer as order volume grows. It starts at 11:00 UTC to reduce
-  # contention with other ShipHero jobs; timing is adjustable.
-  # Runs the shell wrapper (generate -> rename -> post); PYBIN=python (no venv).
+  # All-channel daily sales: native platform sales plus Target's dated report.
+  # The adjacent DST candidate exits before any source or database read.
+  # Run after morning feeds, at 08:00 America/Los_Angeles throughout the year.
   - type: cron
     name: based-inventory-velocity
     runtime: docker
-    dockerfilePath: ./Dockerfile
-    schedule: "0 11 * * *"
-    dockerCommand: bash scripts/run_daily_velocity.sh
+    # Reuse the Python 3.12 image with psycopg and migration files. This report
+    # entrypoint does not enable the separate source/tracker publishers.
+    dockerfilePath: ./Dockerfile.pipeline
+    schedule: "0 15,16 * * *"
+    dockerCommand: python scripts/post_sales_velocity.py --at-local-time 08:00
     plan: starter
     envVars:
-      - key: PYBIN
-        value: python
       - fromService:
           name: based-inventory-quantity
           type: cron
@@ -201,6 +199,21 @@ services:
         key: SLACK_BOT_TOKEN
       - key: SLACK_CHANNEL
         value: C0AK6UGA1NJ
+      # At rollout, bind the existing paid cloud-sales PostgreSQL connection.
+      # The free quantity-alert Redis service is not a durable sales archive.
+      - key: VELOCITY_DATABASE_URL
+        sync: false
+      # Reuse the already configured server credentials at rollout.
+      - key: POLAR_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      - key: TARGET_GMAIL_QUERY
+        value: 'from:zach.haugen@onepltfrm.com subject:"Target Daily Sales Reporting"'
       - key: ENV
         value: prod
       - key: DRY_RUN

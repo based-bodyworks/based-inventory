@@ -15,7 +15,13 @@ def package(tmp_path):
         "warehouse_id": "V2FyZWhvdXNlOjExNzY2MQ==",
         "definition": "ordered",
         "catalog_fingerprint": "a" * 64,
-        "days": {"2026-11-16": {"basedbodyworks.myshopify.com": {"sku": 4}}},
+        "days": {
+            "2026-11-16": {
+                "basedbodyworks.myshopify.com": {"sku": 4},
+                "BASED": {},
+                "Based Bodyworks Amazon": {},
+            }
+        },
         "source_order_counts": {"2026-11-16": 2},
         "excluded_shops": {"Manual Order": 1},
         "source_coverage": {
@@ -27,11 +33,17 @@ def package(tmp_path):
         writer = csv.writer(f)
         writer.writerow(["Date", "SKU", "Channel", "QTY SOLD", "SKU CODE"])
         writer.writerow(["2026-11-16", "Product", "SHOPIFY", 4, "sku"])
+        writer.writerow(["2026-11-16", "Product", "TIKTOK", 0, "sku"])
+        writer.writerow(["2026-11-16", "Product", "AMAZON (FBM)", 0, "sku"])
     w = openpyxl.Workbook()
     w.active.title = "ABOUT"
     s = w.create_sheet("DAILY VELOCITY - SHOPIFY")
     s.append(["Date", "SKU", "QTY SOLD", "SKU CODE"])
     s.append(["2026-11-16", "Product", 4, "sku"])
+    for channel in ("TIKTOK", "AMAZON (FBM)"):
+        s = w.create_sheet("DAILY VELOCITY - " + channel)
+        s.append(["Date", "SKU", "QTY SOLD", "SKU CODE"])
+        s.append(["2026-11-16", "Product", 0, "sku"])
     w.save(stem.with_suffix(".xlsx"))
     return stem, checkpoint
 
@@ -54,5 +66,22 @@ def test_mismatched_csv_or_workbook_cannot_be_published(tmp_path):
     w = openpyxl.load_workbook(stem.with_suffix(".xlsx"))
     w["DAILY VELOCITY - SHOPIFY"]["C2"] = 999
     w.save(stem.with_suffix(".xlsx"))
+    with pytest.raises(ValueError, match="workbook"):
+        load(stem)
+
+
+def test_a_missing_channel_cannot_masquerade_as_observed_zero_sales(tmp_path):
+    stem, checkpoint = package(tmp_path)
+    del checkpoint["days"]["2026-11-16"]["BASED"]
+    stem.with_suffix(".checkpoint.json").write_text(json.dumps(checkpoint))
+    with pytest.raises(ValueError, match="channel"):
+        load(stem)
+
+
+def test_a_missing_zero_sales_workbook_tab_is_still_incomplete(tmp_path):
+    stem, _ = package(tmp_path)
+    workbook = openpyxl.load_workbook(stem.with_suffix(".xlsx"))
+    del workbook["DAILY VELOCITY - TIKTOK"]
+    workbook.save(stem.with_suffix(".xlsx"))
     with pytest.raises(ValueError, match="workbook"):
         load(stem)

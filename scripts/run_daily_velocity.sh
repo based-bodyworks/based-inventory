@@ -5,7 +5,7 @@
 # Run by the Render cron 'based-inventory-velocity' (schedule 0 11 * * *; see
 # render.yaml); also runnable locally by hand. Reuses the
 # main daily_sales_velocity.py with a 1-day window, then renames the output to
-# the friendly daily name and drops the per-day checkpoint. Days are UTC, to
+# the friendly daily name and preserves its source proof. Days are UTC, to
 # match the 6-month report.
 set -euo pipefail
 
@@ -35,6 +35,10 @@ notify_failure() {
   trap - EXIT
   [ "$code" -eq 0 ] && return 0
   echo "FAILED: daily velocity for $DAY (exit $code). Log: $LOG"
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "DRY_RUN: failure notification not sent"
+    exit "$code"
+  fi
   # Render injects credentials into the environment; .env is only a local
   # fallback. A missing file or failed alert must never replace the real exit.
   local tok="${SLACK_BOT_TOKEN:-}"
@@ -73,14 +77,14 @@ set +e
     --start-date "$DAY" --end-date "$DAY" \
     --out-dir "$OUTDIR" --fresh
 
-  # Rename the window-slug outputs to the friendly daily name; drop the checkpoint.
+  # Keep the checkpoint with the saved workbook so the send can validate
+  # source coverage, CSV values and workbook values before archiving the day.
   SLUG="daily-sales-velocity_${DAY}_${DAY}"
-  for ext in xlsx csv bundles.csv README.txt; do
+  for ext in xlsx csv bundles.csv README.txt checkpoint.json; do
     if [ -f "$OUTDIR/$SLUG.$ext" ]; then
       mv -f "$OUTDIR/$SLUG.$ext" "$OUTDIR/daily-velocity_${DAY}.$ext"
     fi
   done
-  rm -f "$OUTDIR/$SLUG.checkpoint.json"
 
   if [ -f "$OUTDIR/daily-velocity_${DAY}.xlsx" ]; then
     echo "OK -> $OUTDIR/daily-velocity_${DAY}.xlsx"
@@ -89,13 +93,16 @@ set +e
     exit 1
   fi
 
-  # A workbook-post failure stays nonfatal because the report is already saved.
+  # Delivery is part of this job's promise. Keep its real failure status so
+  # a saved local workbook cannot masquerade as a successful daily send.
   if "$PYBIN" "$ROOT/scripts/post_velocity_to_slack.py" \
        --xlsx "$OUTDIR/daily-velocity_${DAY}.xlsx" \
        --day "$DAY" --channel "$SLACK_CHANNEL_ID"; then
     echo "Slack: posted to $SLACK_CHANNEL_ID"
   else
+    post_status=$?
     echo "Slack: post FAILED (file still saved locally)"
+    exit "$post_status"
   fi
 ) 2>&1 | tee -a "$LOG"
 run_status=${PIPESTATUS[0]}

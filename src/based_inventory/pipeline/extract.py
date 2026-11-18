@@ -48,6 +48,8 @@ def load_extract(stem: Path, day: date, commit: str, captured_at: datetime) -> V
     coverage.validate()
     if state.get("source_order_counts", {}).get(key) != coverage.fetched_unique:
         raise ValueError("Source order count differs from coverage")
+    if set(state["days"][key]) != set(SHOP_LABELS):
+        raise ValueError("Missing or unexpected merchant sales channel coverage")
     expected = {}
     for shop, skus in state["days"][key].items():
         if shop not in SHOP_LABELS:
@@ -74,15 +76,20 @@ def load_extract(stem: Path, day: date, commit: str, captured_at: datetime) -> V
         raise ValueError("CSV differs from verified extraction checkpoint")
     workbook = openpyxl.load_workbook(artifact(stem, "xlsx"), data_only=True)
     workbook_rows = []
+    workbook_channels = set()
     for sheet in workbook:
         if sheet.title.startswith("DAILY VELOCITY - "):
             label = sheet.title.removeprefix("DAILY VELOCITY - ")
             if label not in CHANNEL_LABELS:
                 raise ValueError("Unexpected workbook channel")
+            workbook_channels.add(label)
             for d, name, units, sku in list(sheet.values)[1:]:
                 if d != key:
                     raise ValueError("Unexpected workbook date")
                 workbook_rows.append(SalesRow(str(sku), name, CHANNEL_LABELS[label], units))
+    workbook.close()
+    if workbook_channels != set(CHANNEL_LABELS):
+        raise ValueError("Missing merchant channel in saved workbook")
     if sorted(workbook_rows, key=lambda r: (r.sku, r.channel)) != sorted(
         rows, key=lambda r: (r.sku, r.channel)
     ):
