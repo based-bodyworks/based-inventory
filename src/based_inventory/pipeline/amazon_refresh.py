@@ -152,7 +152,9 @@ def collect_amazon(day: date, polar, shiphero, *, start=None):
         "settings": json.dumps({"timezone": "UTC", "zero_value_orders": "include"}),
         "rules": json.dumps(rules),
         "metricRules": "{}",
-        "limit": 100000,
+        # Larger requests select Polar's truncated download-preview response.
+        # Keep the bounded seven-day query inline; reject any actual row cutoff below.
+        "limit": 5000,
     }
     report = polar.call("generate_report", payload)
     for key in (
