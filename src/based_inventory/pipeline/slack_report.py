@@ -1,5 +1,6 @@
 """Reconcile a known Slack file before retrying an ambiguous publication."""
 
+from datetime import timedelta
 from urllib.parse import urlparse
 
 import requests
@@ -11,16 +12,10 @@ class SlackReportError(RuntimeError):
     """A redacted Slack publication/readback failure."""
 
 
-def summary(version):
-    totals = version.totals
-    return (
-        f"*Daily merchant sales: {version.day}* (complete UTC day)\n"
-        f"Total: *{sum(totals.values()):,}* ordered units. "
-        f"TikTok {totals['TIKTOK']:,}; Shopify {totals['Shopify']:,}; Amazon FBM {totals['Amazon FBM']:,}.\n"
-        f"Verified {version.coverage.fetched_unique:,} warehouse orders with complete item coverage. "
-        "Bundle components are already included. Target retail and Amazon FBA are separate.\n"
-        f"Sales version: `{version.version_id}`. The merchant trackers use this same version."
-    )
+def summary(version, history=None):
+    from based_inventory.daily_velocity_report import render_report
+
+    return render_report(version, history or {})
 
 
 class SlackReport:
@@ -84,7 +79,7 @@ class SlackReport:
         if digest(self.download(info["url_private_download"])) != digest(version.report):
             raise SlackReportError("Saved Slack report hash mismatch")
 
-    def publish(self, store, version):
+    def publish(self, store, version, *, summary_text: str | None = None):
         store.assert_current(version.version_id)
         receipt = store.receipts(version.version_id).get("slack")
         if receipt:
@@ -97,6 +92,14 @@ class SlackReport:
                 ) from None
             store.record_receipt(version.version_id, "slack", digest(version.report), file_id)
             return file_id
+        if summary_text is None:
+            history = {}
+            for offset in range(7):
+                day = version.day - timedelta(days=offset)
+                record = store.latest(day)
+                if record is not None:
+                    history[day] = record
+            summary_text = summary(version, history)
         reservation = self.call(
             "files.getUploadURLExternal",
             {"filename": f"daily-velocity_{version.day}.xlsx", "length": str(len(version.report))},
@@ -123,7 +126,7 @@ class SlackReport:
                 {
                     "files": [{"id": file_id, "title": f"BASED Merchant Sales {version.day}"}],
                     "channel_id": self.channel,
-                    "initial_comment": summary(version),
+                    "initial_comment": summary_text,
                 },
             )
         except (requests.RequestException, SlackReportError):

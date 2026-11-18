@@ -40,6 +40,7 @@ def job(tmp_path):
         "    out = Path(args.out_dir)\n"
         "    slug = 'daily-sales-velocity_2026-10-27_2026-10-27'\n"
         "    (out / (slug + '.xlsx')).write_text('workbook fixture')\n"
+        "    (out / (slug + '.checkpoint.json')).write_text('source proof fixture')\n"
         "sys.exit(code)\n"
     )
     (scripts / "post_velocity_to_slack.py").write_text(
@@ -52,6 +53,7 @@ def job(tmp_path):
         "args = p.parse_args()\n"
         "assert args.day == '2026-10-27'\n"
         "assert Path(args.xlsx).read_text() == 'workbook fixture'\n"
+        "assert Path(args.xlsx).with_suffix('.checkpoint.json').read_text() == 'source proof fixture'\n"
         "Path(os.environ['POST_MARKER']).touch()\n"
         "print('workbook post detail')\n"
         "sys.exit(int(os.environ.get('POST_EXIT', '0')))\n"
@@ -140,16 +142,30 @@ def test_failed_slack_alert_is_visible_and_cannot_mask_original_failure(job, ove
     assert "test-render-token" not in result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("post_exit", ["0", "7"])
-def test_successful_fetch_keeps_workbook_and_post_failures_remain_nonfatal(job, post_exit):
-    result, log = run_job(job, FETCH_EXIT="0", POST_EXIT=post_exit)
+def test_successful_fetch_keeps_workbook_and_source_proof(job):
+    result, log = run_job(job, FETCH_EXIT="0", POST_EXIT="0")
     assert result.returncode == 0
     assert Path(job[1]["POST_MARKER"]).exists()
     assert not Path(job[1]["CURL_CAPTURE"]).exists()
     workbook = job[0] / "data" / "sales-velocity" / "daily" / f"daily-velocity_{DAY}.xlsx"
     assert workbook.read_text() == "workbook fixture"
+    assert workbook.with_suffix(".checkpoint.json").read_text() == "source proof fixture"
     assert "workbook post detail" in result.stdout + result.stderr
     assert "workbook post detail" in log
+
+
+def test_a_failed_daily_send_is_a_failed_run_even_when_the_workbook_exists(job):
+    result, log = run_job(job, FETCH_EXIT="0", POST_EXIT="7")
+    assert result.returncode == 7
+    assert "post FAILED" in log
+    assert (job[0] / "data/sales-velocity/daily" / f"daily-velocity_{DAY}.xlsx").exists()
+
+
+def test_a_dry_run_failure_never_posts_a_live_failure_alert(job):
+    result, _ = run_job(job, DRY_RUN="1", SLACK_BOT_TOKEN="test-render-token")
+    assert result.returncode == 17
+    assert not Path(job[1]["CURL_CAPTURE"]).exists()
+    assert "DRY_RUN" in result.stdout
 
 
 def test_missing_workbook_is_still_a_failed_run(job):

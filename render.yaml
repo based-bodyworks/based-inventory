@@ -201,6 +201,13 @@ services:
         key: SLACK_BOT_TOKEN
       - key: SLACK_CHANNEL
         value: C0AK6UGA1NJ
+      # Dedicated daily-velocity keys share the existing Redis service,
+      # without reading or replacing the quantity-alert state blob.
+      - key: STATE_PATH
+        fromService:
+          type: keyvalue
+          name: based-inventory-state
+          property: connectionString
       - key: ENV
         value: prod
       - key: DRY_RUN

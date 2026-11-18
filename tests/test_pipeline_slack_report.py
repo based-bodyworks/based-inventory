@@ -1,3 +1,4 @@
+from datetime import timedelta
 from unittest.mock import Mock
 
 import pytest
@@ -7,6 +8,44 @@ from based_inventory.pipeline.models import digest
 from based_inventory.pipeline.slack_report import SlackReport, SlackReportError
 from based_inventory.pipeline.store import Store
 from tests.test_pipeline_models import verified
+
+
+def publication_client():
+    client = SlackReport("token", "C123", session=Mock())
+    client.call = Mock(
+        side_effect=[
+            {"file_id": "F123", "upload_url": "https://files.slack.com/upload"},
+            {"ok": True},
+        ]
+    )
+    client.session.post.return_value.status_code = 200
+    client.verify = Mock()
+    return client
+
+
+def test_publication_uses_exact_full_report_text():
+    client = publication_client()
+    text = "*Daily SKU velocity*\nEvery tracked SKU is visible."
+    client.publish(store_with(), verified(), summary_text=text)
+    assert client.call.call_args_list[1].args[1]["initial_comment"] == text
+
+
+def test_cloud_publication_shows_all_catalog_skus_and_complete_seven_day_pace():
+    version = verified()
+    history = {
+        version.day - timedelta(days=n): verified(day=version.day - timedelta(days=n))
+        for n in range(7)
+    }
+    store = store_with()
+    store.latest.side_effect = history.get
+    client = publication_client()
+    client.publish(store, version)
+    text = client.call.call_args_list[1].args[1]["initial_comment"]
+    assert "Skin Elixir" in text
+    assert "Mini Sea Salt Spray" in text
+    assert "Target retail Sea Salt Spray" in text
+    assert "4.0/day" in text
+    assert "Product" in text  # A positive unregistered SKU must remain visible.
 
 
 def store_with(receipt=None):
