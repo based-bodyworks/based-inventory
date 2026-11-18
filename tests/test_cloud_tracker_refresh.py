@@ -430,6 +430,7 @@ def test_missing_formula_or_wrong_stock_readback_cannot_verify(monkeypatch):
 
 
 @pytest.mark.parametrize("missing_cover", [None, "online", "online_as_scoped", "scope_marker"])
+@pytest.mark.parametrize("trim_online_tail", [False, True])
 @pytest.mark.parametrize(
     ("scoped_sku", "scope_note"),
     [
@@ -438,9 +439,10 @@ def test_missing_formula_or_wrong_stock_readback_cannot_verify(monkeypatch):
     ],
 )
 def test_stock_refresh_preserves_registered_cover_scope(
-    monkeypatch, missing_cover, scoped_sku, scope_note
+    monkeypatch, missing_cover, scoped_sku, scope_note, trim_online_tail
 ):
     import json
+    from copy import deepcopy
     from datetime import datetime
     from hashlib import sha256
 
@@ -472,18 +474,29 @@ def test_stock_refresh_preserves_registered_cover_scope(
         collected_at=now,
         now=now,
     )
-    google = NativeSheets()
+
+    class TrimmedSheets(NativeSheets):
+        def cells(self, *args):
+            native = super().cells(*args)
+            for sheet in native["sheets"]:
+                for grid in sheet["data"]:
+                    for row in grid["rowData"]:
+                        while row["values"] and not row["values"][-1]:
+                            row["values"].pop()
+            return native
+
+    google = TrimmedSheets()
     for column in range(8, 16):
         google.data[(7, column)] = {"userEnteredValue": {"formulaValue": "=1"}}
         google.data[(8, column)] = {
             "userEnteredValue": {"stringValue": "n/a" if column < 15 else scope_note}
         }
+    if trim_online_tail:
+        google.data[(7, 15)] = {}
     if missing_cover == "online":
         for column in range(8, 16):
             google.data[(7, column)] = {}
     elif missing_cover == "online_as_scoped":
-        from copy import deepcopy
-
         for column in range(8, 16):
             google.data[(7, column)] = deepcopy(google.data[(8, column)])
     elif missing_cover == "scope_marker":
@@ -505,6 +518,17 @@ def test_stock_refresh_preserves_registered_cover_scope(
         ).hexdigest(),
     }
     verify_source_plan(google, plan)
+    legacy = deepcopy(result)
+    del legacy["verification"]["inventory_cover_values"]
+    verify_source_plan(
+        google,
+        {
+            "receipt": legacy,
+            "digest": sha256(
+                json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        },
+    )
     google.data[(8, 8)]["userEnteredValue"] = {"stringValue": "incorrect"}
     with pytest.raises(SourceIncomplete, match="stock-cover"):
         verify_source_plan(google, plan)

@@ -184,19 +184,18 @@ def verify_source_plan(google, plan):
             raise SourceIncomplete("Saved Target projection changed")
     if "inventory_formulas" in verification or "inventory_cover_values" in verification:
         native = google.cells(ERP_ID, [verification["inventory_range"]])
-        formulas = [
-            [c.get("userEnteredValue", {}).get("formulaValue") for c in r.get("values", [])]
-            for s in native.get("sheets", [])
-            for g in s.get("data", [])
-            for r in g.get("rowData", [])
-        ]
-        if "inventory_formulas" in verification and formulas != verification["inventory_formulas"]:
-            raise SourceIncomplete("Saved warehouse stock-cover formulas changed")
-        if (
-            "inventory_cover_values" in verification
-            and inventory_cover_values(native) != verification["inventory_cover_values"]
-        ):
-            raise SourceIncomplete("Saved warehouse stock-cover cells changed")
+        if "inventory_cover_values" in verification:
+            if inventory_cover_values(native) != verification["inventory_cover_values"]:
+                raise SourceIncomplete("Saved warehouse stock-cover cells changed")
+        else:
+            formulas = [
+                [c.get("userEnteredValue", {}).get("formulaValue") for c in r.get("values", [])]
+                for s in native.get("sheets", [])
+                for g in s.get("data", [])
+                for r in g.get("rowData", [])
+            ]
+            if formulas != verification["inventory_formulas"]:
+                raise SourceIncomplete("Saved warehouse stock-cover formulas changed")
     if "file_id" in verification:
         metadata(google, verification["file_id"])
         content = google.request(

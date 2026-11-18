@@ -113,7 +113,13 @@ def publish_inventory(snapshot, google, *, mode="compare", before_write=None):
                             }
                         )
     frozen_cover = verified_inventory_cover(before, snapshot["products"])
-    frozen_formulas = [[value.get("formulaValue") for value in row] for row in frozen_cover]
+    # Retain the original unpadded shape for older monitor versions.
+    frozen_formulas = [
+        [cell.get("userEnteredValue", {}).get("formulaValue") for cell in row.get("values", [])]
+        for sheet in before.get("sheets", [])
+        for grid in sheet.get("data", [])
+        for row in grid.get("rowData", [])
+    ]
     if mode == "publish" and before_write:
         before_write(
             {
