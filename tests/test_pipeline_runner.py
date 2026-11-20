@@ -315,3 +315,18 @@ def test_cli_unhealthy_monitor_exits_nonzero(monkeypatch, capsys):
 )
 def test_local_schedule_allows_under_one_hour_startup_delay(instant, clock, expected):
     assert local_time_matches(datetime.fromisoformat(instant), clock) is expected
+
+
+def test_warehouse_command_never_publishes_merchant_slack_report():
+    store = Store()
+
+    class NoSend:
+        def publish(self, *args, **kwargs):
+            pytest.fail("Warehouse job attempted a second Slack report")
+
+    result = run_command(
+        "warehouse", store=store, google=None, slack=NoSend(), day=DAY, now_utc=NOW
+    )
+    assert result["status"] == "verified"
+    assert "warehouse" in store.events and "merchant" in store.events and "archive" in store.events
+    assert "slack" not in store.events

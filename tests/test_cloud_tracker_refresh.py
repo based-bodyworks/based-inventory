@@ -880,3 +880,40 @@ def test_older_pending_source_retry_cannot_write_after_later_day(monkeypatch):
     assert google.mock_calls == []
     store.plan_once.assert_not_called()
     store.record_receipt.assert_not_called()
+
+
+def test_frozen_target_source_is_reused_without_a_second_mail_pull(monkeypatch):
+    from unittest.mock import Mock
+
+    import based_inventory.pipeline.source_refresh as module
+
+    day = date(2026, 11, 18)
+    frozen = {"date": str(day), "safe_to_write": True, "message_id": "same-frozen-message"}
+    store = Mock(unsafe=True)
+    store.load.return_value = Mock(day=day)
+    collect = Mock(side_effect=AssertionError("A second Target collection would diverge"))
+    publish = Mock(return_value={"status": "verified", "verification": {"target": frozen}})
+    monkeypatch.setattr(module, "collect_target", collect)
+    monkeypatch.setattr(module, "publish_target", publish)
+    monkeypatch.setattr(module, "collect_amazon", Mock(side_effect=SourceIncomplete("unavailable")))
+    monkeypatch.setattr(
+        module, "collect_inventory", Mock(side_effect=SourceIncomplete("unavailable"))
+    )
+    monkeypatch.setattr(module, "metadata", Mock(side_effect=SourceIncomplete("unavailable")))
+    monkeypatch.setattr(
+        "based_inventory.shiphero_auth.resolve_access_token", lambda *a, **k: "test-token"
+    )
+    result = refresh_sources(
+        day,
+        store,
+        "version",
+        Mock(),
+        mode="compare",
+        polar_token="test-token",
+        target_query="unused",
+        target_workbook_id="file",
+        frozen_target=frozen,
+    )
+    collect.assert_not_called()
+    assert publish.call_args.args[0] is frozen
+    assert result["sources"]["target"]["status"] == "verified"

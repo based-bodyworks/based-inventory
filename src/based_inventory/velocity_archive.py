@@ -30,8 +30,9 @@ LOCK_NAMESPACE = 1_803_408_774
 
 
 class VelocityArchive:
-    def __init__(self, location: Path | str):
+    def __init__(self, location: Path | str, *, read_only=False):
         self.location = str(location)
+        self.read_only = read_only
         self._connection = None
         self._directory = None
         if self.location.startswith(("redis://", "rediss://")):
@@ -43,9 +44,11 @@ class VelocityArchive:
                 row_factory=dict_row,
                 connect_timeout=15,
                 application_name="based-daily-velocity",
+                options="-c default_transaction_read_only=on" if read_only else "",
             )
             try:
-                self._migrate()
+                if not read_only:
+                    self._migrate()
             except BaseException:
                 self._connection.close()
                 raise
@@ -92,6 +95,8 @@ class VelocityArchive:
         return value
 
     def _write(self, key: str, value: dict, *, once: bool = False) -> None:
+        if self.read_only:
+            raise PermissionError("Daily velocity archive is read-only")
         text = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if self._connection is not None:
             conflict = (

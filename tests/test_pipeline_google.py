@@ -127,3 +127,69 @@ def test_range_tail_clear_cannot_bypass_formula_preflight():
             ],
         )
     api.json.assert_not_called()
+
+
+def test_platform_tab_creation_cannot_touch_owner_files_or_reuse_owner_title():
+    from based_inventory.pipeline.platform_trackers import TABS
+
+    api = GoogleAPI("id", "secret", "refresh", session=Mock())
+    api.json = Mock()
+    with pytest.raises(ValueError, match="allowlist"):
+        api.platform_write(
+            "1lbWCa0FxTxk4tFFrre3oiBi8QKVifP4mSsVVRF3B2P8",
+            1740410295,
+            "Daily SKU Sales",
+            [["data"]],
+        )
+    file, tab_id, title, _ = TABS[0]
+    api.metadata = Mock(return_value={"sheets": [{"properties": {"sheetId": 999, "title": title}}]})
+    with pytest.raises(ValueError, match="identity"):
+        api.platform_write(file, tab_id, title, [["data"]])
+    api.json.assert_not_called()
+
+
+def test_real_platform_adapter_creates_only_owned_tab_and_clears_old_tail():
+    from based_inventory.pipeline.platform_trackers import TABS
+
+    api = GoogleAPI("id", "secret", "refresh", session=Mock())
+    file, tab_id, title, _ = TABS[0]
+    tabs = {}
+    rows = []
+
+    def metadata(spreadsheet):
+        assert spreadsheet == file
+        return {"sheets": [{"properties": props} for props in tabs.values()]}
+
+    def apply(method, url, *, json):
+        nonlocal rows
+        for request in json["requests"]:
+            if "addSheet" in request:
+                props = request["addSheet"]["properties"]
+                assert props["sheetId"] == tab_id and props["title"] == title
+                tabs[tab_id] = props
+            elif "updateCells" in request:
+                update = request["updateCells"]
+                assert update["range"]["sheetId"] == tab_id
+                assert update["range"]["endRowIndex"] == 5000
+                rows = [
+                    [
+                        next(iter(c["userEnteredValue"].values()))
+                        if "userEnteredValue" in c
+                        else ""
+                        for c in row["values"]
+                    ]
+                    for row in update["rows"]
+                ]
+        return {}
+
+    api.metadata = metadata
+    api.json = apply
+    api.values = lambda spreadsheet, a1: rows
+    api.cells = lambda spreadsheet, ranges: {
+        "sheets": [{"properties": {"sheetId": tab_id}, "data": []}]
+    }
+    api.platform_write(file, tab_id, title, [["Exact text", 42], ["n/a", 0]])
+    assert api.platform_read(file, tab_id, title) == [["Exact text", 42], ["n/a", 0]]
+    api.platform_write(file, tab_id, title, [["shorter", 3]])
+    assert api.platform_read(file, tab_id, title) == [["shorter", 3]]
+    assert len(tabs) == 1

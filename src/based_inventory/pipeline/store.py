@@ -170,7 +170,7 @@ class Store:
         return {row["destination"]: row for row in rows}
 
     def begin_run(self, kind: str, day: date) -> str:
-        if kind not in {"sales", "trackers", "monitor"}:
+        if kind not in {"sales", "warehouse", "trackers", "monitor"}:
             raise ValueError("Unknown run type")
         run_id = str(uuid4())
         self.connection.execute(

@@ -253,3 +253,19 @@ def test_database_error_is_not_silently_changed_into_success():
     store.latest = broken
     with pytest.raises(RuntimeError, match="database unavailable"):
         check_pipeline(DAY, store, native, now_utc=NOW)
+
+
+def test_native_monitor_requires_warehouse_job_and_skips_only_merchant_slack():
+    store = Store()
+    store.runs["warehouse"] = store.runs.pop("sales")
+    store.saved_receipts.pop("slack")
+
+    def warehouse_native(version):
+        return {key: value for key, value in native(version).items() if key != "slack"}
+
+    report = check_pipeline(DAY, store, warehouse_native, now_utc=NOW, native_report=True)
+    assert report.state == "healthy"
+    # Losing a real warehouse/source readback still fails the combined monitor.
+    store.saved_receipts.pop("history")
+    report = check_pipeline(DAY, store, warehouse_native, now_utc=NOW, native_report=True)
+    assert report.state == "incomplete" and "history_receipt_missing" in report.reason_codes

@@ -75,3 +75,13 @@ def test_later_source_day_fences_old_stock_replay_before_receipt_exists(stores):
         first.assert_destination_current(old.version_id, "inventory")
     first.assert_destination_current(newer.version_id, "inventory")
     first.assert_destination_current(old.version_id, "target")
+
+
+def test_warehouse_run_is_durable_and_independent_of_slack_sales_run(stores):
+    first, second = stores
+    day = verified().day
+    run = first.begin_run("warehouse", day)
+    assert second.latest_run("warehouse", day)["status"] == "running"
+    assert second.latest_run("sales", day) is None
+    first.finish_run(run, "failed", error_code="warehouse_failed")
+    assert second.latest_run("warehouse", day)["status"] == "failed"

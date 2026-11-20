@@ -1,84 +1,90 @@
 # Render sales and tracker operations
 
-This change moves Based's daily sales publishing, tracker refresh and morning checks to Render. The report and merchant tracker updates use one saved, verified sales version. A separate check reads the actual report and tracker values again.
+The active daily SKU report counts native Shopify, TikTok, Amazon and Target sales. Its exact source captures, text, workbook and Slack delivery receipt are saved in the paid PostgreSQL database. Online days follow the report's platform calendar; Target follows the date printed on its retail report.
 
-## Current release status
+The cloud migration also maintains warehouse-only demand and stock. Warehouse UTC orders are a separate measure. Amazon FBA sales, TikTok platform fulfillment and Target store sales must not be used as Merchdrop warehouse depletion.
 
-This is deployment preparation. The existing Render sales job and Mac automations remain active. The new Render definition is `render.cloud.yaml`, separate from the active `render.yaml`. Importing it creates paid resources, so review its resource preview before importing. New writers default to disabled. Merging this change does not switch the current jobs.
+## Deployment status
 
-The release still requires the actual pull request to be approved and merged, cloud credentials and a cloud Target workbook to be configured, a supervised live publication to pass, and the old writers to be disabled at cutover. Do not run both merchant publishers together. Their databases and locks do not coordinate with the old shell job.
+`render.yaml` defines the active 08:00 Pacific all-channel report. `render.cloud.yaml` is a separate, opt-in definition for warehouse tracking, source refresh and monitoring. Its writers default to `PIPELINE_ALLOW_WRITES=0`, with automatic deployment disabled. Merging code does not activate those writers. Keep the current local tracker writer and monitor until the supervised cloud checks and cutover approvals below are complete.
 
-## Daily schedule
+The proposed sales service now runs `warehouse`, which saves a verified warehouse order extract, archives its workbook in Drive and updates warehouse history, rolling demand and ERP daily warehouse totals. It never posts a warehouse sales report to Slack. The existing all-channel report remains the sole daily Slack report.
+
+## Morning schedule after approved cutover
 
 | Job | Time | Result |
 | --- | --- | --- |
-| Merchant sales | 11:00 UTC daily | Save yesterday's complete UTC warehouse orders, archive the exact workbook, update merchant trackers, then publish the matching workbook to Slack. |
-| Trackers | 07:00 America/Los_Angeles daily | Use that saved merchant version, refresh Target retail, Amazon-held fulfillment and warehouse stock, and update the cloud Target workbook. |
-| Check | 08:45 America/Los_Angeles daily | Read saved job records and actual report/tracker values. Exit with a failure if results are missing, stale or different. |
+| Warehouse tracking | 11:00 UTC | Save yesterday's complete UTC warehouse orders and update warehouse trackers. |
+| Active SKU report | 08:00 Pacific | Save and post the native all-channel report. |
+| Tracker refresh | 08:20 Pacific | Verify the saved report in Slack; refresh stock, Amazon fulfillment and Target destinations; mirror the exact report into both trackers. |
+| Monitor | 09:15 Pacific | Read actual tracker values and Slack bytes again. Fail if required jobs, versions, sources or provider values are missing, stale or different. |
 
-Render schedules use UTC. The tracker and check jobs each have summer and winter candidates. A Pacific clock guard allows a start within 60 minutes of the scheduled time and excludes the adjacent daylight saving candidate. Delays of an hour or more need operator attention. The check can run while a writer is active and treats an interrupted or overlong run as a problem. Configure Render's failure notifications to an approved destination and verify receipt of a test notification before disabling the local monitor. This release does not send separate monitor messages to Slack. A Render-wide outage can also stop its monitor; retain an independent heartbeat check if outage detection is required.
+Summer and winter UTC candidates use a Pacific clock guard. A run may start within 60 minutes of its intended local time. The adjacent daylight-saving candidate exits untouched. A delay of an hour or more requires operator attention.
 
-## Cloud setup
+The `operations` command updates three dedicated tabs in both **BASED Dynamic Sales** and **BB SALES VEL / ERP**: `Daily SKU Sales`, `Daily Sales Sources` and `Daily Sales Methods`. It copies the exact cells of the saved Slack workbook, including unavailable values and source qualifications. Each view includes the reporting date, immutable report version and workbook SHA-256 checksum. These are current report snapshots, not append-only history. PostgreSQL retains the historical captures and workbooks.
 
-Use the same Render region for all three jobs and a paid PostgreSQL database. The database stores report bytes, daily normalized sales, write plans and readback results. Cron jobs have no persistent disk. A direct database connection is required because the shared writer lock belongs to the connection. Do not use a transaction-pooling URL. Keep public database access disabled and enable the paid database's supported backup and recovery features.
+Existing Verified Sales History, Canonical Sales Raw, Rolling7Demand and Current Inventory keep their warehouse definitions. Canonical Sales Raw and stock-cover columns stay formula-driven. The new native sales tabs do not feed warehouse cover formulas. Historical planning assumptions are preserved.
 
-The Render Blueprint is a proposal, with automatic deployment disabled and `PIPELINE_ALLOW_WRITES=0`. Choose paid database and compute sizes in Render's resource preview; no monthly total is promised here. Render bills active cron time with a $1 monthly minimum for each cron service, plus database and storage charges. See [Render cron billing](https://render.com/docs/cronjobs) and [Render pricing](https://render.com/pricing).
+The Target retailer tabs and cloud XLSX use the parsed Target source already frozen behind the native report. The tracker refresh does not fetch a second Target report. Amazon fulfillment and current stock retain their separate source checks and dates.
 
-Configure these secrets directly in Render. Do not copy credentials from a Codex session or commit them to Git.
+## Cloud configuration
 
-| Setting | Purpose and required access |
+Use the same paid, private PostgreSQL database for `DATABASE_URL` on the proposed jobs and `VELOCITY_DATABASE_URL` on the active report. Cron jobs have no persistent disk. Use a direct database connection, keep public database ingress disabled and retain backup/recovery support.
+
+Server credentials are configured directly in Render. Never commit them, paste them into chat or put them in command arguments.
+
+| Setting | Purpose |
 | --- | --- |
-| `DATABASE_URL` | Private direct PostgreSQL URL for the shared database. |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | Dedicated OAuth grant. Gmail read-only for Target messages, Sheets write access to the two permitted trackers, and Drive access to the report/workbook files in Marketing Operations. Use the least access that can reach those existing shared files. Verify actual file access before enabling writes. |
-| `SHIPHERO_REFRESH_TOKEN` | Server credential for the existing read-only warehouse stock and order queries. |
-| `SLACK_BOT_TOKEN` | Existing approved report bot, with file upload and file read access for content verification. |
-| `SLACK_REPORT_CHANNEL_ID` | Approved inventory report channel. Verify the bot can read and share files there. |
-| `POLAR_API_KEY` | Supported Polar tool API credential with Amazon sales and fulfillment dimensions available. |
-| `TARGET_GMAIL_QUERY` | Narrow sender/subject query for Target's daily retail report. The collector also checks the report date and content. |
-| `TARGET_WORKBOOK_ID` | Drive ID of the cloud Target XLSX, preserving the existing Daily Data, Summary, charts and historical values. |
-| `PIPELINE_ALLOW_WRITES` | `0` until approved publication. `1` permits the explicit migration and publishing commands. |
+| `DATABASE_URL` | Private direct connection to the shared PostgreSQL database. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | Approved Gmail read, Sheets write and Drive access. Verify access to the existing tracker and report files before enabling writes. |
+| `SHIPHERO_REFRESH_TOKEN` | Existing warehouse read credential. |
+| `SLACK_BOT_TOKEN` | Approved report bot with file upload and file read access. |
+| `SLACK_REPORT_CHANNEL_ID` | Existing approved report channel for the proposed jobs. The active report uses `SLACK_CHANNEL`. Both must name the same channel. |
+| `POLAR_API_KEY` | Existing server credential for native online sales and separate fulfillment data. |
+| `TARGET_GMAIL_QUERY` | Narrow sender/subject query used by source collection. |
+| `TARGET_WORKBOOK_ID` | Existing cloud Target XLSX in Marketing Operations. |
+| `PIPELINE_ALLOW_WRITES` | `0` until approved supervised writes and cutover; `1` permits writer commands. |
 
-The cloud Target workbook must be in shared drive `0ANDGo4RyWVY2Uk9PVA`, folder `1Fw8-tnitkJKllxKA2ysAgvaGibWFYDxL` (Marketing Operations). Upload the original workbook once, preserve its history and formulas, and verify Drive metadata for both IDs before setting the environment variable. The Mac workbook is no longer the cloud destination. Set the source query and workbook ID only after read-only access succeeds.
+The cloud Target XLSX must remain in shared drive `0ANDGo4RyWVY2Uk9PVA`, folder `1Fw8-tnitkJKllxKA2ysAgvaGibWFYDxL`. Preserve its file ID, history, formulas and sharing state. Neither owner roadmap nor lifecycle calendar is a write target.
+
+Render cron billing includes a minimum per service plus active runtime, database and storage costs. Keep the approved total within $25/month. Updating existing services in this change does not require creating additional paid services.
 
 ## Commands
 
-Run inside the cloud image with secrets supplied through the service environment, never on the command line. Explicit dates make recovery repeatable.
+Run inside the cloud image with secrets supplied by the service environment. Explicit dates make supervised runs repeatable.
 
 ```sh
 python -m based_inventory.pipeline migrate
-python -m based_inventory.pipeline compare --day 2026-11-16
-python -m based_inventory.pipeline sales --day 2026-11-16
-python -m based_inventory.pipeline trackers --day 2026-11-16
-python -m based_inventory.pipeline monitor --day 2026-11-16
+python -m based_inventory.pipeline warehouse --day 2026-11-18
+python -m based_inventory.pipeline operations --day 2026-11-18
+python -m based_inventory.pipeline operations-monitor --day 2026-11-18
 ```
 
-`migrate`, `sales` and `trackers` require writes enabled. `compare` and `monitor` do not migrate, create run records, extract merchant orders, or write to providers. They require an existing saved version and read the live destinations against saved expectations. Before the first publication there are no saved destination expectations, so an incomplete comparison is expected and does not prove parity. Check source credentials read-only before bootstrap. Preparing a durable, operator-accessible evidence record for all seven reporting dates is still required before the supervised test; this PR does not include the private recovery artifacts. For a November 16, 2026 test, verify November 10 through November 16 inclusive. For a different test day, use that day and the six preceding UTC dates. Record the evidence location, source coverage and per-day comparisons in the deployment record, then verify the tracker history against it. Never mark missing source days as zero to bypass coverage.
+`warehouse`, `operations` and `migrate` require writes enabled. `operations-monitor` never migrates, collects new sales, creates run records, repairs receipts, posts Slack messages or writes tracker cells. The native report archive is opened with a database-enforced read-only connection for monitoring.
 
-A normal `sales` retry reuses the saved version. `--version` selects an existing version and rejects an older version superseded for that date. `sales --fresh --day YYYY-MM-DD` performs a new paid-credit warehouse pull and saves a new version. Use it only for a confirmed source revision. Re-run the matching tracker job and verify the new report and all tracker destinations afterward. Source refreshes for an older date are blocked once a later reporting day has saved a source plan, so an old retry cannot replace current stock or Amazon coverage. Correct historical Target or Amazon data through a separate reviewed repair. Repairing an older date preserves the latest rolling demand window. After a historical correction, also create and publish a fresh version for the latest reporting day so its saved demand expectations include that correction.
+The legacy `sales`, `trackers`, `monitor` and `compare` commands remain available for compatibility. Do not activate the legacy `sales` publisher alongside the current all-channel report. It would post a separate warehouse workbook and its monitor checks the older publication model.
 
-A session lock prevents the new sales and tracker jobs from writing concurrently. If a job is busy, wait for its outcome before manually triggering another job. Render cancels an active run when that same cron service is manually triggered. A failed or interrupted job remains visible in monitoring; a saved success alone cannot make live readbacks pass.
+A normal warehouse retry reuses the saved version. `warehouse --fresh --day YYYY-MM-DD` makes a new paid-credit warehouse pull and is only for a confirmed source correction. Review and verify all affected warehouse destinations after a correction. Existing source plans fence older dates from replacing newer stock or fulfillment results.
 
-## Verification and retry rules
+The native report and its Target source must already have a verified Slack delivery and all seven saved reporting dates before `operations` writes any source cells. A saved Target write plan that differs from the native report source is rejected for reconciliation.
 
-Merchant verification requires stable warehouse order counts and complete order and item pagination. Saved CSV totals, workbook rows and normalized data must match. Bundle components are already included. Merchant ordered units exclude Target replenishment and Amazon-held fulfillment; Target retail and Amazon-held units use separate collectors and controls.
+Tracker view publication saves its exact intent before writing. One cross-date lock protects the six dedicated tabs. An older day cannot replace a newer snapshot. A lost provider response is reconciled against the saved values; retries do not blindly overwrite a changed sheet. A renamed, hidden, resized, missing or conflicting owned tab requires investigation. Owner sheets and formula cells cannot be silently reused as new report tabs.
 
-The merchant publisher updates Verified Sales History, rolling demand and ERP Daily Sales. Canonical Sales Raw is read-only formula output. Current Inventory I:P stays formula-driven. The publisher rejects an unexpected formula or validation in a value-write destination. Source adapters update only the approved stock and separate sales ranges and verify the native results.
+## Supervised checks and cutover
 
-Google writes have bounded retries and native readback. Report archives reserve a Drive file ID before upload. Slack reserves a file ID before upload and records it durably. If a Slack upload has an uncertain outcome, the retry verifies that same file rather than allocating another. A crash before upload completion can require an operator to reconcile or complete the reserved file. Do not delete the pending receipt or automatically reupload to make a failed check disappear.
+1. Approve and merge the actual PR after independent code review and passing checks. Record the currently active report command and schedule before changing any service settings.
+2. Deploy the merged version to the three proposed services with writes disabled. Verify the shared database, Google access, bot channel, Polar access and cloud Target file destination. Run migrations only when required and explicitly enabled.
+3. Verify seven complete warehouse source dates and seven native report dates. Keep the two calendars and definitions explicit. Do not substitute zero for missing source days.
+4. Pause the local tracker writer before enabling supervised cloud writes. Run `warehouse` for the agreed day, then `operations` after that day's native report is verified. Never manually trigger a service while its current run is active; Render cancels that service's active run.
+5. Read back the actual six native report tabs against the frozen workbook, warehouse history and canonical output, rolling demand and stock-cover formulas, Target retailer values and cloud XLSX, Amazon fulfillment data and stock timestamps. Run `operations-monitor`. A saved success receipt alone is insufficient.
+6. After explicit cutover approval, enable the new schedules and retire the local tracker writer. Configure Render failure notifications to the approved destination and verify receipt of a test failure alert. Keep the independent local monitor until seven scheduled cloud mornings pass. A manual repair does not count as a scheduled success.
 
-Notifications are handled by Render's job failure alerts in this release. The complete report message template is defined in `slack_report.py`; review its wording and approved channel before the supervised publication. No test message has been sent by preparing this change.
+## Rollback and recovery
 
-## Cutover and rollback
+Disable the new writers first and confirm no run is active. Re-enable the recorded local tracker writer if needed. Preserve the active all-channel report's 08:00 Pacific command and schedule. Do not restore the obsolete warehouse-only Slack publisher. Keep the database, frozen reports, plans and receipts for investigation. The dedicated native view tabs can stay as dated snapshots during rollback; do not delete sales evidence or restore old tracker values over owner corrections.
 
-1. Approve and merge the actual PR after code review and passing checks.
-2. Review Render's resource and cost preview, import the separate Blueprint, set credentials, initialize the database, and verify read access. Leave publishing disabled outside the supervised test.
-3. Prepare the seven-day evidence record described above and confirm the tracker history against it. Record the old Render command and schedule, and the two local automation definitions, in private deployment evidence.
-4. Pause the old merchant publisher for the supervised test. Run the new sales and tracker commands for one agreed reporting day. Read back the Slack and Drive file hashes, merchant values, separate Target and Amazon data, warehouse formulas and the cloud Target workbook. Confirm the same version is recorded for both jobs.
-5. After explicit cutover approval, enable the new scheduled writers and disable the old merchant publisher and local tracker writer. Keep the local monitor until seven scheduled cloud mornings pass. Confirm the Render failure-notification destination before retiring it.
-6. For rollback, disable the new writers first, confirm no run is active, restore the recorded old Render command and schedule, and re-enable the old tracker writer. Restore an earlier tracker value only from a verified source, preserving correction notes. Keep the database, report files and receipts for investigation.
-
-For database recovery, stop all new writers, restore the paid database to a new instance at the chosen recovery time using Render's restore workflow, verify saved version/report hashes and readback receipts, then switch the private connection URL. A restored database can lag provider writes. Reconcile native files and cells before any resumed publication; do not assume database restore rolls back Google or Slack.
+For database recovery, stop all writers and restore the paid database to a new instance. Verify saved source/workbook hashes and reconcile actual Google and Slack results before switching connections and resuming publication. Database restore does not roll back provider writes.
 
 ## Validation limits
 
-The repository tests use synthetic source fixtures, provider failures and an actual local PostgreSQL instance. CI also builds both Docker images. Cloud credentials, resource provisioning, provider parity, alert delivery and scheduled operation must be proven during deployment. A passing test suite does not prove those live steps are complete.
+Tests cover provider failures, immutable source/report records, interrupted publication, protected cells, date fences and database behavior. CI builds both images. Live credentials, tracker formulas, exact native views, cloud Target readbacks, alert receipt and seven scheduled mornings still require deployment evidence before the migration is called complete.

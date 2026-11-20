@@ -74,6 +74,7 @@ def check_pipeline(
     now_utc: datetime,
     heartbeat_max_age: timedelta = HEARTBEAT_MAX_AGE,
     max_run_age: timedelta = MAX_RUN_AGE,
+    native_report: bool = False,
 ) -> HealthReport:
     """Check one reporting day without starting or repairing its jobs.
 
@@ -88,11 +89,16 @@ def check_pipeline(
     if heartbeat_max_age <= timedelta(0) or max_run_age <= timedelta(0):
         raise ValueError("Running time limits must be positive")
     local = now.astimezone(ZoneInfo(PACIFIC))
-    deadline = datetime.combine(day + timedelta(days=1), DEADLINE, ZoneInfo(PACIFIC))
+    deadline = datetime.combine(
+        day + timedelta(days=1), time(9, 15) if native_report else DEADLINE, ZoneInfo(PACIFIC)
+    )
+    merchant_destinations = tuple(
+        d for d in MERCHANT_DESTINATIONS if not (native_report and d == "slack")
+    )
     overdue = local >= deadline
     version = store.latest(day)
     failures, stale, incomplete, running = [], [], [], []
-    for kind in ("sales", "trackers"):
+    for kind in ("warehouse" if native_report else "sales", "trackers"):
         run = store.latest_run(kind, day)
         if not run:
             (failures if overdue else incomplete).append(f"{kind}_not_started")
@@ -123,7 +129,7 @@ def check_pipeline(
         if version.day != day:
             stale.append("sales_day_mismatch")
         receipts = store.receipts(version.version_id)
-        for destination in MERCHANT_DESTINATIONS + SOURCE_DESTINATIONS:
+        for destination in merchant_destinations + SOURCE_DESTINATIONS:
             receipt = receipts.get(destination)
             if not receipt:
                 incomplete.append(f"{destination}_receipt_missing")
@@ -144,7 +150,7 @@ def check_pipeline(
                 # Never expose provider response text or credentials in bot alerts.
                 incomplete.append("provider_readback_failed")
             else:
-                for destination in MERCHANT_DESTINATIONS + SOURCE_DESTINATIONS:
+                for destination in merchant_destinations + SOURCE_DESTINATIONS:
                     if readbacks.get(destination) is not True:
                         stale.append(f"{destination}_readback_mismatch")
     reasons = failures + stale + incomplete + running
