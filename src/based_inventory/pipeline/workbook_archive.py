@@ -257,6 +257,7 @@ def target_workbook_update(content, parsed):
             )
 
             def cache(match, value=value):
+                opening = re.sub(r'\s+t="[^"]*"', "", match.group(1))
                 body, count = re.subn(
                     r"<v\b[^>]*?(?:/>|>.*?</v>)",
                     f"<v>{value}</v>",
@@ -266,7 +267,7 @@ def target_workbook_update(content, parsed):
                 )
                 if not count:
                     body += f"<v>{value}</v>"
-                return match.group(1) + body + match.group(3)
+                return opening + body + match.group(3)
 
             text, count = pattern.subn(cache, text)
             if count != 1:

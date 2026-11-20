@@ -231,7 +231,8 @@ def test_failed_readback_never_records_source_receipts(monkeypatch):
     store.record_receipt.assert_not_called()
 
 
-def test_cloud_workbook_updates_daily_summary_chart_caches_without_excel():
+@pytest.mark.parametrize("cache_type", [None, "str", "e"])
+def test_cloud_workbook_updates_daily_summary_chart_caches_without_excel(cache_type):
     from io import BytesIO
     from pathlib import Path
     from zipfile import ZipFile
@@ -275,11 +276,35 @@ def test_cloud_workbook_updates_daily_summary_chart_caches_without_excel():
         },
     }
     before = path.read_bytes()
+    if cache_type:
+        import re
+
+        output = BytesIO()
+        with ZipFile(BytesIO(before)) as original, ZipFile(output, "w") as changed:
+            for info in original.infolist():
+                content = original.read(info.filename)
+                if info.filename == "xl/worksheets/sheet2.xml":
+                    text = content.decode()
+                    for column in ("B", "C", "E", "F", "G", "L"):
+                        pattern = re.compile(r'(<c\b(?=[^>]*\br="' + column + r'6")[^>]*)(>)')
+                        text, count = pattern.subn(
+                            lambda match: re.sub(r'\s+t="[^"]*"', "", match[1])
+                            + f' t="{cache_type}"'
+                            + match[2],
+                            text,
+                        )
+                        assert count == 1
+                    content = text.encode()
+                changed.writestr(info, content)
+        before = output.getvalue()
     after = target_workbook_update(before, parsed)
     native = load_workbook(BytesIO(after), data_only=True)
     assert native["Daily Data"]["F6"].value == 5
     assert native["Daily Data"]["E6"].value == 50
     assert native["Daily Data"]["G6"].value == 10
+    assert native["Daily Data"]["B6"].value == 46326
+    assert native["Daily Data"]["C6"].value == 1
+    assert native["Daily Data"]["L6"].value == -0.5
     assert native["Summary"]["C7"].value == 15
     assert native["Summary"]["B16"].value == 150
     assert native["Summary"]["B36"].value == 2
