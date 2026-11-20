@@ -1,5 +1,6 @@
 """Reconcile a known Slack file before retrying an ambiguous publication."""
 
+import time
 from datetime import timedelta
 from urllib.parse import urlparse
 
@@ -79,6 +80,18 @@ class SlackReport:
         if digest(self.download(info["url_private_download"])) != digest(version.report):
             raise SlackReportError("Saved Slack report hash mismatch")
 
+    def _verify_delivery(self, file_id, version):
+        # Slack can acknowledge completion before its file readback is ready.
+        # Retry only the existing file; never allocate or complete another upload.
+        for attempt in range(5):
+            try:
+                self.verify(file_id, version)
+                return
+            except (SlackReportError, KeyError, ValueError):
+                if attempt == 4:
+                    raise
+                time.sleep(2**attempt)
+
     def publish(
         self, store, version, *, summary_text: str | None = None, report_title: str | None = None
     ):
@@ -87,7 +100,7 @@ class SlackReport:
         if receipt:
             file_id = receipt["provider_id"]
             try:
-                self.verify(file_id, version)
+                self._verify_delivery(file_id, version)
             except (SlackReportError, KeyError, ValueError):
                 raise SlackReportError(
                     "Slack publication remains ambiguous; reconcile the reserved file before any reupload"
@@ -140,7 +153,7 @@ class SlackReport:
             # Do not allocate another file. A successful-but-lost completion is reconciled below.
             pass
         try:
-            self.verify(file_id, version)
+            self._verify_delivery(file_id, version)
         except (SlackReportError, KeyError, ValueError):
             raise SlackReportError(
                 "Slack publication remains ambiguous; reserved file requires reconciliation"

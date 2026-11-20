@@ -99,3 +99,30 @@ def test_api_failure_is_redacted():
     with pytest.raises(SlackReportError) as error:
         SlackReport("token", "C123", session=session).call("files.info", {"file": "F123"})
     assert "private credential" not in str(error.value)
+
+
+def test_delayed_file_readback_retries_same_file_without_reupload(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    client = publication_client()
+    client.verify.side_effect = [SlackReportError("temporary readback failure"), None]
+    store = store_with()
+    assert client.publish(store, verified(), summary_text="Report") == "F123"
+    assert client.verify.call_count == 2
+    assert [call.args[0] for call in client.call.call_args_list] == [
+        "files.getUploadURLExternal",
+        "files.completeUploadExternal",
+    ]
+    assert store.record_receipt.call_args.kwargs.get("status", "verified") == "verified"
+
+
+def test_pending_delivery_retries_then_preserves_receipt(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    client = SlackReport("token", "C123")
+    client.verify = Mock(side_effect=SlackReportError("temporary readback failure"))
+    client.call = Mock()
+    store = store_with({"status": "pending", "provider_id": "F123"})
+    with pytest.raises(SlackReportError, match="ambiguous"):
+        client.publish(store, verified())
+    assert client.verify.call_count == 5
+    client.call.assert_not_called()
+    store.record_receipt.assert_not_called()
