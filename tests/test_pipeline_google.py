@@ -193,3 +193,67 @@ def test_real_platform_adapter_creates_only_owned_tab_and_clears_old_tail():
     api.platform_write(file, tab_id, title, [["shorter", 3]])
     assert api.platform_read(file, tab_id, title) == [["shorter", 3]]
     assert len(tabs) == 1
+
+
+def test_sheets_calls_are_paced_below_per_minute_allowance():
+    class Clock:
+        now = 0.0
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    timestamps = []
+    session = Mock()
+    session.post.return_value = response(200, {"access_token": "synthetic"})
+
+    def request(*args, **kwargs):
+        timestamps.append(clock.now)
+        return response(200, {})
+
+    session.request.side_effect = request
+    api = GoogleAPI(
+        "id", "secret", "refresh", session=session, sleep=clock.sleep, clock=lambda: clock.now
+    )
+    for _ in range(80):
+        api.json("GET", "https://sheets.googleapis.com/v4/spreadsheets/synthetic")
+    assert (
+        max(
+            sum(start <= timestamp < start + 60 for timestamp in timestamps) for start in timestamps
+        )
+        <= 55
+    )
+
+
+def test_429_waits_through_a_full_quota_reset_and_stops_retrying():
+    class Clock:
+        now = 0.0
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    session = Mock()
+    session.post.return_value = response(200, {"access_token": "synthetic"})
+
+    def request(*args, **kwargs):
+        return response(429, {}) if clock.now < 60 else response(200, {"ready": True})
+
+    session.request.side_effect = request
+    api = GoogleAPI(
+        "id",
+        "secret",
+        "refresh",
+        session=session,
+        sleep=clock.sleep,
+        clock=lambda: clock.now,
+        jitter=lambda: 0,
+    )
+    assert api.json("GET", "https://sheets.googleapis.com/v4/spreadsheets/synthetic") == {
+        "ready": True
+    }
+    assert 60 <= clock.now < 70
+    session.request.side_effect = None
+    session.request.return_value = response(429, {})
+    with pytest.raises(GoogleAPIError):
+        api.json("GET", "https://sheets.googleapis.com/v4/spreadsheets/synthetic")

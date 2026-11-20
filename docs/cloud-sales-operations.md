@@ -68,6 +68,8 @@ A normal warehouse retry reuses the saved version. `warehouse --fresh --day YYYY
 
 The native report and its Target source must already have a verified Slack delivery and all seven saved reporting dates before `operations` writes any source cells. A saved Target write plan that differs from the native report source is rejected for reconciliation.
 
+Sheets requests are paced below the default per-user allowance. Bounded retries for HTTP 429 span a full minute so a preceding request burst can clear. The limit and recovery guidance are documented in [Google Sheets usage limits](https://developers.google.com/workspace/sheets/api/limits).
+
 Tracker view publication saves its exact intent before writing. One cross-date lock protects the six dedicated tabs. An older day cannot replace a newer snapshot. A lost provider response is reconciled against the saved values; retries do not blindly overwrite a changed sheet. A renamed, hidden, resized, missing or conflicting owned tab requires investigation. Owner sheets and formula cells cannot be silently reused as new report tabs.
 
 ## Supervised checks and cutover

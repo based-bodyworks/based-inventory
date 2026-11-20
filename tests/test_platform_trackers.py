@@ -188,3 +188,91 @@ def test_readonly_archive_does_not_migrate_or_allow_writes(tmp_path, monkeypatch
         assert connect.call_args.kwargs["options"] == "-c default_transaction_read_only=on"
         with pytest.raises(PermissionError):
             storage._write("test", {})
+
+
+def test_complete_view_cycle_with_production_adapter_respects_google_quota(tmp_path):
+    from datetime import timedelta
+    from urllib.parse import unquote
+
+    from based_inventory.pipeline.google_api import GoogleAPI
+    from tests.test_pipeline_google import response
+
+    class Server:
+        now = 0.0
+
+        def __init__(self):
+            self.tabs = {}
+            self.read_times = []
+            self.quota_errors = 0
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+        def post(self, *args, **kwargs):
+            return response(200, {"access_token": "synthetic"})
+
+        def request(self, method, url, **kwargs):
+            if method == "GET":
+                recent = [t for t in self.read_times if self.now - 60 < t <= self.now]
+                if len(recent) >= 60:
+                    self.quota_errors += 1
+                    return response(429, {})
+                self.read_times.append(self.now)
+            file = url.split("/spreadsheets/")[1].split("/")[0].split(":")[0]
+            tabs = self.tabs.setdefault(file, {})
+            if method == "GET" and "/values/" in url:
+                title = unquote(url.split("/values/")[1]).split("!")[0].strip("'")
+                item = next(item for item in tabs.values() if item["properties"]["title"] == title)
+                return response(200, {"values": item["values"]})
+            if method == "GET":
+                ranges = kwargs.get("params", {}).get("ranges")
+                sheets = []
+                for item in tabs.values():
+                    props = item["properties"]
+                    if ranges and not any(
+                        r.startswith("'" + props["title"] + "'!") for r in ranges
+                    ):
+                        continue
+                    sheets.append({"properties": props, "data": []})
+                return response(200, {"sheets": sheets})
+            for request in kwargs["json"]["requests"]:
+                if "addSheet" in request:
+                    props = request["addSheet"]["properties"]
+                    assert props["sheetId"] not in tabs
+                    tabs[props["sheetId"]] = {"properties": props, "values": []}
+                elif "updateCells" in request:
+                    update = request["updateCells"]
+                    tabs[update["range"]["sheetId"]]["values"] = [
+                        [
+                            next(iter(cell["userEnteredValue"].values()))
+                            if "userEnteredValue" in cell
+                            else ""
+                            for cell in row["values"]
+                        ]
+                        for row in update["rows"]
+                    ]
+            return response(200, {})
+
+    server = Server()
+    google = GoogleAPI(
+        "id",
+        "secret",
+        "refresh",
+        session=server,
+        sleep=server.sleep,
+        clock=lambda: server.now,
+        jitter=lambda: 0,
+    )
+    with VelocityArchive(tmp_path) as storage:
+        # Account for the source-refresh requests before view publication.
+        for _ in range(40):
+            google.metadata(TABS[0][0])
+        first = package()
+        publish_views(storage, first, google)
+        verify_views(storage, first, google)
+        second = package(first.day + timedelta(days=1))
+        publish_views(storage, second, google)
+        publish_views(storage, second, google)
+        verify_views(storage, second, google)
+    assert len(server.read_times) > 200
+    assert server.quota_errors == 0

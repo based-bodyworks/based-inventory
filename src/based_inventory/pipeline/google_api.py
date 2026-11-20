@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from urllib.parse import quote
 
@@ -33,7 +34,17 @@ class GoogleAPIError(RuntimeError):
 
 
 class GoogleAPI:
-    def __init__(self, client_id, client_secret, refresh_token, *, session=None, sleep=time.sleep):
+    def __init__(
+        self,
+        client_id,
+        client_secret,
+        refresh_token,
+        *,
+        session=None,
+        sleep=time.sleep,
+        clock=time.monotonic,
+        jitter=random.random,
+    ):
         if not all((client_id, client_secret, refresh_token)):
             raise ValueError("Cloud Google OAuth credentials are required")
         self.credentials = {
@@ -43,6 +54,8 @@ class GoogleAPI:
         }
         self.session = session or requests.Session()
         self.sleep = sleep
+        self.clock, self.jitter = clock, jitter
+        self._next_sheet_request = 0.0
         self.token = None
 
     def _refresh(self):
@@ -73,9 +86,16 @@ class GoogleAPI:
             raise ValueError("Unexpected Google API origin")
         refreshed = False
         headers = dict(kwargs.pop("headers", {}))
-        for attempt in range(5):
+        for attempt in range(7):
             if not self.token:
                 self._refresh()
+            if url.startswith("https://sheets.googleapis.com/"):
+                # Keep this sequential service below the default 60/min/user
+                # read allowance, including source refresh, view sync and retries.
+                delay = self._next_sheet_request - self.clock()
+                if delay > 0:
+                    self.sleep(delay)
+                self._next_sheet_request = self.clock() + 1.1
             try:
                 response = self.session.request(
                     method,
@@ -92,7 +112,11 @@ class GoogleAPI:
                 self._refresh()
                 refreshed = True
                 continue
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < 4:
+            if response.status_code == 429 and attempt < 6:
+                # Seven bounded attempts span a full minute's quota reset.
+                self.sleep(min(2**attempt, 32) + self.jitter())
+                continue
+            if response.status_code in {500, 502, 503, 504} and attempt < 4:
                 self.sleep(min(2**attempt, 16))
                 continue
             if not 200 <= response.status_code < 300:
