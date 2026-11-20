@@ -378,6 +378,13 @@ def _source_rows(current, merchant):
             ]
         )
         for key, meaning in labels.items():
+            if channel != "Shopify" and key in {
+                "excluded_mirrored_listing_units",
+                "excluded_promotional_listing_units",
+            }:
+                # These counters belong to Shopify's filters. Other channels'
+                # initialized zeros do not establish promotional-order coverage.
+                continue
             value = source.get(key)
             if value is not None:
                 if isinstance(value, Mapping):
