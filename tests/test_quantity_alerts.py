@@ -7,7 +7,6 @@ from based_inventory.jobs.quantity_alerts import (
     _availability_tier,
     _backorder_is_alertable,
     _backorder_tier_for,
-    _format_cover,
     _severity_rank,
     _tier_for,
     build_blocks,
@@ -32,14 +31,6 @@ def test_tier_for_critical_low_warning_headsup() -> None:
 def test_tier_for_above_threshold_returns_none() -> None:
     assert _tier_for(1001) is None
     assert _tier_for(50_000) is None
-
-
-def test_format_cover_subweek_uses_2_decimals() -> None:
-    assert _format_cover(0.04) == "0.04w"
-    assert _format_cover(0.4) == "0.40w"
-    assert _format_cover(1.0) == "1.0w"
-    assert _format_cover(8.5) == "8.5w"
-    assert _format_cover(99999.0) == "∞ (no observed depletion)"
 
 
 def _alert(**overrides) -> Alert:
@@ -105,33 +96,11 @@ def test_build_blocks_omits_inbound_when_zero() -> None:
     assert "pending PO" not in text
 
 
-def test_format_channel_mix_renders_known_channel_labels() -> None:
-    from based_inventory.jobs.quantity_alerts import _format_channel_mix
-
-    out = _format_channel_mix(
-        {
-            "BASED": 70,
-            "basedbodyworks.myshopify.com": 20,
-            "Based Bodyworks Amazon": 10,
-        }
-    )
-    assert out is not None
-    assert "TTS 70%" in out
-    assert "Shopify 20%" in out
-    assert "Amazon 10%" in out
-
-
-def test_format_channel_mix_returns_none_for_empty() -> None:
-    from based_inventory.jobs.quantity_alerts import _format_channel_mix
-
-    assert _format_channel_mix({}) is None
-
-
-def test_build_blocks_appends_channel_mix_to_footer() -> None:
-    blocks = build_blocks([_alert()], channel_mix_summary="TTS 65% / Shopify 25% / Amazon 10%")
+def test_build_blocks_footer_keeps_warehouse_scope_without_channel_mix() -> None:
+    blocks = build_blocks([_alert()])
     footer = blocks[-1]["elements"][0]["text"]
-    assert "TTS 65%" in footer
-    assert "channel mix" in footer.lower()
+    assert "ShipHero (Merchdrop)" in footer
+    assert "channel mix" not in footer.lower()
 
 
 def test_build_blocks_renders_critical_alert() -> None:
@@ -145,8 +114,8 @@ def test_build_blocks_renders_critical_alert() -> None:
     assert "CRITICAL" in text
     assert "Shampoo" in text
     assert "50" in text
-    assert "0.05w" in text
-    assert "156" in text
+    assert "cover" not in text.lower()
+    assert "/day" not in text
     assert "Shower Duo" in text
     footer = blocks[-1]
     assert footer["type"] == "context"
@@ -161,84 +130,53 @@ def test_build_blocks_oversold_includes_owe_message() -> None:
     assert "owe customers" in text
 
 
-def test_build_blocks_no_velocity_falls_back_to_no_recent_depletion() -> None:
+def test_build_blocks_does_not_treat_missing_velocity_as_no_depletion() -> None:
     blocks = build_blocks([_alert(velocity_per_day=0.0, weeks_of_cover=99999.0, on_hand=50)])
     text = blocks[2]["text"]["text"]
-    assert "no recent depletion observed" in text
+    assert "depletion" not in text.lower()
+    assert "cover" not in text.lower()
 
 
-# --------------------------------------------------------------------------
-# Velocity interpretation: in-stock burst rate vs 7d average annotation
-# --------------------------------------------------------------------------
-
-
-def test_format_sample_window_renders_days_hours_or_minutes() -> None:
-    from based_inventory.jobs.quantity_alerts import _format_sample_window
-
-    assert _format_sample_window(2.5) == "2.5d"
-    assert _format_sample_window(0.5) == "12.0h"
-    assert _format_sample_window(0.04) == "57.6min" or _format_sample_window(0.04).endswith("min")
-
-
-def test_velocity_interpretation_returns_none_for_full_window() -> None:
-    from based_inventory.jobs.quantity_alerts import _velocity_interpretation
-
-    # If the sample window matches the requested window, no annotation needed.
-    assert _velocity_interpretation(2000, 7.0, 7) is None
-    assert _velocity_interpretation(2000, 6.7, 7) is None  # within 95% threshold
-
-
-def test_velocity_interpretation_surfaces_sample_context_without_calendar_avg() -> None:
-    from based_inventory.jobs.quantity_alerts import _velocity_interpretation
-
-    # Saturated case: 2,377 units captured in 0.3 days -> short sample window.
-    annotation = _velocity_interpretation(2377, 0.3, 7)
-    assert annotation is not None
-    assert "2,377 units" in annotation
-    assert "shipped last 7d" in annotation
-    # Calendar-avg framing was removed 2026-05-08 (operationally misleading).
-    assert "calendar avg" not in annotation
-    assert "calendar" not in annotation
-    # Sample window rendered in hours/minutes for short spans.
-    assert "h " in annotation or "min " in annotation
-    assert "In-stock rate sampled" in annotation
-
-
-def test_build_blocks_renders_burst_rate_label_when_window_short() -> None:
+def test_build_blocks_removes_capped_sample_rate_and_false_seven_day_total() -> None:
     blocks = build_blocks(
         [
             _alert(
-                velocity_per_day=1667.0,
-                weeks_of_cover=0.0,
-                depletion_units=2377,
-                effective_window_days=0.3,
+                sku="BB2000S-1-6-1",
+                product_name="Sea Salt Spray",
+                on_hand=21_701,
+                available=0,
+                backorder=2_919,
+                velocity_per_day=4_343.0,
+                weeks_of_cover=0.71,
+                depletion_units=505,
+                effective_window_days=2.8 / 24,
             )
         ]
     )
     text = blocks[2]["text"]["text"]
-    assert "1,667/day in-stock rate" in text
-    assert "2,377 units shipped last 7d" in text
-    assert "In-stock rate sampled" in text
-    assert "calendar avg" not in text
+    assert "21,701" in text and "2,919" in text
+    assert "No sellable units reported for this warehouse SKU" in text
+    assert "cover" not in text.lower()
+    assert "/day" not in text
+    assert "in-stock rate" not in text.lower()
+    assert "shipped last 7d" not in text
+    assert "505" not in text
 
 
-def test_build_blocks_renders_normal_velocity_label_when_window_full() -> None:
+def test_build_blocks_never_labels_full_sample_as_order_demand() -> None:
     blocks = build_blocks(
-        [
-            _alert(
-                velocity_per_day=156.0,
-                weeks_of_cover=0.05,
-                depletion_units=1092,
-                effective_window_days=7.0,
-            )
-        ]
+        [_alert(velocity_per_day=156.0, depletion_units=1092, effective_window_days=7.0)]
     )
     text = blocks[2]["text"]["text"]
-    # Full-window: should label as "velocity" not "in-stock rate"
-    assert "/day velocity" in text
-    assert "in-stock rate" not in text
-    # No burst-rate annotation because the sample matched the requested window
-    assert "Burst rate sampled" not in text
+    assert "velocity" not in text.lower()
+    assert "cover" not in text.lower()
+
+
+def test_build_blocks_zero_or_negative_available_means_no_sellable_stock() -> None:
+    for available in (0, -1):
+        blocks = build_blocks([_alert(on_hand=21_701, available=available)])
+        text = blocks[2]["text"]["text"]
+        assert "No sellable units reported for this warehouse SKU" in text
 
 
 def test_build_blocks_renders_fba_quantity_when_present() -> None:
@@ -446,17 +384,17 @@ def _run_with_stock_clock(monkeypatch, tmp_path, available):
             return stock
 
         def fetch_sku_depletion(self, **kwargs):
-            clock[0] = 1793631600.0  # 15:00 UTC, well after the stock read
-            return 14, 7.0
+            raise AssertionError("Stock alerts must not extrapolate capped shipment samples")
 
         def fetch_inbound_outstanding_by_sku(self, **kwargs):
+            clock[0] = 1793631600.0  # 15:00 UTC, well after the stock read
             return {}
 
         def fetch_fba_inventory(self, sku):
             return []
 
         def fetch_channel_mix(self, **kwargs):
-            return {}
+            raise AssertionError("Warehouse-wide order mix is not a SKU's sales mix")
 
     class ReportDestination:
         def post_message(self, fallback, blocks):
@@ -507,3 +445,15 @@ def test_quantity_scan_logs_freshness_without_threshold_alerts(monkeypatch, tmp_
     assert posted == []
     assert "Quantity scan complete: 1 candidate SKUs; 0 threshold alerts" in caplog.text
     assert "stock read 2026-11-02 14:00:00 UTC to 2026-11-02 14:07:00 UTC" in caplog.text
+
+
+def test_quantity_alert_posts_zero_stock_without_depletion_or_channel_mix_queries(
+    monkeypatch, tmp_path
+):
+    posted = _run_with_stock_clock(monkeypatch, tmp_path, available=0)
+    assert len(posted) == 1
+    text = posted[0][2]["text"]["text"]
+    assert "CRITICAL" in text
+    assert "No sellable units reported for this warehouse SKU" in text
+    assert "cover" not in text.lower()
+    assert "channel mix" not in posted[0][-1]["elements"][0]["text"].lower()

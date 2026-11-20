@@ -419,6 +419,8 @@ class ShipHeroClient:
         updated_from: str = "2020-01-01T00:00:00",
         updated_to: str = "2099-01-01T00:00:00",
         max_calls: int = 64,
+        *,
+        require_complete: bool = False,
     ) -> list[WarehouseStock]:
         """Fetch every active warehouse_product via recursive bisection.
 
@@ -472,10 +474,8 @@ class ShipHeroClient:
                 query, {"warehouse_id": warehouse_id, "updated_from": uf, "updated_to": ut}
             )
             edges = payload["data"]["warehouse_products"]["data"]["edges"]
-            saturated = (
-                len(edges) >= 100
-                and payload["data"]["warehouse_products"]["data"]["pageInfo"]["hasNextPage"]
-            )
+            has_next = payload["data"]["warehouse_products"]["data"]["pageInfo"]["hasNextPage"]
+            saturated = bool(has_next) if require_complete else len(edges) >= 100 and has_next
             return [e["node"] for e in edges], saturated
 
         seen: set[str] = set()
@@ -484,6 +484,8 @@ class ShipHeroClient:
 
         def visit(uf: str, ut: str) -> None:
             if call_budget[0] <= 0:
+                if require_complete:
+                    raise RuntimeError("ShipHero stock catalog exceeded its complete-read budget")
                 return
             call_budget[0] -= 1
             nodes, saturated = fetch(uf, ut)
@@ -509,6 +511,8 @@ class ShipHeroClient:
                 return
             mid = _midpoint_iso(uf, ut)
             if mid is None or mid in (uf, ut):
+                if require_complete:
+                    raise RuntimeError("ShipHero stock catalog has an incomplete date window")
                 # Window is too narrow to bisect further; accept truncation.
                 return
             time.sleep(0.2)
@@ -622,6 +626,8 @@ class ShipHeroClient:
         updated_from: str = "2020-01-01T00:00:00",
         updated_to: str = "2099-01-01T00:00:00",
         max_calls: int = 32,
+        *,
+        require_complete: bool = False,
     ) -> list[KitDefinition]:
         """Fetch every product where kit=true via recursive bisection.
 
@@ -651,9 +657,8 @@ class ShipHeroClient:
         def fetch(uf: str, ut: str) -> tuple[list[dict], bool]:
             payload = self._execute(query, {"updated_from": uf, "updated_to": ut})
             edges = payload["data"]["products"]["data"]["edges"]
-            saturated = (
-                len(edges) >= 100 and payload["data"]["products"]["data"]["pageInfo"]["hasNextPage"]
-            )
+            has_next = payload["data"]["products"]["data"]["pageInfo"]["hasNextPage"]
+            saturated = bool(has_next) if require_complete else len(edges) >= 100 and has_next
             return [e["node"] for e in edges], saturated
 
         seen: set[str] = set()
@@ -662,6 +667,8 @@ class ShipHeroClient:
 
         def visit(uf: str, ut: str) -> None:
             if call_budget[0] <= 0:
+                if require_complete:
+                    raise RuntimeError("ShipHero kit catalog exceeded its complete-read budget")
                 return
             call_budget[0] -= 1
             nodes, saturated = fetch(uf, ut)
@@ -682,6 +689,8 @@ class ShipHeroClient:
                 return
             mid = _midpoint_iso(uf, ut)
             if mid is None or mid in (uf, ut):
+                if require_complete:
+                    raise RuntimeError("ShipHero kit catalog has an incomplete date window")
                 return
             time.sleep(0.2)
             visit(uf, mid)

@@ -53,3 +53,9 @@ jobs:
         run: docker build -f Dockerfile.pipeline -t based-sales-pipeline-ci .
       - name: Check cloud pipeline entrypoint
         run: docker run --rm based-sales-pipeline-ci python -m based_inventory.pipeline --help
+      - name: Check daily SKU report entrypoint in its production image
+        run: docker run --rm based-sales-pipeline-ci python scripts/post_velocity_to_slack.py --help
+      - name: Check all-channel daily sales entrypoint in its production image
+        run: docker run --rm based-sales-pipeline-ci python scripts/post_sales_velocity.py --help
+      - name: Check durable daily sales migration is included in the image
+        run: docker run --rm based-sales-pipeline-ci python -c "from pathlib import Path; assert Path('/app/migrations/002_daily_velocity_archive.sql').is_file()"
