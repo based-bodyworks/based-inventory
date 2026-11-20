@@ -13,7 +13,7 @@ services:
     dockerContext: .
     autoDeployTrigger: "off"
     schedule: "0 11 * * *"
-    dockerCommand: python -m based_inventory.pipeline sales
+    dockerCommand: python -m based_inventory.pipeline warehouse
     envVars: &pipeline_env
       - key: PIPELINE_ALLOW_WRITES
         value: "0"
@@ -46,10 +46,10 @@ services:
     dockerfilePath: ./Dockerfile.pipeline
     dockerContext: .
     autoDeployTrigger: "off"
-    # Summer 14:00 UTC; winter 15:00 UTC. Allow 07:00 <= local start < 08:00.
+    # After the native 08:00 report: summer 15:20 UTC; winter 16:20 UTC.
     # The adjacent DST candidate falls outside this window and exits untouched.
-    schedule: "0 14,15 * * *"
-    dockerCommand: python -m based_inventory.pipeline trackers --at-local-time 07:00
+    schedule: "20 15,16 * * *"
+    dockerCommand: python -m based_inventory.pipeline operations --at-local-time 08:20
     envVars: *pipeline_env
   - type: cron
     name: based-cloud-monitor-proposed
@@ -58,10 +58,10 @@ services:
     dockerfilePath: ./Dockerfile.pipeline
     dockerContext: .
     autoDeployTrigger: "off"
-    # Summer 15:45 UTC; winter 16:45 UTC. Allow 08:45 <= local start < 09:45.
+    # Summer 16:15 UTC; winter 17:15 UTC. Allow 09:15 <= local start < 10:15.
     # A delay of 60 minutes or more is outside the window. Monitor never sends Slack messages.
-    schedule: "45 15,16 * * *"
-    dockerCommand: python -m based_inventory.pipeline monitor --at-local-time 08:45
+    schedule: "15 16,17 * * *"
+    dockerCommand: python -m based_inventory.pipeline operations-monitor --at-local-time 09:15
     envVars: *pipeline_env
 databases:
   - name: based-cloud-sales-db-proposed

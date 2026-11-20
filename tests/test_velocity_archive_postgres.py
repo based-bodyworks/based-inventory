@@ -162,3 +162,13 @@ def test_all_channel_report_sources_and_exact_delivery_survive_database_reopen(d
         )
     assert server.reservations == 1
     assert len(server.comments) == 1
+
+
+def test_monitor_connection_is_database_enforced_readonly(database_url):
+    import psycopg
+
+    with (
+        VelocityArchive(database_url, read_only=True) as storage,
+        pytest.raises(psycopg.errors.ReadOnlySqlTransaction),
+    ):
+        storage._connection.execute("DELETE FROM daily_velocity_archive")

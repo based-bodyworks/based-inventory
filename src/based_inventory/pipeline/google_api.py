@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from urllib.parse import quote
 
@@ -10,8 +11,17 @@ import requests
 DYNAMIC_ID = "1vI9dM06MtptojGSxBAfNqOu0l0ZPyAGj0-D88ZF82eY"
 ERP_ID = "1TE-gFZLELr1BYfaTkhaAqhSkvuid7a8X0cZthyA33I4"
 WRITE_TABS = {
-    DYNAMIC_ID: {2106291001, 1740410291, 1740410293, 1740410294, 708272086},
-    ERP_ID: {1275479413, 1740410290, 560223170},
+    DYNAMIC_ID: {
+        2106291001,
+        1740410291,
+        1740410293,
+        1740410294,
+        708272086,
+        1740410295,
+        1740410296,
+        1740410297,
+    },
+    ERP_ID: {1275479413, 1740410290, 560223170, 1740410298, 1740410299, 1740410300},
 }
 
 
@@ -24,7 +34,17 @@ class GoogleAPIError(RuntimeError):
 
 
 class GoogleAPI:
-    def __init__(self, client_id, client_secret, refresh_token, *, session=None, sleep=time.sleep):
+    def __init__(
+        self,
+        client_id,
+        client_secret,
+        refresh_token,
+        *,
+        session=None,
+        sleep=time.sleep,
+        clock=time.monotonic,
+        jitter=random.random,
+    ):
         if not all((client_id, client_secret, refresh_token)):
             raise ValueError("Cloud Google OAuth credentials are required")
         self.credentials = {
@@ -34,6 +54,8 @@ class GoogleAPI:
         }
         self.session = session or requests.Session()
         self.sleep = sleep
+        self.clock, self.jitter = clock, jitter
+        self._next_sheet_request = 0.0
         self.token = None
 
     def _refresh(self):
@@ -64,9 +86,16 @@ class GoogleAPI:
             raise ValueError("Unexpected Google API origin")
         refreshed = False
         headers = dict(kwargs.pop("headers", {}))
-        for attempt in range(5):
+        for attempt in range(7):
             if not self.token:
                 self._refresh()
+            if url.startswith("https://sheets.googleapis.com/"):
+                # Keep this sequential service below the default 60/min/user
+                # read allowance, including source refresh, view sync and retries.
+                delay = self._next_sheet_request - self.clock()
+                if delay > 0:
+                    self.sleep(delay)
+                self._next_sheet_request = self.clock() + 1.1
             try:
                 response = self.session.request(
                     method,
@@ -83,7 +112,11 @@ class GoogleAPI:
                 self._refresh()
                 refreshed = True
                 continue
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < 4:
+            if response.status_code == 429 and attempt < 6:
+                # Seven bounded attempts span a full minute's quota reset.
+                self.sleep(min(2**attempt, 32) + self.jitter())
+                continue
+            if response.status_code in {500, 502, 503, 504} and attempt < 4:
                 self.sleep(min(2**attempt, 16))
                 continue
             if not 200 <= response.status_code < 300:
@@ -247,3 +280,150 @@ class GoogleAPI:
                             raise ValueError(
                                 "Source write encountered unexpected native validation"
                             )
+
+    def _platform_properties(self, spreadsheet, tab_id, title):
+        from .platform_trackers import MAX_COLUMNS, MAX_ROWS, TABS
+
+        if not any((spreadsheet, tab_id, title) == tab[:3] for tab in TABS):
+            raise ValueError("Platform tab is outside the write allowlist")
+        matches = [
+            sheet["properties"]
+            for sheet in self.metadata(spreadsheet)["sheets"]
+            if sheet["properties"]["sheetId"] == tab_id or sheet["properties"]["title"] == title
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1 or matches[0]["sheetId"] != tab_id or matches[0]["title"] != title:
+            raise ValueError("Platform sales tab identity differs")
+        props = matches[0]
+        if props.get("sheetType", "GRID") != "GRID" or props.get("hidden", False):
+            raise ValueError("Platform sales tab is hidden or has an unexpected type")
+        if (
+            props["gridProperties"]["rowCount"] != MAX_ROWS
+            or props["gridProperties"]["columnCount"] != MAX_COLUMNS
+        ):
+            raise ValueError("Platform sales tab bounds changed")
+        return props
+
+    def platform_read(self, spreadsheet, tab_id, title):
+        from .platform_trackers import MAX_ROWS
+
+        if self._platform_properties(spreadsheet, tab_id, title) is None:
+            return None
+        return self.values(spreadsheet, f"'{title}'!A1:J{MAX_ROWS}")
+
+    def platform_write(self, spreadsheet, tab_id, title, rows):
+        from .platform_trackers import MAX_COLUMNS, MAX_ROWS
+
+        if not rows or len(rows) > MAX_ROWS or any(len(row) > MAX_COLUMNS for row in rows):
+            raise ValueError("Platform sales view exceeds safe bounds")
+        if self._platform_properties(spreadsheet, tab_id, title) is None:
+            # Only these six new tabs may be created; owner sheets cannot be renamed or resized.
+            self.json(
+                "POST",
+                f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet}:batchUpdate",
+                json={
+                    "requests": [
+                        {
+                            "addSheet": {
+                                "properties": {
+                                    "sheetId": tab_id,
+                                    "title": title,
+                                    "gridProperties": {
+                                        "rowCount": MAX_ROWS,
+                                        "columnCount": MAX_COLUMNS,
+                                        "frozenRowCount": 13 if title == "Daily SKU Sales" else 8,
+                                        "hideGridlines": True,
+                                    },
+                                }
+                            }
+                        },
+                        {
+                            "repeatCell": {
+                                "range": {"sheetId": tab_id},
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "wrapStrategy": "WRAP",
+                                        "verticalAlignment": "TOP",
+                                    }
+                                },
+                                "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment",
+                            }
+                        },
+                        {
+                            "updateDimensionProperties": {
+                                "range": {
+                                    "sheetId": tab_id,
+                                    "dimension": "COLUMNS",
+                                    "startIndex": 0,
+                                    "endIndex": MAX_COLUMNS,
+                                },
+                                "properties": {"pixelSize": 220},
+                                "fields": "pixelSize",
+                            }
+                        },
+                        {
+                            "updateDimensionProperties": {
+                                "range": {
+                                    "sheetId": tab_id,
+                                    "dimension": "COLUMNS",
+                                    "startIndex": 1,
+                                    "endIndex": 2,
+                                },
+                                "properties": {
+                                    "pixelSize": 1000 if title == "Daily Sales Methods" else 420
+                                },
+                                "fields": "pixelSize",
+                            }
+                        },
+                        {
+                            "updateDimensionProperties": {
+                                "range": {
+                                    "sheetId": tab_id,
+                                    "dimension": "ROWS",
+                                    "startIndex": 0,
+                                    "endIndex": len(rows),
+                                },
+                                "properties": {
+                                    "pixelSize": 150 if title == "Daily Sales Methods" else 90
+                                },
+                                "fields": "pixelSize",
+                            }
+                        },
+                    ]
+                },
+            )
+            if self.platform_read(spreadsheet, tab_id, title) not in ([], None):
+                raise ValueError("New platform sales tab contains unexpected values")
+
+        def cell(value):
+            if value in (None, ""):
+                return {}
+            key = (
+                "boolValue"
+                if isinstance(value, bool)
+                else "numberValue"
+                if isinstance(value, int | float)
+                else "stringValue"
+            )
+            return {"userEnteredValue": {key: value}}
+
+        # An explicit range clears stale trailing values within the dedicated view only.
+        self.batch(
+            spreadsheet,
+            [
+                {
+                    "updateCells": {
+                        "range": {
+                            "sheetId": tab_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": MAX_ROWS,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": MAX_COLUMNS,
+                        },
+                        "rows": [{"values": [cell(value) for value in row]} for row in rows],
+                        "fields": "userEnteredValue",
+                    }
+                }
+            ],
+        )

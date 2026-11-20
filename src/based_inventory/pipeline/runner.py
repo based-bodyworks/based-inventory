@@ -51,20 +51,22 @@ def run_command(
     now_utc=None,
     provider_readbacks=None,
     extractor=None,
+    native_report=False,
+    frozen_target=None,
 ):
     now = now_utc or datetime.now(UTC)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("A timezone-aware clock is required")
-    if command not in {"sales", "trackers", "monitor", "compare"}:
+    if command not in {"sales", "warehouse", "trackers", "monitor", "compare"}:
         raise ValueError("Unknown pipeline command")
     day = day or (
         now.astimezone(UTC).date() - timedelta(days=1)
-        if command == "sales"
+        if command in {"sales", "warehouse"}
         else expected_reporting_day(now)
     )
     if type(day) is not date or day >= now.astimezone(UTC).date():
         raise ValueError("A complete UTC reporting day is required")
-    if fresh and (command != "sales" or version_id):
+    if fresh and (command not in {"sales", "warehouse"} or version_id):
         raise ValueError("Fresh extraction is only available for sales without a version")
     if command in {"monitor", "compare"}:
         if version_id:
@@ -72,7 +74,9 @@ def run_command(
             if version.day != day:
                 raise ValueError("Saved version does not match reporting day")
             store.assert_current(version_id)
-        report = check_pipeline(day, store, provider_readbacks, now_utc=now)
+        report = check_pipeline(
+            day, store, provider_readbacks, now_utc=now, native_report=native_report
+        )
         return {
             "status": report.state,
             "day": day.isoformat(),
@@ -89,7 +93,7 @@ def run_command(
                 store.load(version_id) if version_id else (None if fresh else store.latest(day))
             )
             if version is None:
-                if command != "sales":
+                if command not in {"sales", "warehouse"}:
                     raise ValueError("Trackers require a saved verified merchant version")
                 version = (extractor or extract_day)(day, heartbeat=lambda: store.heartbeat(run_id))
                 store.save_version(version)
@@ -97,13 +101,17 @@ def run_command(
                 raise ValueError("Saved version does not match reporting day")
             store.assert_current(version.version_id)
             store.heartbeat(run_id)
-            if command == "sales":
+            if command in {"sales", "warehouse"}:
                 source_url = DriveArchive(google).ensure_report(store, version)
                 store.heartbeat(run_id)
                 MerchantPublisher(store, google).publish(version, source_url)
                 store.heartbeat(run_id)
-                slack.publish(store, version)
+                if command == "sales":
+                    slack.publish(store, version)
             else:
+                source_options = (
+                    {"frozen_target": frozen_target} if frozen_target is not None else {}
+                )
                 result = refresh_sources(
                     day,
                     store,
@@ -113,6 +121,7 @@ def run_command(
                     polar_token=os.getenv("POLAR_API_KEY", ""),
                     target_query=os.getenv("TARGET_GMAIL_QUERY", ""),
                     target_workbook_id=os.getenv("TARGET_WORKBOOK_ID", ""),
+                    **source_options,
                 )
                 if result.get("status") != "verified":
                     raise ValueError("Tracker sources are incomplete")
@@ -125,7 +134,19 @@ def run_command(
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Verified sales cloud pipeline")
-    parser.add_argument("command", choices=("sales", "trackers", "monitor", "compare", "migrate"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "sales",
+            "warehouse",
+            "trackers",
+            "operations",
+            "monitor",
+            "operations-monitor",
+            "compare",
+            "migrate",
+        ),
+    )
     parser.add_argument("--day", type=date.fromisoformat)
     parser.add_argument("--version", dest="version_id")
     parser.add_argument("--fresh", action="store_true")
@@ -136,7 +157,7 @@ def main(argv=None) -> int:
         if args.at_local_time and not local_time_matches(now, args.at_local_time):
             print(json.dumps({"status": "skipped", "reason": "outside_local_schedule"}))
             return 0
-        if args.command in {"sales", "trackers", "migrate"}:
+        if args.command in {"sales", "warehouse", "trackers", "operations", "migrate"}:
             require_writes()
         with Store(os.environ["DATABASE_URL"]) as store:
             if args.command == "migrate":
@@ -154,12 +175,23 @@ def main(argv=None) -> int:
                 os.environ["SLACK_BOT_TOKEN"], os.environ["SLACK_REPORT_CHANNEL_ID"]
             )
             readbacks = None
-            if args.command in {"monitor", "compare"}:
+            if args.command in {"monitor", "operations-monitor", "compare"}:
                 from .health_readbacks import native_readbacks
 
                 readbacks = native_readbacks(store, google, slack)
+            frozen_target = None
+            if args.command == "operations":
+                from based_inventory.velocity_archive import VelocityArchive
+
+                from .platform_trackers import report_inputs
+
+                reporting_day = args.day or expected_reporting_day(now)
+                with VelocityArchive(os.environ["DATABASE_URL"], read_only=True) as storage:
+                    _, frozen_target = report_inputs(storage, reporting_day, slack)
             result = run_command(
-                args.command,
+                {"operations": "trackers", "operations-monitor": "monitor"}.get(
+                    args.command, args.command
+                ),
                 store=store,
                 google=google,
                 slack=slack,
@@ -168,7 +200,20 @@ def main(argv=None) -> int:
                 fresh=args.fresh,
                 now_utc=now,
                 provider_readbacks=readbacks,
+                native_report=args.command == "operations-monitor",
+                frozen_target=frozen_target,
             )
+            if args.command in {"operations", "operations-monitor"}:
+                from .platform_trackers import check_or_publish
+
+                report_version = check_or_publish(
+                    os.environ["DATABASE_URL"],
+                    date.fromisoformat(result["day"]),
+                    google,
+                    slack,
+                    publish=args.command == "operations",
+                )
+                result["report_version_id"] = report_version
             print(json.dumps(result, sort_keys=True))
             return 0 if result["status"] in {"verified", "healthy"} else 1
     except Exception:

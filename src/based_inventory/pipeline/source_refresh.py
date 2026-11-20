@@ -30,6 +30,7 @@ def refresh_sources(
     polar_token: str,
     target_query: str,
     target_workbook_id: str,
+    frozen_target=None,
 ) -> dict:
     require_mode(mode)
     version = store.load(version_id)
@@ -62,6 +63,14 @@ def refresh_sources(
                     )
 
             if saved:
+                if (
+                    name == "target"
+                    and frozen_target is not None
+                    and saved["receipt"]["verification"]["target"] != frozen_target
+                ):
+                    raise SourceIncomplete(
+                        "Saved Target write plan differs from the frozen native report"
+                    )
                 existing = store.receipts(version_id).get(name, {})
                 if (
                     existing.get("status") == "verified"
@@ -102,7 +111,13 @@ def refresh_sources(
 
     def target_action(before_write):
         nonlocal target
-        target = collect_target(day, google, target_query)
+        target = (
+            frozen_target
+            if frozen_target is not None
+            else collect_target(day, google, target_query)
+        )
+        if target.get("date") != str(day) or target.get("safe_to_write") is not True:
+            raise SourceIncomplete("Target source is not safe for this reporting day")
         return publish_target(target, google, mode=mode, before_write=before_write)
 
     run("target", target_action)
