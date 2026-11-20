@@ -322,3 +322,37 @@ def test_oversize_report_fails_without_dropping_products(tmp_path):
     )
     with pytest.raises(ValueError, match="Slack"):
         render(sales(), {}, catalog_path=path)
+
+
+def test_sources_do_not_present_shopify_only_exclusions_as_other_channel_controls():
+    from based_inventory.all_channel_sales import SalesDay, decode_source_proof, encode_proof
+
+    baseline = sales(rows=[SalesRow("BB2000S-1-6-1", "Sea Salt Spray", "TikTok", 3)])
+    payload = baseline.payload()
+    fields = ("excluded_mirrored_listing_units", "excluded_promotional_listing_units")
+    for channel in ("Shopify", "TikTok", "Amazon"):
+        source = payload["sources"][channel]
+        proof = decode_source_proof(source)
+        for field in fields:
+            source[field] = proof[field] = 0
+        source["raw_proof_gzip"], source["raw_sha256"] = encode_proof(proof)
+        source["scope"] = {
+            "promotional_orders": "known creator gifting excluded"
+            if channel == "Shopify"
+            else "not separately identified"
+        }
+    current = SalesDay.from_payload(payload)
+    before = openpyxl.load_workbook(io.BytesIO(build(baseline, {})))
+    after = openpyxl.load_workbook(io.BytesIO(build(current, {})))
+    rows = list(after["Sources"].values)
+    for field in fields:
+        assert any(row[0] == "Shopify" and row[1] == field and row[2] == 0 for row in rows)
+        assert not any(row[0] in ("TikTok", "Amazon") and row[1] == field for row in rows)
+    for channel in ("TikTok", "Amazon"):
+        assert any(
+            row[0] == channel and row[1] == "scope" and "not separately identified" in row[2]
+            for row in rows
+        )
+    assert list(before["SKU Velocity"].values) == list(after["SKU Velocity"].values)
+    before.close()
+    after.close()
