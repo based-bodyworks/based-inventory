@@ -16,6 +16,13 @@ def test_lost_write_response_is_read_back_and_not_appended_twice():
     )
     api = Mock()
     store = Mock(spec=Store)
+    stock_receipt = {"digest": "verified-stock-source", "provider_id": "stock-source"}
+    receipts = {"inventory": stock_receipt}
+    store.record_receipt.side_effect = (
+        lambda version_id, destination, digest, provider_id: receipts.update(
+            {destination: {"digest": digest, "provider_id": provider_id}}
+        )
+    )
     store.plan_once.return_value = planned | {
         "history_before": history,
         "rolling_before": rolling,
@@ -50,8 +57,9 @@ def test_lost_write_response_is_read_back_and_not_appended_twice():
         "rolling",
         "erp",
         "canonical",
-        "inventory",
     }
+    publisher.verify_inventory.assert_called_once_with(planned["rolling_after"])
+    assert receipts["inventory"] is stock_receipt
 
 
 def test_external_history_edit_blocks_stale_plan_before_any_write():
