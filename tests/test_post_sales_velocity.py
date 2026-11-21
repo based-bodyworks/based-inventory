@@ -18,7 +18,7 @@ import post_sales_velocity as job
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(job, "load_dotenv", lambda *a, **k: None)
-    for key in ("ENV", "DRY_RUN", "SLACK_BOT_TOKEN", "VELOCITY_DATABASE_URL"):
+    for key in ("ENV", "DRY_RUN", "SLACK_BOT_TOKEN", "VELOCITY_DATABASE_URL", "DATABASE_URL"):
         monkeypatch.delenv(key, raising=False)
     source = model()
     source_file = tmp_path / "sources.json"
@@ -88,9 +88,9 @@ def test_partial_source_data_never_posts_a_false_all_channel_total(setup, tmp_pa
     )
     monkeypatch.setattr(job, "SlackReport", lambda *a, **k: pytest.fail("partial report published"))
     notices = []
-    monkeypatch.setattr(job, "_pending_notice", lambda *a: notices.append(a))
+    monkeypatch.setattr("based_inventory.slack.SlackClient", lambda *a: notices.append(a))
     assert job.main(["--day", str(source.day), "--history", str(tmp_path / "archive")]) == 1
-    assert notices
+    assert not notices
     with VelocityArchive(tmp_path / "archive") as storage:
         assert storage._read(f"sales-package:{source.day}") is None
 
@@ -112,30 +112,56 @@ def test_target_search_is_bounded_to_the_requested_report_date(monkeypatch):
     assert "before:2026/11/20" in query
 
 
-@pytest.mark.parametrize("success", [True, False])
-def test_pending_notice_reservation_survives_reopen_without_repeated_messages(
-    setup, tmp_path, monkeypatch, success
+@pytest.mark.parametrize("failures", [1, 2, 3])
+def test_transient_source_failures_retry_without_notices_or_duplicate_uploads(
+    setup, tmp_path, monkeypatch, failures
 ):
+    from based_inventory.pipeline.target_refresh import SourceIncomplete
+
     source, _ = setup
-    notices = []
+    server = SlackServer()
+    client = SlackReport("test-token", "C_TEST", session=server)
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(job, "_clients", lambda: (None, None, None))
+    monkeypatch.setattr(job, "SlackReport", lambda *a, **k: client)
+    monkeypatch.setattr(job, "_merchant_context", lambda *a: None)
+    monkeypatch.setattr(
+        "based_inventory.slack.SlackClient", lambda *a: pytest.fail("pending notice sent")
+    )
+    delays, calls = [], []
+    monkeypatch.setattr("time.sleep", delays.append)
 
-    class NoticeClient:
-        def __init__(self, token, channel):
-            pass
+    def collect(*args):
+        calls.append(args)
+        if len(calls) <= failures:
+            raise SourceIncomplete("Online source freshness proof is unavailable")
+        return source
 
-        def post_message(self, text, blocks):
-            notices.append((text, blocks))
-            return success
+    monkeypatch.setattr(job, "collect_sales_day", collect)
+    args = ["--day", str(source.day), "--channel", "C_TEST", "--history", str(tmp_path / "archive")]
+    assert job.main(args) == (1 if failures == 3 else 0)
+    assert len(calls) == min(failures + 1, 3)
+    assert delays == [30, 60][: min(failures, 2)]
+    assert server.reservations == (0 if failures == 3 else 1)
+    if failures < 3:
+        assert job.main(args) == 0
+        assert server.reservations == 1
+        assert len(calls) == failures + 1
+    else:
+        with VelocityArchive(tmp_path / "archive") as archive:
+            assert archive._read(f"sales-day:{source.day}") is None
+            assert archive._read(f"sales-package:{source.day}") is None
 
-    monkeypatch.setattr(job, "SlackClient", NoticeClient)
-    with VelocityArchive(tmp_path / "archive") as storage:
-        if success:
-            job._pending_notice(storage, source.day, "test-token", "C_TEST", "Target missing")
-        else:
-            with pytest.raises(RuntimeError, match="could not be verified"):
-                job._pending_notice(storage, source.day, "test-token", "C_TEST", "Target missing")
-    with VelocityArchive(tmp_path / "archive") as reopened:
-        job._pending_notice(reopened, source.day, "test-token", "C_TEST", "Target missing")
-    assert len(notices) == 1
-    assert "Report pending: Target" in notices[0][0]
-    assert "Missing data will not appear as zero sales" in notices[0][0]
+
+def test_runtime_with_shared_database_never_falls_back_to_local_history(setup, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://shared-database")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "test-token")
+    locations = []
+
+    def open_archive(location):
+        locations.append(location)
+        raise RuntimeError("stop before opening test database")
+
+    monkeypatch.setattr(job, "VelocityArchive", open_archive)
+    assert job.main(["--day", "2026-11-20", "--archive-only"]) == 1
+    assert locations == ["postgresql://shared-database"]
