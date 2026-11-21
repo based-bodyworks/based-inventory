@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -34,7 +35,6 @@ from based_inventory.sales_report_archive import (  # noqa: E402
 )
 from based_inventory.shiphero import ShipHeroClient  # noqa: E402
 from based_inventory.shiphero_auth import resolve_access_token  # noqa: E402
-from based_inventory.slack import SlackClient, section  # noqa: E402
 from based_inventory.velocity_archive import POSTGRES_SCHEMES, VelocityArchive  # noqa: E402
 
 TARGET_QUERY = 'from:zach.haugen@onepltfrm.com subject:"Target Daily Sales Reporting"'
@@ -84,26 +84,27 @@ def _merchant_context(location, day):
         return None
 
 
-def _pending_notice(storage, day, token, channel, reason):
-    key = f"sales-pending:{day}:{channel}"
-    if storage._read(key) is not None:
-        return
-    names = [
-        name
-        for name in ("Shopify", "TikTok", "Amazon", "Target")
-        if name.lower() in str(reason).lower()
-    ]
-    source = ", ".join(names) if names else "Required source"
-    text = (
-        f"*Daily SKU Velocity | {day}*\n"
-        f"Report pending: {source} data has not passed the checks for this reporting date. "
-        "The all-channel report has been withheld. Missing data will not appear as zero sales."
-    )
-    # Reserve the notice attempt first. An uncertain response must not create a
-    # stream of repeated notices; the complete report uses a separate receipt.
-    storage._write(key, {"attempted": True, "source": source}, once=True)
-    if not SlackClient(token, channel).post_message(text, [section(text)]):
-        raise RuntimeError("The pending-report notice could not be verified")
+def _collect_with_retries(day):
+    transient = {
+        "ShipHero complete product and kit catalog is unavailable",
+        "Online source freshness proof is unavailable",
+        "Polar API request unavailable",
+        "Polar response is not valid JSON",
+        *(f"Polar API HTTP {code}" for code in (429, 500, 502, 503, 504)),
+    }
+    for attempt, delay in enumerate((30, 60, 0), start=1):
+        try:
+            polar, shiphero, google = _clients()
+            return collect_sales_day(day, polar, shiphero, google, _target_query(day))
+        except SourceIncomplete as error:
+            if not delay or str(error) not in transient:
+                raise
+            print(
+                f"Temporary source failure; retrying collection {attempt}/2 in {delay}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    raise RuntimeError("Sales source retries exhausted")
 
 
 def _output(package, directory):
@@ -165,6 +166,7 @@ def _run(args, now):
     location = (
         args.history
         or os.getenv("VELOCITY_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
         or str(ROOT / "data/sales-velocity/all-channel-history")
     )
     if os.getenv("ENV") == "prod" and not location.startswith(POSTGRES_SCHEMES):
@@ -181,15 +183,9 @@ def _run(args, now):
         if package is None:
             current = archive.latest_day(day)
             if current is None:
-                try:
-                    if source is None:
-                        polar, shiphero, google = _clients()
-                        source = collect_sales_day(day, polar, shiphero, google, _target_query(day))
-                    current = archive.save_day(source)
-                except SourceIncomplete as error:
-                    if not args.archive_only:
-                        _pending_notice(storage, day, token, channel, error)
-                    raise
+                if source is None:
+                    source = _collect_with_retries(day)
+                current = archive.save_day(source)
             elif source is not None and current.capture_id != source.capture_id:
                 raise ValueError("Different same-date sources require reconciliation")
             if args.archive_only:

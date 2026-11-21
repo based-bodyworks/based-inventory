@@ -188,12 +188,13 @@ class MerchantPublisher:
                     raise
                 self.sleep(2)
         self.store.assert_current(version.version_id)
+        # The inventory source adapter owns the stock receipt. Demand/cover
+        # verification above must not replace it with a rolling-sales digest.
         for destination, content in (
             ("history", plan["history_after"]),
             ("rolling", plan["rolling_after"]),
             ("erp", merchant_daily(plan["daily_after"])),
             ("canonical", [(r.sku, r.channel, r.units) for r in version.rows]),
-            ("inventory", plan["rolling_after"]),
         ):
             self.store.record_receipt(
                 version.version_id, destination, digest(canonical(content)), version.version_id
