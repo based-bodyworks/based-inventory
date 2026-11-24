@@ -99,6 +99,47 @@ def test_sales_reuses_saved_version_and_orders_publications():
     assert not store.locked
 
 
+def test_operations_copies_delivered_report_even_when_warehouse_publication_fails(
+    monkeypatch, tmp_path
+):
+    from contextlib import nullcontext
+
+    from based_inventory.pipeline import platform_trackers, runner
+    from based_inventory.velocity_archive import VelocityArchive
+    from tests.test_platform_trackers import Google, package
+
+    report = package()
+    google = Google()
+    for key in (
+        "DATABASE_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REFRESH_TOKEN", "SLACK_BOT_TOKEN", "SLACK_REPORT_CHANNEL_ID",
+    ):
+        monkeypatch.setenv(key, "test")
+    monkeypatch.setattr(runner, "Store", lambda _: nullcontext(Store(False)))
+    monkeypatch.setattr(runner, "GoogleAPI", lambda *_: google)
+    monkeypatch.setattr(runner, "SlackReport", lambda *_: object())
+    monkeypatch.setattr(
+        "based_inventory.velocity_archive.VelocityArchive", lambda *_, **__: VelocityArchive(tmp_path)
+    )
+    monkeypatch.setattr(platform_trackers, "report_inputs", lambda *_: (report, {}))
+
+    def copy_report(*_, publish=False):
+        assert publish
+        with VelocityArchive(tmp_path) as storage:
+            platform_trackers.publish_views(storage, report, google)
+        return report.version_id
+
+    monkeypatch.setattr(platform_trackers, "check_or_publish", copy_report)
+
+    def warehouse_unavailable(*_, **__):
+        raise RuntimeError("warehouse unavailable")
+
+    monkeypatch.setattr(runner, "run_command", warehouse_unavailable)
+    assert runner.main(["operations", "--day", str(report.day)]) == 1
+    assert len(google.tabs) == 6
+    assert all(tab[1][6] == ["Amazon includes FBA", 42] for tab in google.tabs.values())
+
+
 def test_missing_version_extracts_inside_lock_with_heartbeat():
     store = Store(False)
 

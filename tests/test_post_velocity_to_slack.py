@@ -102,7 +102,7 @@ def test_preview_needs_no_credentials_or_network_and_shows_every_catalog_row(
     monkeypatch.setenv("VELOCITY_DATABASE_URL", "postgresql://not-a-preview-source")
     assert pvs.main([*args, "--preview"]) == 0
     text = capsys.readouterr().out
-    assert "46 tracked SKUs" in text
+    assert "47 tracked SKUs" in text
     assert "2026-11-16 (UTC)" in text
     assert "1/7 verified days" in text
     assert "Tallow Moisturizer (Travel): *0* | n/a" in text
@@ -205,7 +205,7 @@ def test_verified_send_saves_the_day_and_does_not_repeat_a_successful_upload(
     assert pvs.main(args) == 0
     assert server.reservations == 1
     assert len(server.comments) == 1
-    assert "46 tracked SKUs" in server.comments[0]
+    assert "47 tracked SKUs" in server.comments[0]
     assert "Other sold SKUs (mapping unverified)" in server.comments[0]
 
 

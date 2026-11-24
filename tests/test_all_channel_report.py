@@ -86,7 +86,7 @@ def test_all_catalog_rows_and_channel_counts_remain_visible():
     ]
     out = render(sales(rows=rows), {})
     entries = json.loads(DEFAULT_CATALOG_PATH.read_text())
-    assert "46 tracked SKUs" in out
+    assert "47 tracked SKUs" in out
     assert "Total reported units: *17*" in out
     assert "Sea Salt Spray: *10* | n/a" in out
     assert "Shopify 2 · TikTok 3 · Amazon 5 · Target 0" in out

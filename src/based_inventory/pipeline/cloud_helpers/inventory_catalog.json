@@ -234,5 +234,10 @@
     "sku": "BB-SRS-MINI-RETAIL",
     "online_cover_note": "Target retail-only SKU; online cover not applicable",
     "required": true
+  },
+  {
+    "product": "Duffel Bag",
+    "sku": "BB-ACCS-DUFBG-BLK",
+    "required": true
   }
 ]
