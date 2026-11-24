@@ -42,7 +42,7 @@ def test_every_canonical_sku_is_visible_including_zero_sales():
     entries = json.loads(DEFAULT_CATALOG_PATH.read_text())
     out = render(version(), {})
     assert f"{len(entries)} tracked SKUs" in out
-    assert len(entries) == 46
+    assert len(entries) == 47
     for entry in entries:
         assert f"{escape(entry['product'], quote=False)}: *0* | n/a" in out
     assert "Target retail Sea Salt Spray: *0* | n/a" in out

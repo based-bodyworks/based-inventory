@@ -183,11 +183,23 @@ def main(argv=None) -> int:
             if args.command == "operations":
                 from based_inventory.velocity_archive import VelocityArchive
 
-                from .platform_trackers import report_inputs
+                from .platform_trackers import check_or_publish, report_inputs
 
                 reporting_day = args.day or expected_reporting_day(now)
+                if args.fresh:
+                    raise ValueError("Operations cannot collect fresh warehouse sales")
+                if args.version_id:
+                    selected = store.load(args.version_id)
+                    if selected.day != reporting_day:
+                        raise ValueError("Saved version does not match reporting day")
+                    store.assert_current(args.version_id)
                 with VelocityArchive(os.environ["DATABASE_URL"], read_only=True) as storage:
                     _, frozen_target = report_inputs(storage, reporting_day, slack)
+                # These six views consume the complete delivered native package,
+                # not the warehouse pull. A warehouse failure must not strand them.
+                report_version = check_or_publish(
+                    os.environ["DATABASE_URL"], reporting_day, google, slack, publish=True
+                )
             result = run_command(
                 {"operations": "trackers", "operations-monitor": "monitor"}.get(
                     args.command, args.command
@@ -203,7 +215,9 @@ def main(argv=None) -> int:
                 native_report=args.command == "operations-monitor",
                 frozen_target=frozen_target,
             )
-            if args.command in {"operations", "operations-monitor"}:
+            if args.command == "operations":
+                result["report_version_id"] = report_version
+            elif args.command == "operations-monitor":
                 from .platform_trackers import check_or_publish
 
                 report_version = check_or_publish(
@@ -211,7 +225,7 @@ def main(argv=None) -> int:
                     date.fromisoformat(result["day"]),
                     google,
                     slack,
-                    publish=args.command == "operations",
+                    publish=False,
                 )
                 result["report_version_id"] = report_version
             print(json.dumps(result, sort_keys=True))
