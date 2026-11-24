@@ -111,15 +111,20 @@ def test_operations_copies_delivered_report_even_when_warehouse_publication_fail
     report = package()
     google = Google()
     for key in (
-        "DATABASE_URL", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
-        "GOOGLE_REFRESH_TOKEN", "SLACK_BOT_TOKEN", "SLACK_REPORT_CHANNEL_ID",
+        "DATABASE_URL",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REFRESH_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_REPORT_CHANNEL_ID",
     ):
         monkeypatch.setenv(key, "test")
     monkeypatch.setattr(runner, "Store", lambda _: nullcontext(Store(False)))
     monkeypatch.setattr(runner, "GoogleAPI", lambda *_: google)
     monkeypatch.setattr(runner, "SlackReport", lambda *_: object())
     monkeypatch.setattr(
-        "based_inventory.velocity_archive.VelocityArchive", lambda *_, **__: VelocityArchive(tmp_path)
+        "based_inventory.velocity_archive.VelocityArchive",
+        lambda *_, **__: VelocityArchive(tmp_path),
     )
     monkeypatch.setattr(platform_trackers, "report_inputs", lambda *_: (report, {}))
 
