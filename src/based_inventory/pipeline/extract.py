@@ -139,8 +139,8 @@ def extract_day(day: date, *, heartbeat=None) -> VerifiedDay:
                 except subprocess.TimeoutExpired:
                     if heartbeat:
                         heartbeat()
-                    if time.monotonic() - started > 10800:
-                        raise TimeoutError("Merchant extraction exceeded three hours") from None
+                    if time.monotonic() - started > 14400:
+                        raise TimeoutError("Merchant extraction exceeded four hours") from None
         finally:
             if process.poll() is None:
                 process.terminate()

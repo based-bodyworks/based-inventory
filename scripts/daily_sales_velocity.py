@@ -711,11 +711,11 @@ def _load_catalog(client: ShipHeroClient) -> tuple[list[WarehouseStock], BundleR
     return stock, registry
 
 
-# Hard wall-clock cap on a SINGLE day's fetch. Current volume can exceed 11k
-# orders/day, so cursor paging needs substantially more than the old 25-minute
-# limit. Keep a bound for genuinely wedged reads without interrupting a healthy
-# full-day pull and restarting its completed pages.
-_DAY_FETCH_WATCHDOG_SECS = 7200
+# Let large scans continue while complete order pages advance. A stalled page
+# still fails after 15 minutes, and a whole day remains bounded at 3.5 hours.
+# The cloud parent allows four hours including inventory/catalog collection.
+_DAY_FETCH_WATCHDOG_SECS = 900
+_DAY_FETCH_MAX_SECS = 12600
 
 
 class _FetchTimeoutError(Exception):
@@ -758,6 +758,23 @@ def _fetch_orders_resilient(
     again.
     """
     previous = _set_watchdog(_DAY_FETCH_WATCHDOG_SECS)
+    started = time.monotonic()
+    last_logged = 0
+
+    def progress(fetched: int, expected: int) -> None:
+        nonlocal last_logged
+        elapsed = time.monotonic() - started
+        remaining = _DAY_FETCH_MAX_SECS - elapsed
+        if remaining <= 0:
+            raise _FetchTimeoutError("per-day fetch absolute time limit exceeded")
+        if previous is not None:
+            signal.alarm(max(1, min(_DAY_FETCH_WATCHDOG_SECS, int(remaining))))
+        if fetched - last_logged >= 1000 or fetched == expected:
+            logger.info(
+                "%s: fetched %d/%d complete orders in %.0fs", day, fetched, expected, elapsed
+            )
+            last_logged = fetched
+
     try:
         for attempt in range(3):
             try:
@@ -766,6 +783,7 @@ def _fetch_orders_resilient(
                     warehouse_id=MERCHDROP_WAREHOUSE_ID,
                     max_pages=max_pages,
                     until_iso=until,
+                    progress=progress,
                 )
             except (OrdersCountChangedError, OrdersPaginationUnstableError) as exc:
                 if attempt == 2:
