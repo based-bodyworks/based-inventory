@@ -31,6 +31,73 @@ from based_inventory.shiphero import (  # noqa: E402
 
 
 # --- fixtures ---------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("page_seconds", "page_count", "fails"),
+    [(420, 20, False), (901, 1, True), (800, 17, True)],
+)
+def test_order_scan_deadline_tracks_progress_and_keeps_absolute_bound(
+    monkeypatch, page_seconds, page_count, fails
+):
+    # A healthy 140-minute scan must finish. A stalled page or a scan over
+    # 3.5 hours must still fail without returning partial orders.
+    clock = {"now": 0, "deadline": None}
+    original_handler = object()
+    monkeypatch.setattr(dsv.signal, "signal", lambda *_: original_handler)
+
+    def alarm(seconds):
+        clock["deadline"] = clock["now"] + seconds if seconds else None
+
+    monkeypatch.setattr(dsv.signal, "alarm", alarm)
+    monkeypatch.setattr(dsv.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(dsv.time, "sleep", lambda _: None)
+    page = 0
+
+    def post(_url, *, json, **_kwargs):
+        nonlocal page
+        if "total_count" in json["query"]:
+            data = {"total_count": page_count}
+        else:
+            clock["now"] += page_seconds
+            if clock["deadline"] is not None and clock["now"] >= clock["deadline"]:
+                dsv._watchdog_handler(None, None)
+            page += 1
+            data = {
+                "edges": [
+                    {
+                        "node": {
+                            "id": str(page),
+                            "order_number": str(page),
+                            "order_date": "2026-11-23T01:00:00",
+                            "shop_name": "BASED",
+                            "line_items": {
+                                "edges": [{"node": {"id": str(page), "sku": "GEL", "quantity": 1}}],
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            },
+                        }
+                    }
+                ],
+                "pageInfo": {"hasNextPage": page < page_count, "endCursor": str(page)},
+            }
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "application/json"
+        import json as json_module
+
+        response._content = json_module.dumps({"data": {"orders": {"data": data}}}).encode()
+        return response
+
+    monkeypatch.setattr("based_inventory.shiphero.requests.post", post)
+    client = ShipHeroClient("synthetic-token")
+    if fails:
+        with pytest.raises(dsv._FetchTimeoutError, match="watchdog|limit"):
+            dsv._fetch_orders_resilient(client, "2026-11-23", "since", "until", 100)
+    else:
+        result = dsv._fetch_orders_resilient(client, "2026-11-23", "since", "until", 100)
+        assert len(result) == 20
+        assert result[-1]["id"] == "20"
+    assert clock["deadline"] is None
+
+
 def _stock(sku: str, name: str, is_kit: bool = False) -> WarehouseStock:
     return WarehouseStock(
         sku=sku,
@@ -560,7 +627,9 @@ def test_run_writes_bundle_view_alongside_channel_grids(tmp_path, monkeypatch) -
     ]
 
     class FakeClient:
-        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+        def fetch_orders_window(
+            self, since_iso, warehouse_id=None, max_pages=0, until_iso=None, progress=None
+        ):
             return orders
 
     stock = [
@@ -643,7 +712,9 @@ def test_partial_utc_day_is_refetched_after_midnight(tmp_path, monkeypatch) -> N
     class FakeClient:
         calls = 0
 
-        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+        def fetch_orders_window(
+            self, since_iso, warehouse_id=None, max_pages=0, until_iso=None, progress=None
+        ):
             self.calls += 1
             return [order]
 
@@ -704,7 +775,9 @@ def test_changed_bundle_recipe_refetches_cached_day(tmp_path, monkeypatch) -> No
     class FakeClient:
         calls = 0
 
-        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+        def fetch_orders_window(
+            self, since_iso, warehouse_id=None, max_pages=0, until_iso=None, progress=None
+        ):
             self.calls += 1
             return [
                 {
@@ -872,7 +945,9 @@ def test_fetch_orders_resilient_does_not_restart_after_network_exhaustion(monkey
     calls = {"n": 0}
 
     class FlakyClient:
-        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+        def fetch_orders_window(
+            self, since_iso, warehouse_id=None, max_pages=0, until_iso=None, progress=None
+        ):
             calls["n"] += 1
             raise RuntimeError("ShipHero network error after 6 retries")
 
@@ -1000,7 +1075,9 @@ def test_fetch_orders_resilient_does_not_restart_after_watchdog_timeout(monkeypa
     calls = {"n": 0}
 
     class HangingClient:
-        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+        def fetch_orders_window(
+            self, since_iso, warehouse_id=None, max_pages=0, until_iso=None, progress=None
+        ):
             calls["n"] += 1
             raise dsv._FetchTimeoutError("per-day fetch watchdog fired")
 
@@ -1015,7 +1092,9 @@ def test_fetch_orders_resilient_propagates_non_network_error(monkeypatch) -> Non
     monkeypatch.setattr(dsv.time, "sleep", lambda _s: None)
 
     class BadQueryClient:
-        def fetch_orders_window(self, since_iso, warehouse_id=None, max_pages=0, until_iso=None):
+        def fetch_orders_window(
+            self, since_iso, warehouse_id=None, max_pages=0, until_iso=None, progress=None
+        ):
             raise RuntimeError("ShipHero GraphQL errors: [{'message': 'bad field'}]")
 
     try:

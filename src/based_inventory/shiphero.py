@@ -21,6 +21,7 @@ import math
 import re
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1107,6 +1108,7 @@ class ShipHeroClient:
         warehouse_id: str = MERCHDROP_WAREHOUSE_ID,
         max_pages: int = 500,
         until_iso: str | None = None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch orders whose order_date is in [since_iso, until_iso], with line_items.
 
@@ -1242,6 +1244,7 @@ class ShipHeroClient:
                         "ShipHero orders pagination returned empty page with more data"
                     )
                 break
+            previous_count = len(out)
             for e in edges:
                 n = e["node"]
                 order_id = n.get("id")
@@ -1266,6 +1269,10 @@ class ShipHeroClient:
                 seen[order_id] = n
                 self._finish_order_lines(n, pacing_floor=line_pacing_floor)
                 out.append(n)
+            # Only fully fetched, newly seen orders extend a caller's stall
+            # deadline. Repeated pages, credit errors and incomplete lines do not.
+            if progress is not None and len(out) > previous_count:
+                progress(len(out), expected_count)
             if not page_info["hasNextPage"]:
                 break
             next_cursor = page_info.get("endCursor")
