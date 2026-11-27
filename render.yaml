@@ -159,6 +159,30 @@ services:
       - key: LOG_LEVEL
         value: INFO
 
+  # Hourly online master-SKU check. Start with preview output in Render logs.
+  - type: cron
+    name: based-inventory-hourly
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    schedule: "10 * * * *"
+    dockerCommand: python -m based_inventory.jobs.hourly_stock_watch --post-to-slack
+    plan: starter
+    envVars:
+      - key: SHIPHERO_REFRESH_TOKEN
+        fromService:
+          name: based-inventory-quantity
+          type: cron
+          envVarKey: SHIPHERO_REFRESH_TOKEN
+      - key: SLACK_BOT_TOKEN
+        fromService:
+          name: based-inventory-quantity
+          type: cron
+          envVarKey: SLACK_BOT_TOKEN
+      - key: SLACK_CHANNEL
+        value: C0AK6UGA1NJ
+      - key: DRY_RUN
+        sync: false
+
   # All-channel daily sales: native platform sales plus Target's dated report.
   # The adjacent DST candidate exits before any source or database read.
   # Run after morning feeds, at 08:00 America/Los_Angeles throughout the year.

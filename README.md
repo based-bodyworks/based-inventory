@@ -23,6 +23,7 @@ offline `--preview` mode that requires a checked local source capture.
 
 ```sh
 DRY_RUN=1 python -m based_inventory.jobs.quantity_alerts
+PYTHONPATH=src python -m based_inventory.jobs.hourly_stock_watch --env-file .env
 pytest
 ruff check
 ruff format --check
@@ -33,9 +34,20 @@ ruff format --check
 | Job | Schedule in `render.yaml` |
 | --- | --- |
 | `based_inventory.jobs.quantity_alerts` | Weekdays at 14:00 UTC |
+| `based_inventory.jobs.hourly_stock_watch` | Every hour at :10 |
 | `based_inventory.jobs.atc_audit` | Mondays at 13:00 UTC |
 | `based_inventory.jobs.weekly_snapshot` | Monday, Wednesday and Friday at 16:00 UTC |
 | `scripts/post_sales_velocity.py --at-local-time 08:00` | Daily at 08:00 Pacific |
+
+The hourly check uses ShipHero's Available count at Merchdrop for online master
+SKUs in the shared inventory catalog. Retail-only items, entries without a verified
+online mapping, and discontinued items are excluded. It lists master SKUs with
+fewer than 1,000 available units, confirms when all are at or above 1,000, and
+reports an incomplete check if any master SKU cannot be verified. The Render
+service starts in preview mode. After Slack approval, set `DRY_RUN=0` in
+the hourly service's Render environment to enable posting. The Blueprint leaves
+this setting under dashboard control. Suspend the hourly service to stop its
+schedule.
 
 The sales cron uses `0 15,16 * * *` to cover daylight-saving time. The command
 accepts startup from 08:00 through 08:59:59 Pacific; the other candidate exits
