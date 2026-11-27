@@ -42,8 +42,10 @@ ruff format --check
 The hourly check uses ShipHero's Available count at Merchdrop for online master
 SKUs in the shared inventory catalog. Retail-only items, entries without a verified
 online mapping, and discontinued items are excluded. It lists master SKUs with
-fewer than 1,000 available units, confirms when all are at or above 1,000, and
-reports an incomplete check if any master SKU cannot be verified. The Render
+fewer than 1,000 available units and shows each flagged SKU's sell-ahead status
+and quantity separately. The alert threshold uses the reported Available count.
+The job confirms when all SKUs are at or above 1,000 and reports an incomplete
+check if any master SKU's availability cannot be verified. The Render
 service starts in preview mode. After Slack approval, set `DRY_RUN=0` in
 the hourly service's Render environment to enable posting. The Blueprint leaves
 this setting under dashboard control. Suspend the hourly service to stop its

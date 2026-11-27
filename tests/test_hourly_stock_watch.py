@@ -6,7 +6,7 @@ import pytest
 from based_inventory.jobs import hourly_stock_watch as watch
 
 
-def stock(sku, available):
+def stock(sku, available, sell_ahead=0):
     return {
         "data": {
             "edges": [
@@ -16,6 +16,7 @@ def stock(sku, available):
                         "warehouse_id": watch.MERCHDROP_WAREHOUSE_ID,
                         "active": True,
                         "available": available,
+                        "sell_ahead": sell_ahead,
                         "product": {"kit": False},
                     }
                 }
@@ -38,7 +39,11 @@ def test_scope_uses_online_master_skus():
 def test_stock_watch_flags_strictly_below_1000_and_sorts_units():
     client = Mock()
     client._execute.return_value = {
-        "data": {"s0": stock("a", 999), "s1": stock("b", 1_000), "s2": stock("c", -2)}
+        "data": {
+            "s0": stock("a", 999, 30_000),
+            "s1": stock("b", 1_000, 70_000),
+            "s2": stock("c", -2),
+        }
     }
     catalog = {"a": "First", "b": "At threshold", "c": "Lowest"}
 
@@ -46,16 +51,48 @@ def test_stock_watch_flags_strictly_below_1000_and_sorts_units():
     message = watch.format_status(catalog, *result)
 
     assert "2 of 3 individual product SKUs are below 1,000 available units" in message
+    assert "Sell-ahead shows how many units ShipHero lets us sell before they arrive." in message
     assert message.index("Lowest (c), -2 available") < message.index("First (a), 999 available")
+    assert "First (a), 999 available | Sell-ahead active (30,000 units)" in message
+    assert "Lowest (c), -2 available | No sell-ahead" in message
     assert "At threshold" not in message
-    _, variables = client._execute.call_args.args
+    query, variables = client._execute.call_args.args
+    assert "sell_ahead" in query
     assert variables == {"warehouse": watch.MERCHDROP_WAREHOUSE_ID, "s0": "a", "s1": "b", "s2": "c"}
 
 
 def test_all_clear_includes_1000_units():
     assert "No individual product SKUs are below 1,000 available units" in watch.format_status(
-        {"a": "One"}, {"a": 1_000}, []
+        {"a": "One"}, {"a": watch.StockLevel(1_000, 70_000)}, []
     )
+
+
+@pytest.mark.parametrize("sell_ahead", [None, True, -1, "30,000"])
+def test_unverified_sell_ahead_preserves_confirmed_low_stock(sell_ahead):
+    client = Mock()
+    client._execute.return_value = {"data": {"s0": stock("a", 0, sell_ahead)}}
+    catalog = {"a": "Low"}
+
+    result = watch.read_stock(client, catalog)
+
+    assert "Low (a), 0 available | Sell-ahead unverified" in watch.format_status(catalog, *result)
+
+
+def test_graphql_error_retries_with_only_stock_fields():
+    client = Mock()
+    fallback_row = stock("a", 0)
+    del fallback_row["data"]["edges"][0]["node"]["sell_ahead"]
+    client._execute.side_effect = [
+        RuntimeError("ShipHero GraphQL error"),
+        {"data": {"s0": fallback_row}},
+    ]
+
+    levels, missing = watch.read_stock(client, {"a": "Low"})
+
+    assert levels == {"a": watch.StockLevel(0, None)}
+    assert missing == []
+    assert "sell_ahead" in client._execute.call_args_list[0].args[0]
+    assert "sell_ahead" not in client._execute.call_args_list[1].args[0]
 
 
 @pytest.mark.parametrize("bad_field", ["available", "active", "warehouse_id", "sku", "product"])
@@ -69,7 +106,7 @@ def test_bad_row_never_becomes_an_all_clear(bad_field):
     counts, missing = watch.read_stock(client, catalog)
     message = watch.format_status(catalog, counts, missing)
 
-    assert counts == {"b": 999}
+    assert counts == {"b": watch.StockLevel(999, 0)}
     assert missing == ["a"]
     assert "Inventory check incomplete" in message
     assert "Unknown (a)" in message
@@ -93,7 +130,7 @@ def test_provider_failure_reports_missing_and_exits_with_error(monkeypatch, caps
 def test_read_only_run_leaves_slack_alone(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(watch, "load_master_skus", lambda: {"a": "One"})
     monkeypatch.setattr(watch, "resolve_access_token", lambda *_: "test-token")
-    monkeypatch.setattr(watch, "read_stock", lambda *_: ({"a": 1_000}, []))
+    monkeypatch.setattr(watch, "read_stock", lambda *_: ({"a": watch.StockLevel(1_000, 0)}, []))
     post = Mock()
     monkeypatch.setattr(watch, "SlackClient", post)
 
@@ -106,7 +143,7 @@ def test_read_only_run_leaves_slack_alone(monkeypatch, tmp_path, capsys):
 def test_slack_requires_explicit_enablement(monkeypatch, dry_run):
     monkeypatch.setattr(watch, "load_master_skus", lambda: {"a": "One"})
     monkeypatch.setattr(watch, "resolve_access_token", lambda *_: "test-token")
-    monkeypatch.setattr(watch, "read_stock", lambda *_: ({"a": 1_000}, []))
+    monkeypatch.setattr(watch, "read_stock", lambda *_: ({"a": watch.StockLevel(1_000, 0)}, []))
     if dry_run is None:
         monkeypatch.delenv("DRY_RUN", raising=False)
     else:
