@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import requests
@@ -11,6 +12,27 @@ import requests
 logger = logging.getLogger(__name__)
 
 _POST_URL = "https://slack.com/api/chat.postMessage"
+_POST_REJECTIONS = frozenset(
+    {
+        "cannot_reply_to_message",
+        "channel_not_found",
+        "invalid_arguments",
+        "invalid_auth",
+        "invalid_blocks",
+        "is_archived",
+        "missing_scope",
+        "not_authed",
+        "not_in_channel",
+        "ratelimited",
+        "restricted_action",
+        "thread_not_found",
+        "token_revoked",
+    }
+)
+
+
+class SlackPostUncertainError(RuntimeError):
+    """Slack might have posted the message without returning a usable receipt."""
 
 
 class SlackClient:
@@ -35,16 +57,7 @@ class SlackClient:
             return True
 
         try:
-            response = requests.post(
-                _POST_URL,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json",
-                },
-                timeout=15,
-            )
-            result = response.json()
+            result = self._post(payload).json()
         except requests.RequestException as exc:
             logger.error("Slack post failed: %s", exc)
             return False
@@ -54,6 +67,60 @@ class SlackClient:
             return False
 
         return True
+
+    def _post(self, payload: dict[str, Any]) -> requests.Response:
+        return requests.post(
+            _POST_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+
+    def post_with_receipt(
+        self,
+        text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        thread_ts: str | None,
+    ) -> str | None:
+        """Return the posted timestamp, or None for a definite rejection."""
+        if self.dry_run:
+            raise ValueError("Tracked Slack posts require live delivery")
+        payload = {
+            "channel": self.channel,
+            "text": text,
+            "blocks": blocks,
+            "unfurl_links": False,
+        }
+        if thread_ts is not None:
+            payload.update(thread_ts=thread_ts, reply_broadcast=False)
+        try:
+            response = self._post(payload)
+            if response.status_code == 429:
+                logger.warning("Slack rate-limited the stock update")
+                return None
+            result = response.json()
+        except (requests.RequestException, ValueError):
+            raise SlackPostUncertainError("Slack did not return a usable post receipt") from None
+
+        if isinstance(result, dict) and response.status_code < 500:
+            timestamp = result.get("ts")
+            if (
+                response.ok
+                and result.get("ok") is True
+                and result.get("channel") == self.channel
+                and isinstance(timestamp, str)
+                and re.fullmatch(r"[0-9]+\.[0-9]{6}", timestamp)
+            ):
+                return timestamp
+            error = result.get("error")
+            if result.get("ok") is False and isinstance(error, str) and error in _POST_REJECTIONS:
+                logger.error("Slack rejected the stock update: %s", error)
+                return None
+        raise SlackPostUncertainError("Slack did not confirm whether it posted the stock update")
 
     def upload_file(
         self,
