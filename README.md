@@ -34,7 +34,7 @@ ruff format --check
 | Job | Schedule in `render.yaml` |
 | --- | --- |
 | `based_inventory.jobs.quantity_alerts` | Weekdays at 14:00 UTC |
-| `based_inventory.jobs.hourly_stock_watch` | Every hour at :10 |
+| `based_inventory.jobs.hourly_stock_watch` | At the start of every hour |
 | `based_inventory.jobs.atc_audit` | Mondays at 13:00 UTC |
 | `based_inventory.jobs.weekly_snapshot` | Monday, Wednesday and Friday at 16:00 UTC |
 | `scripts/post_sales_velocity.py --at-local-time 08:00` | Daily at 08:00 Pacific |
@@ -50,6 +50,17 @@ service starts in preview mode. After Slack approval, set `DRY_RUN=0` in
 the hourly service's Render environment to enable posting. The Blueprint leaves
 this setting under dashboard control. Suspend the hourly service to stop its
 schedule.
+
+The first hourly status that posts on each Pacific calendar day starts the
+daily Slack thread, normally at midnight. Each later check for that day is a
+thread reply. A check that runs past midnight is skipped so the new day starts
+with its own check. The job stores its post and reply receipts in the existing paid
+PostgreSQL database through `HOURLY_STOCK_DATABASE_URL`. Preview runs need no
+database connection. If the first post's delivery is uncertain, pause the hourly
+job and check the channel. If the post exists, save its Slack timestamp on the
+pending receipt. Clear a pending receipt only after confirming that Slack did
+not publish the post. A missing or deleted Slack parent also needs a manual
+check. A reply with an uncertain result affects only that hour.
 
 The sales cron uses `0 15,16 * * *` to cover daylight-saving time. The command
 accepts startup from 08:00 through 08:59:59 Pacific; the other candidate exits

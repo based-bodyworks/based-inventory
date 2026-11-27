@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -150,15 +151,19 @@ def test_slack_requires_explicit_enablement(monkeypatch, dry_run):
         monkeypatch.setenv("DRY_RUN", dry_run)
     monkeypatch.setenv("SLACK_BOT_TOKEN", "test-slack-token")
     monkeypatch.setenv("SLACK_CHANNEL", "test-channel")
+    monkeypatch.setenv("HOURLY_STOCK_DATABASE_URL", "postgresql://test")
     slack = Mock()
+    publish = Mock(return_value=True)
     monkeypatch.setattr(watch, "SlackClient", slack)
+    monkeypatch.setattr("based_inventory.jobs.hourly_stock_slack.publish_hourly_status", publish)
 
     assert watch.main(["--post-to-slack"]) == 0
     if dry_run == "0":
         slack.assert_called_once_with("test-slack-token", "test-channel")
-        slack.return_value.post_message.assert_called_once()
+        publish.assert_called_once()
     else:
         slack.assert_not_called()
+        publish.assert_not_called()
 
 
 def test_catalog_failure_reports_incomplete_in_slack_if_enabled(monkeypatch):
@@ -166,19 +171,48 @@ def test_catalog_failure_reports_incomplete_in_slack_if_enabled(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "test-slack-token")
     monkeypatch.setenv("SLACK_CHANNEL", "test-channel")
+    monkeypatch.setenv("HOURLY_STOCK_DATABASE_URL", "postgresql://test")
     slack = Mock()
+    publish = Mock(return_value=True)
     monkeypatch.setattr(watch, "SlackClient", slack)
+    monkeypatch.setattr("based_inventory.jobs.hourly_stock_slack.publish_hourly_status", publish)
 
     assert watch.main(["--post-to-slack"]) == 1
-    status, _ = slack.return_value.post_message.call_args.args
+    _, _, status = publish.call_args.args
     assert "The list of individual product SKUs could not be read." in status
+
+
+@pytest.mark.parametrize("start_hour, end_hour, expected", [(8, 9, 0), (7, 8, 1)])
+def test_slack_delivery_uses_the_hour_the_check_started(
+    monkeypatch, start_hour, end_hour, expected
+):
+    start = datetime(2026, 11, 27, start_hour, 59, tzinfo=UTC)
+    end = datetime(2026, 11, 27, end_hour, tzinfo=UTC)
+    monkeypatch.setattr(watch, "datetime", Mock(now=Mock(side_effect=[start, end])))
+    monkeypatch.setattr(watch, "load_master_skus", lambda: {"a": "One"})
+    monkeypatch.setattr(watch, "resolve_access_token", lambda *_: "test-token")
+    monkeypatch.setattr(watch, "read_stock", lambda *_: ({"a": watch.StockLevel(1_000, 0)}, []))
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "test-slack-token")
+    monkeypatch.setenv("SLACK_CHANNEL", "test-channel")
+    monkeypatch.setenv("HOURLY_STOCK_DATABASE_URL", "postgresql://test")
+    publish = Mock(return_value=True)
+    monkeypatch.setattr("based_inventory.jobs.hourly_stock_slack.publish_hourly_status", publish)
+
+    assert watch.main(["--post-to-slack"]) == expected
+    if expected == 0:
+        assert publish.call_args.kwargs["checked_at"] == start
+    else:
+        publish.assert_not_called()
 
 
 def test_render_job_is_hourly_and_defaults_to_preview():
     config = Path("render.yaml").read_text(encoding="utf-8")
     service = config.split("    name: based-inventory-hourly\n", 1)[1].split("\n  - type:", 1)[0]
 
-    assert 'schedule: "10 * * * *"' in service
+    assert 'schedule: "0 * * * *"' in service
+    assert "dockerfilePath: ./Dockerfile.pipeline" in service
+    assert "envVarKey: VELOCITY_DATABASE_URL" in service
     assert (
         "dockerCommand: python -m based_inventory.jobs.hourly_stock_watch --post-to-slack"
         in service

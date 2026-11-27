@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
@@ -151,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--post-to-slack", action="store_true", help="Post when DRY_RUN is 0")
     options = parser.parse_args(argv)
+    checked_at = datetime.now(UTC)
     settings = {**(dotenv_values(options.env_file) if options.env_file else {}), **os.environ}
     try:
         catalog = load_master_skus()
@@ -181,18 +183,29 @@ def main(argv: list[str] | None = None) -> int:
     if options.post_to_slack and settings.get("DRY_RUN") == "0":
         slack_token = settings.get("SLACK_BOT_TOKEN")
         channel = settings.get("SLACK_CHANNEL")
-        if not slack_token or not channel:
-            logger.error("Missing Slack credentials or destination")
+        database_url = settings.get("HOURLY_STOCK_DATABASE_URL")
+        if not slack_token or not channel or not database_url:
+            logger.error("Missing hourly Slack credentials, destination, or receipt database")
             return 1
-        lines = status.splitlines()
-        blocks = [
-            {
-                "type": "section",
-                "text": {"type": "plain_text", "text": "\n".join(lines[i : i + 12])},
-            }
-            for i in range(0, len(lines), 12)
-        ]
-        if not SlackClient(slack_token, channel).post_message(status, blocks):
+        from based_inventory.jobs.hourly_stock_slack import PACIFIC, publish_hourly_status
+
+        if datetime.now(UTC).astimezone(PACIFIC).date() != checked_at.astimezone(PACIFIC).date():
+            logger.error(
+                "The stock check ran past Pacific midnight; waiting for the new day's check"
+            )
+            return 1
+
+        try:
+            delivered = publish_hourly_status(
+                database_url,
+                SlackClient(slack_token, channel),
+                status,
+                checked_at=checked_at,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.error("Hourly stock update delivery failed: %s", exc)
+            return 1
+        if not delivered:
             return 1
     return int(incomplete)
 

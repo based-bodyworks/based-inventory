@@ -163,8 +163,8 @@ services:
   - type: cron
     name: based-inventory-hourly
     runtime: docker
-    dockerfilePath: ./Dockerfile
-    schedule: "10 * * * *"
+    dockerfilePath: ./Dockerfile.pipeline
+    schedule: "0 * * * *"
     dockerCommand: python -m based_inventory.jobs.hourly_stock_watch --post-to-slack
     plan: starter
     envVars:
@@ -180,6 +180,11 @@ services:
           envVarKey: SLACK_BOT_TOKEN
       - key: SLACK_CHANNEL
         value: C0AK6UGA1NJ
+      - key: HOURLY_STOCK_DATABASE_URL
+        fromService:
+          name: based-inventory-velocity
+          type: cron
+          envVarKey: VELOCITY_DATABASE_URL
       - key: DRY_RUN
         sync: false
 
